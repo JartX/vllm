@@ -99,22 +99,27 @@ def check_upstream_fa_availability(dtype: torch.dtype):
 
 
 def maybe_get_vit_flash_attn_backend(
-    attn_backend: _Backend, use_upstream_fa: bool
+    attn_backend: _Backend,
+    use_upstream_fa: bool,
+    attn_backend_override: _Backend | None = None,
 ) -> tuple[_Backend, Callable | None]:
     if current_platform.is_rocm():
         if envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_MHA and on_gfx9():
             attn_backend = _Backend.ROCM_AITER_FA
 
-        elif check_upstream_fa_availability(torch.get_default_dtype()) and on_gfx9():
+        elif (
+            check_upstream_fa_availability(torch.get_default_dtype())
+            and on_gfx9()
+            and attn_backend_override is None
+        ):
             attn_backend = _Backend.FLASH_ATTN
             use_upstream_fa = True
         else:
             return _Backend.TORCH_SDPA, None
 
     elif current_platform.is_cuda():
-        if (
-            attn_backend != _Backend.FLASH_ATTN
-            and check_upstream_fa_availability(torch.get_default_dtype())
+        if attn_backend != _Backend.FLASH_ATTN and check_upstream_fa_availability(
+            torch.get_default_dtype()
         ):
             attn_backend = _Backend.FLASH_ATTN
             use_upstream_fa = True
@@ -514,6 +519,7 @@ class MultiHeadAttention(nn.Module):
             maybe_get_vit_flash_attn_backend(
                 self.attn_backend,
                 use_upstream_fa,
+                attn_backend_override=attn_backend_override,
             )
         )
 
@@ -558,6 +564,7 @@ class MultiHeadAttention(nn.Module):
             value = torch.repeat_interleave(value, num_repeat, dim=2)
 
         if self.is_flash_attn_backend:
+            assert self._flash_attn_varlen_func is not None
             cu_seqlens_q = torch.arange(
                 0, (bsz + 1) * q_len, step=q_len, dtype=torch.int32, device=query.device
             )
