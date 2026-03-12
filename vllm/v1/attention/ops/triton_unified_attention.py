@@ -465,10 +465,10 @@ def kernel_unified_attention_3d(
     BLOCK_M: tl.constexpr,  # int
     NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int
     USE_QUANTIZED_KV: tl.constexpr,  # bool, True for fp8/int8 KV cache
-    INT8_PER_HEAD_SCALE: tl.constexpr = False,  # bool, True for int8 per-head scale
     USE_MM_PREFIX: tl.constexpr,  # bool
     MAX_MM_RANGES: tl.constexpr,  # int
     mm_prefix_range_ptr,  # [num_seqs] - prefix length for each sequence
+    INT8_PER_HEAD_SCALE: tl.constexpr = False,  # bool, True for int8 per-head scale
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
