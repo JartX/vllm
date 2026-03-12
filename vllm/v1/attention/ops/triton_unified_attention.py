@@ -106,6 +106,7 @@ def kernel_unified_attention_2d(
     BLOCK_M: tl.constexpr,  # int
     USE_FP8: tl.constexpr,  # bool
     USE_QUANTIZED_KV: tl.constexpr,  # bool, True for fp8/int8 KV cache
+    INT8_PER_HEAD_SCALE: tl.constexpr = False,  # bool, True for int8 per-head scale
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
 ):
@@ -261,10 +262,16 @@ def kernel_unified_attention_2d(
         )
 
         if USE_QUANTIZED_KV:
-            if Q.dtype.is_fp8():
+            if K_load.dtype.is_fp8():
+                # FP8 KV: use native fp8 in the dot product
                 K = K_load
             else:
-                K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
+                # INT8 KV (or other non-fp8 quantized): always dequantize
+                if INT8_PER_HEAD_SCALE:
+                    k_scale_val = tl.load(k_scale + kv_head_idx)
+                else:
+                    k_scale_val = tl.load(k_scale)
+                K = (K_load.to(tl.float32) * k_scale_val).to(Q.dtype)
         else:
             K = K_load
 
@@ -276,10 +283,16 @@ def kernel_unified_attention_2d(
         )
 
         if USE_QUANTIZED_KV:
-            if Q.dtype.is_fp8():
+            if V_load.dtype.is_fp8():
+                # FP8 KV: use native fp8 in the dot product
                 V = V_load
             else:
-                V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
+                # INT8 KV (or other non-fp8 quantized): always dequantize
+                if INT8_PER_HEAD_SCALE:
+                    v_scale_val = tl.load(v_scale + kv_head_idx)
+                else:
+                    v_scale_val = tl.load(v_scale)
+                V = (V_load.to(tl.float32) * v_scale_val).to(Q.dtype)
         else:
             V = V_load
 
@@ -452,6 +465,7 @@ def kernel_unified_attention_3d(
     BLOCK_M: tl.constexpr,  # int
     NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int
     USE_QUANTIZED_KV: tl.constexpr,  # bool, True for fp8/int8 KV cache
+    INT8_PER_HEAD_SCALE: tl.constexpr = False,  # bool, True for int8 per-head scale
     USE_MM_PREFIX: tl.constexpr,  # bool
     MAX_MM_RANGES: tl.constexpr,  # int
     mm_prefix_range_ptr,  # [num_seqs] - prefix length for each sequence
@@ -617,10 +631,16 @@ def kernel_unified_attention_3d(
         )
 
         if USE_QUANTIZED_KV:
-            if Q.dtype.is_fp8():
+            if K_load.dtype.is_fp8():
+                # FP8 KV: use native fp8 in the dot product
                 K = K_load
             else:
-                K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
+                # INT8 KV (or other non-fp8 quantized): always dequantize
+                if INT8_PER_HEAD_SCALE:
+                    k_scale_val = tl.load(k_scale + kv_head_idx)
+                else:
+                    k_scale_val = tl.load(k_scale)
+                K = (K_load.to(tl.float32) * k_scale_val).to(Q.dtype)
         else:
             K = K_load
 
@@ -632,10 +652,16 @@ def kernel_unified_attention_3d(
         )
 
         if USE_QUANTIZED_KV:
-            if Q.dtype.is_fp8():
+            if V_load.dtype.is_fp8():
+                # FP8 KV: use native fp8 in the dot product
                 V = V_load
             else:
-                V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
+                # INT8 KV (or other non-fp8 quantized): always dequantize
+                if INT8_PER_HEAD_SCALE:
+                    v_scale_val = tl.load(v_scale + kv_head_idx)
+                else:
+                    v_scale_val = tl.load(v_scale)
+                V = (V_load.to(tl.float32) * v_scale_val).to(Q.dtype)
         else:
             V = V_load
 
@@ -935,6 +961,15 @@ def unified_attention(
     use_qq_bias = qq_bias is not None
     # True when KV cache is quantized (fp8/int8); kernel dequantizes with scale
     use_quantized_kv = k_descale is not None
+    # True when INT8 KV uses per-head scales: k_descale is a 1-D tensor
+    # [num_kv_heads] (passed directly from triton_attn, NOT expand'd).
+    # FP8 always uses per-tensor scale; INT8 may be per-tensor (scalar/0-dim)
+    # or per-head (1-D, numel > 1).
+    int8_per_head_scale = (
+        use_quantized_kv
+        and k_descale.ndim == 1
+        and k_descale.numel() > 1
+    )
 
     block_size = v.shape[1]
     num_seqs = len(seqused_k)
@@ -1045,6 +1080,7 @@ def unified_attention(
             BLOCK_M=BLOCK_M,
             USE_FP8=output_scale is not None,
             USE_QUANTIZED_KV=use_quantized_kv,
+            INT8_PER_HEAD_SCALE=int8_per_head_scale,
         )
     else:
         kernel_unified_attention_3d[
@@ -1098,6 +1134,7 @@ def unified_attention(
             BLOCK_M=BLOCK_M,
             NUM_SEGMENTS_PER_SEQ=num_par_softmax_segments,
             USE_QUANTIZED_KV=use_quantized_kv,
+            INT8_PER_HEAD_SCALE=int8_per_head_scale,
         )
         reduce_segments[(q.shape[0], num_query_heads)](
             output_ptr=out,

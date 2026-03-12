@@ -500,6 +500,20 @@ class TritonAttentionImpl(AttentionImpl):
         descale_shape = (cu_seqlens_q.shape[0] - 1, key_cache.shape[2])
         mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
 
+        # For INT8 per-head scale (_k_scale is [num_kv_heads]), pass the 1-D
+        # tensor directly so unified_attention can detect the granularity.
+        # For FP8 / INT8 per-tensor, expand to (num_seqs, num_kv_heads) as usual.
+        if (
+            self.kv_cache_dtype.startswith("int8")
+            and layer._k_scale.ndim == 1
+            and layer._k_scale.numel() > 1
+        ):
+            k_descale = layer._k_scale  # [num_kv_heads]
+            v_descale = layer._v_scale  # [num_kv_heads]
+        else:
+            k_descale = layer._k_scale.expand(descale_shape)
+            v_descale = layer._v_scale.expand(descale_shape)
+
         unified_attention(
             q=query[:num_actual_tokens],
             k=key_cache,
@@ -517,8 +531,8 @@ class TritonAttentionImpl(AttentionImpl):
             block_table=block_table,
             softcap=self.logits_soft_cap,
             q_descale=None,  # Not supported
-            k_descale=layer._k_scale.expand(descale_shape),
-            v_descale=layer._v_scale.expand(descale_shape),
+            k_descale=k_descale,
+            v_descale=v_descale,
             seq_threshold_3D=seq_threshold_3D,
             num_par_softmax_segments=num_par_softmax_segments,
             softmax_segm_output=softmax_segm_output,

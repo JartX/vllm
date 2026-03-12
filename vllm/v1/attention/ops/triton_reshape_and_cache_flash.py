@@ -31,6 +31,7 @@ def reshape_and_cache_kernel_flash(
     USE_HEAD_MAJOR_LAYOUT: tl.constexpr,
     # Quantization flags
     QUANTIZED_KV_CACHE: tl.constexpr,  # True for fp8/int8
+    INT8_PER_HEAD_SCALE: tl.constexpr,  # True for int8 per-head scale [num_heads]
     # tune parameters
     TILE_SIZE: tl.constexpr,
 ):
@@ -81,12 +82,22 @@ def reshape_and_cache_kernel_flash(
         # tl.store will do the correct implicit cast to quantized format (fp8/int8),
         # based on the key_cache_ptr.dtype.element_ty
         if key_load.dtype.is_fp8():
+            # FP8: pass through; triton handles implicit fp8 cast on store
             key_tile = key_load
         else:
-            key_tile = key_load / tl.load(k_scale)
-            # INT8 requires explicit clamping to [-128, 127]
-            # FP8 has automatic saturation, but INT8 needs manual clamp
+            # INT8: divide by scale then clamp to [-128, 127]
+            if INT8_PER_HEAD_SCALE:
+                # Per-head scale: gather one scale value per element in tile.
+                # tile_pos spans [0, num_heads*head_size), head = tile_pos // head_size
+                cur_head = tile_pos // head_size
+                k_scale_val = tl.load(
+                    k_scale + cur_head, mask=tile_pos < (num_heads * head_size)
+                )
+            else:
+                k_scale_val = tl.load(k_scale)
+            key_tile = key_load / k_scale_val
             if key_cache_ptr.dtype.element_ty == tl.int8:
+                # INT8 has no automatic saturation: clamp explicitly
                 key_tile = tl.clamp(key_tile, -128.0, 127.0)
     else:
         key_tile = key_load
@@ -97,14 +108,21 @@ def reshape_and_cache_kernel_flash(
     )
     if QUANTIZED_KV_CACHE:
         if value_load.dtype.is_fp8():
+            # FP8: pass through; triton handles implicit fp8 cast on store
             value_tile = value_load
         else:
-            # tl.store will do the correct implicit cast to quantized format (fp8/int8),
-            #  based on the value_cache_ptr.dtype.element_ty
-            value_tile = value_load / tl.load(v_scale)
-            # INT8 requires explicit clamping to [-128, 127]
-            # FP8 has automatic saturation, but INT8 needs manual clamp
+            # INT8: divide by scale then clamp to [-128, 127]
+            if INT8_PER_HEAD_SCALE:
+                cur_head = tile_pos // head_size
+                v_scale_val = tl.load(
+                    v_scale + cur_head, mask=tile_pos < (num_heads * head_size)
+                )
+            else:
+                v_scale_val = tl.load(v_scale)
+            # tl.store casts to the cache dtype (fp8/int8) on store
+            value_tile = value_load / v_scale_val
             if value_cache_ptr.dtype.element_ty == tl.int8:
+                # INT8 has no automatic saturation: clamp explicitly
                 value_tile = tl.clamp(value_tile, -128.0, 127.0)
     else:
         value_tile = value_load
@@ -131,8 +149,8 @@ def triton_reshape_and_cache_flash(
     value_cache: torch.Tensor,
     slot_mapping: torch.Tensor,  # [num_tokens]
     kv_cache_dtype: str,  # "auto", "fp8", "int8"
-    k_scale: torch.Tensor,  # float32
-    v_scale: torch.Tensor,  # float32
+    k_scale: torch.Tensor,  # float32 scalar (per-tensor) or [num_heads] (int8 per-head)
+    v_scale: torch.Tensor,  # float32 scalar (per-tensor) or [num_heads] (int8 per-head)
 ):
     num_heads = key.shape[1]
     head_size = key.shape[2]
@@ -183,6 +201,13 @@ def triton_reshape_and_cache_flash(
     )
 
     QUANTIZED_KV_CACHE = kv_cache_dtype.startswith(("fp8", "int8"))
+    # Per-head INT8 scale: k_scale is a 1-D tensor [num_heads] rather than a scalar.
+    # FP8 always uses per-tensor scale.
+    INT8_PER_HEAD_SCALE = (
+        kv_cache_dtype.startswith("int8")
+        and k_scale.ndim == 1
+        and k_scale.numel() > 1
+    )
     if QUANTIZED_KV_CACHE:
         assert kv_cache_torch_dtype in [
             torch.float8_e4m3fn,
@@ -237,6 +262,7 @@ def triton_reshape_and_cache_flash(
         USE_HEAD_MAJOR_LAYOUT=use_head_major_layout,
         # Quantization flags
         QUANTIZED_KV_CACHE=QUANTIZED_KV_CACHE,
+        INT8_PER_HEAD_SCALE=INT8_PER_HEAD_SCALE,
         # autotune parameters
         TILE_SIZE=TILE_SIZE,
         num_warps=num_warps,
