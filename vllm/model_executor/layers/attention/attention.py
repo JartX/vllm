@@ -479,9 +479,19 @@ class Attention(nn.Module, AttentionLayerBase):
                 )
 
     def calc_kv_scales(self, query, key, value):
+        # For INT8, the valid range is [-128, 127], so we use 127 as the
+        # quantization range to avoid saturation. The FP8 constants (200/100)
+        # are too large for INT8: K_SCALE_CONSTANT=200 saturates ~36% of K
+        # values (those above 63.5% of absmax). Use 127 for full INT8 range.
+        if self.kv_cache_dtype.startswith("int8"):
+            k_range = 127.0
+            v_range = 127.0
+        else:
+            k_range = self.k_range
+            v_range = self.v_range
         self._q_scale.copy_(torch.abs(query).max() / self.q_range)
-        self._k_scale.copy_(torch.abs(key).max() / self.k_range)
-        self._v_scale.copy_(torch.abs(value).max() / self.v_range)
+        self._k_scale.copy_(torch.abs(key).max() / k_range)
+        self._v_scale.copy_(torch.abs(value).max() / v_range)
         self._q_scale_float = self._q_scale.item()
         self._k_scale_float = self._k_scale.item()
         self._v_scale_float = self._v_scale.item()

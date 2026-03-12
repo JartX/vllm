@@ -87,18 +87,28 @@ class BaseKVCacheMethod(QuantizeMethodBase):
                         k_scale *= 2
                         v_scale *= 2
             elif k_scale_all_negative and v_scale_all_negative:
-                # No scales in checkpoint — fall back to 1.0
+                # No scales in checkpoint.
                 if is_int8:
+                    # INT8 with scale=1.0 is catastrophic: typical attention
+                    # values (e.g. ±0.1–0.5) all round to 0 in int8, destroying
+                    # all KV cache information and producing garbage output.
+                    # Automatically enable dynamic scale computation instead.
                     logger.warning_once(
-                        "INT8 KV cache requires calibrated scaling factors. "
-                        "Using default scale=1.0 will likely cause severe accuracy "
-                        "loss. "
-                        "Please either: "
-                        "(1) Use a checkpoint with calibrated k/v_scale."
-                        "(2) Set calculate_kv_scales=True for on-the-fly calibration."
-                        "(3) Use FP8 KV cache instead."
-                        "Expected: scale = absmax(tensor) / 127 for INT8."
+                        "INT8 KV cache: no calibrated k/v_scale found in "
+                        "checkpoint. Automatically enabling --calculate-kv-scales "
+                        "to compute scales from the first batch. For best accuracy, "
+                        "use a checkpoint with pre-calibrated k/v_scale values "
+                        "(scale = absmax(tensor) / 127 for INT8)."
                     )
+                    layer.calculate_kv_scales = True
+                    # Exit early — dynamic computation will set _k_scale/_v_scale
+                    # on the first forward pass via calc_kv_scales().
+                    del layer.k_scale
+                    del layer.v_scale
+                    del layer.q_scale
+                    del layer.prob_scale
+                    return
+                # FP8 fall back to 1.0 (less catastrophic than INT8)
                 k_scale = 1.0
                 v_scale = 1.0
             else:
