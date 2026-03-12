@@ -109,6 +109,15 @@ def kernel_unified_attention_2d(
     INT8_PER_HEAD_SCALE: tl.constexpr = False,  # bool, True for int8 per-head scale
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
+    INT8_PER_TOKEN_SCALE: tl.constexpr = False,  # bool, True for per-(token,head) scale cache
+    k_scale_cache_ptr=None,  # [num_blocks, block_size, num_kv_heads] float32
+    v_scale_cache_ptr=None,  # [num_blocks, block_size, num_kv_heads] float32
+    stride_ks_blk=0,
+    stride_ks_slot=0,
+    stride_ks_head=0,
+    stride_vs_blk=0,
+    stride_vs_slot=0,
+    stride_vs_head=0,
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -266,12 +275,24 @@ def kernel_unified_attention_2d(
                 # FP8 KV: use native fp8 in the dot product
                 K = K_load
             else:
-                # INT8 KV (or other non-fp8 quantized): always dequantize
-                if INT8_PER_HEAD_SCALE:
+                # INT8 KV: dequantize with appropriate scale granularity
+                if INT8_PER_TOKEN_SCALE:
+                    # Per-(token,head) scale stored in scale cache
+                    k_scale_idx = (
+                        physical_block_idx * stride_ks_blk
+                        + (seq_offset % BLOCK_SIZE) * stride_ks_slot
+                        + kv_head_idx * stride_ks_head
+                    )
+                    k_token_scales = tl.load(
+                        k_scale_cache_ptr + k_scale_idx, mask=tile_mask, other=1.0
+                    )
+                    K = (K_load.to(tl.float32) * k_token_scales[None, :]).to(Q.dtype)
+                elif INT8_PER_HEAD_SCALE:
                     k_scale_val = tl.load(k_scale + kv_head_idx)
+                    K = (K_load.to(tl.float32) * k_scale_val).to(Q.dtype)
                 else:
                     k_scale_val = tl.load(k_scale)
-                K = (K_load.to(tl.float32) * k_scale_val).to(Q.dtype)
+                    K = (K_load.to(tl.float32) * k_scale_val).to(Q.dtype)
         else:
             K = K_load
 
@@ -287,12 +308,23 @@ def kernel_unified_attention_2d(
                 # FP8 KV: use native fp8 in the dot product
                 V = V_load
             else:
-                # INT8 KV (or other non-fp8 quantized): always dequantize
-                if INT8_PER_HEAD_SCALE:
+                # INT8 KV: dequantize with appropriate scale granularity
+                if INT8_PER_TOKEN_SCALE:
+                    v_scale_idx = (
+                        physical_block_idx * stride_vs_blk
+                        + (seq_offset % BLOCK_SIZE) * stride_vs_slot
+                        + kv_head_idx * stride_vs_head
+                    )
+                    v_token_scales = tl.load(
+                        v_scale_cache_ptr + v_scale_idx, mask=tile_mask, other=1.0
+                    )
+                    V = (V_load.to(tl.float32) * v_token_scales[:, None]).to(Q.dtype)
+                elif INT8_PER_HEAD_SCALE:
                     v_scale_val = tl.load(v_scale + kv_head_idx)
+                    V = (V_load.to(tl.float32) * v_scale_val).to(Q.dtype)
                 else:
                     v_scale_val = tl.load(v_scale)
-                V = (V_load.to(tl.float32) * v_scale_val).to(Q.dtype)
+                    V = (V_load.to(tl.float32) * v_scale_val).to(Q.dtype)
         else:
             V = V_load
 
@@ -469,6 +501,15 @@ def kernel_unified_attention_3d(
     MAX_MM_RANGES: tl.constexpr,  # int
     mm_prefix_range_ptr,  # [num_seqs] - prefix length for each sequence
     INT8_PER_HEAD_SCALE: tl.constexpr = False,  # bool, True for int8 per-head scale
+    INT8_PER_TOKEN_SCALE: tl.constexpr = False,  # bool, True for per-(token,head) scale cache
+    k_scale_cache_ptr=None,  # [num_blocks, block_size, num_kv_heads] float32
+    v_scale_cache_ptr=None,  # [num_blocks, block_size, num_kv_heads] float32
+    stride_ks_blk=0,
+    stride_ks_slot=0,
+    stride_ks_head=0,
+    stride_vs_blk=0,
+    stride_vs_slot=0,
+    stride_vs_head=0,
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -635,12 +676,24 @@ def kernel_unified_attention_3d(
                 # FP8 KV: use native fp8 in the dot product
                 K = K_load
             else:
-                # INT8 KV (or other non-fp8 quantized): always dequantize
-                if INT8_PER_HEAD_SCALE:
+                # INT8 KV: dequantize with appropriate scale granularity
+                if INT8_PER_TOKEN_SCALE:
+                    # Per-(token,head) scale stored in scale cache
+                    k_scale_idx = (
+                        physical_block_idx * stride_ks_blk
+                        + (seq_offset % BLOCK_SIZE) * stride_ks_slot
+                        + kv_head_idx * stride_ks_head
+                    )
+                    k_token_scales = tl.load(
+                        k_scale_cache_ptr + k_scale_idx, mask=tile_mask, other=1.0
+                    )
+                    K = (K_load.to(tl.float32) * k_token_scales[None, :]).to(Q.dtype)
+                elif INT8_PER_HEAD_SCALE:
                     k_scale_val = tl.load(k_scale + kv_head_idx)
+                    K = (K_load.to(tl.float32) * k_scale_val).to(Q.dtype)
                 else:
                     k_scale_val = tl.load(k_scale)
-                K = (K_load.to(tl.float32) * k_scale_val).to(Q.dtype)
+                    K = (K_load.to(tl.float32) * k_scale_val).to(Q.dtype)
         else:
             K = K_load
 
@@ -656,12 +709,23 @@ def kernel_unified_attention_3d(
                 # FP8 KV: use native fp8 in the dot product
                 V = V_load
             else:
-                # INT8 KV (or other non-fp8 quantized): always dequantize
-                if INT8_PER_HEAD_SCALE:
+                # INT8 KV: dequantize with appropriate scale granularity
+                if INT8_PER_TOKEN_SCALE:
+                    v_scale_idx = (
+                        physical_block_idx * stride_vs_blk
+                        + (seq_offset % BLOCK_SIZE) * stride_vs_slot
+                        + kv_head_idx * stride_vs_head
+                    )
+                    v_token_scales = tl.load(
+                        v_scale_cache_ptr + v_scale_idx, mask=tile_mask, other=1.0
+                    )
+                    V = (V_load.to(tl.float32) * v_token_scales[:, None]).to(Q.dtype)
+                elif INT8_PER_HEAD_SCALE:
                     v_scale_val = tl.load(v_scale + kv_head_idx)
+                    V = (V_load.to(tl.float32) * v_scale_val).to(Q.dtype)
                 else:
                     v_scale_val = tl.load(v_scale)
-                V = (V_load.to(tl.float32) * v_scale_val).to(Q.dtype)
+                    V = (V_load.to(tl.float32) * v_scale_val).to(Q.dtype)
         else:
             V = V_load
 
@@ -939,6 +1003,9 @@ def unified_attention(
     # Optional tensor for prefix lengths (PrefixLM support)
     mm_prefix_range=None,
     use_alibi_sqrt=False,
+    # Optional per-token scale caches for INT8 KV cache
+    k_scale_cache=None,  # [num_blocks, block_size, num_kv_heads] float32
+    v_scale_cache=None,  # [num_blocks, block_size, num_kv_heads] float32
 ):
     assert causal, "Only causal attention is supported"
     assert q_descale is None, "Q scales not supported"
@@ -960,13 +1027,16 @@ def unified_attention(
     use_alibi_slopes = alibi_slopes is not None
     use_qq_bias = qq_bias is not None
     # True when KV cache is quantized (fp8/int8); kernel dequantizes with scale
-    use_quantized_kv = k_descale is not None
+    use_quantized_kv = k_descale is not None or k_scale_cache is not None
+    # True when INT8 uses per-(token,head) scale caches (highest quality).
+    int8_per_token_scale = k_scale_cache is not None
     # True when INT8 KV uses per-head scales: k_descale is a 1-D tensor
     # [num_kv_heads] (passed directly from triton_attn, NOT expand'd).
-    # FP8 always uses per-tensor scale; INT8 may be per-tensor (scalar/0-dim)
-    # or per-head (1-D, numel > 1).
+    # Per-token scale takes priority; per-head is the fallback.
     int8_per_head_scale = (
-        use_quantized_kv
+        not int8_per_token_scale
+        and use_quantized_kv
+        and k_descale is not None
         and k_descale.ndim == 1
         and k_descale.numel() > 1
     )
@@ -1081,6 +1151,15 @@ def unified_attention(
             USE_FP8=output_scale is not None,
             USE_QUANTIZED_KV=use_quantized_kv,
             INT8_PER_HEAD_SCALE=int8_per_head_scale,
+            INT8_PER_TOKEN_SCALE=int8_per_token_scale,
+            k_scale_cache_ptr=k_scale_cache,
+            v_scale_cache_ptr=v_scale_cache,
+            stride_ks_blk=k_scale_cache.stride(0) if k_scale_cache is not None else 0,
+            stride_ks_slot=k_scale_cache.stride(1) if k_scale_cache is not None else 0,
+            stride_ks_head=k_scale_cache.stride(2) if k_scale_cache is not None else 0,
+            stride_vs_blk=v_scale_cache.stride(0) if v_scale_cache is not None else 0,
+            stride_vs_slot=v_scale_cache.stride(1) if v_scale_cache is not None else 0,
+            stride_vs_head=v_scale_cache.stride(2) if v_scale_cache is not None else 0,
         )
     else:
         kernel_unified_attention_3d[
@@ -1135,6 +1214,15 @@ def unified_attention(
             NUM_SEGMENTS_PER_SEQ=num_par_softmax_segments,
             USE_QUANTIZED_KV=use_quantized_kv,
             INT8_PER_HEAD_SCALE=int8_per_head_scale,
+            INT8_PER_TOKEN_SCALE=int8_per_token_scale,
+            k_scale_cache_ptr=k_scale_cache,
+            v_scale_cache_ptr=v_scale_cache,
+            stride_ks_blk=k_scale_cache.stride(0) if k_scale_cache is not None else 0,
+            stride_ks_slot=k_scale_cache.stride(1) if k_scale_cache is not None else 0,
+            stride_ks_head=k_scale_cache.stride(2) if k_scale_cache is not None else 0,
+            stride_vs_blk=v_scale_cache.stride(0) if v_scale_cache is not None else 0,
+            stride_vs_slot=v_scale_cache.stride(1) if v_scale_cache is not None else 0,
+            stride_vs_head=v_scale_cache.stride(2) if v_scale_cache is not None else 0,
         )
         reduce_segments[(q.shape[0], num_query_heads)](
             output_ptr=out,

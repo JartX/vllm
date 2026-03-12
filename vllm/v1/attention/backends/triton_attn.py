@@ -31,6 +31,7 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.ops.triton_prefill_attention import context_attention_fwd
 from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash,
+    triton_reshape_and_cache_flash_int8_per_token,
 )
 from vllm.v1.attention.ops.triton_unified_attention import unified_attention
 from vllm.v1.kv_cache_interface import AttentionSpec
@@ -408,6 +409,10 @@ class TritonAttentionImpl(AttentionImpl):
             )
         self.use_alibi_sqrt = use_alibi_sqrt
         self.supports_quant_query_input = current_platform.is_cuda()
+        # Lazy-allocated per-(token,head) scale caches for INT8 KV cache.
+        # Shape: [num_blocks, block_size, num_kv_heads], dtype=float32.
+        self._int8_k_scale_cache: torch.Tensor | None = None
+        self._int8_v_scale_cache: torch.Tensor | None = None
 
     def forward(
         self,
@@ -500,10 +505,19 @@ class TritonAttentionImpl(AttentionImpl):
         descale_shape = (cu_seqlens_q.shape[0] - 1, key_cache.shape[2])
         mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
 
+        # For INT8 per-token scale, pass scale caches directly; k_descale unused.
         # For INT8 per-head scale (_k_scale is [num_kv_heads]), pass the 1-D
         # tensor directly so unified_attention can detect the granularity.
         # For FP8 / INT8 per-tensor, expand to (num_seqs, num_kv_heads) as usual.
-        if (
+        int8_k_scale_cache = None
+        int8_v_scale_cache = None
+        if self.kv_cache_dtype.startswith("int8") and self._int8_k_scale_cache is not None:
+            # Per-token path: scale caches hold the dequant scales; k_descale unused.
+            int8_k_scale_cache = self._int8_k_scale_cache
+            int8_v_scale_cache = self._int8_v_scale_cache
+            k_descale = None
+            v_descale = None
+        elif (
             self.kv_cache_dtype.startswith("int8")
             and layer._k_scale.ndim == 1
             and layer._k_scale.numel() > 1
@@ -541,6 +555,8 @@ class TritonAttentionImpl(AttentionImpl):
             sinks=self.sinks,
             output_scale=output_scale,
             mm_prefix_range=mm_prefix_range_tensor,
+            k_scale_cache=int8_k_scale_cache,
+            v_scale_cache=int8_v_scale_cache,
         )
 
         return output
@@ -616,6 +632,32 @@ class TritonAttentionImpl(AttentionImpl):
         elif self.kv_cache_dtype.startswith("int8"):
             key_cache = key_cache.view(self.int8_dtype)
             value_cache = value_cache.view(self.int8_dtype)
+            # Lazily allocate per-(token,head) scale caches on first call.
+            # [num_blocks, block_size, num_kv_heads]
+            if self._int8_k_scale_cache is None:
+                num_blocks = key_cache.shape[0]
+                block_size = key_cache.shape[1]
+                num_kv_heads = key_cache.shape[2]
+                self._int8_k_scale_cache = torch.ones(
+                    (num_blocks, block_size, num_kv_heads),
+                    dtype=torch.float32,
+                    device=key_cache.device,
+                )
+                self._int8_v_scale_cache = torch.ones(
+                    (num_blocks, block_size, num_kv_heads),
+                    dtype=torch.float32,
+                    device=value_cache.device,
+                )
+            triton_reshape_and_cache_flash_int8_per_token(
+                key,
+                value,
+                key_cache,
+                value_cache,
+                self._int8_k_scale_cache,
+                self._int8_v_scale_cache,
+                slot_mapping,
+            )
+            return
         triton_reshape_and_cache_flash(
             key,
             value,
