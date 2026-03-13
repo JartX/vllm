@@ -324,14 +324,12 @@ torch::Tensor LLMM1(at::Tensor& in_a, at::Tensor& in_b,
       V0 += (s.x + s.y);                                             \
     }
 #elif defined(__HIP__GFX1X__)
-  // gfx1x: v_dot2_f32_f16 (VOP3-P, dot10-insts, available on gfx11+gfx12)
-  #define DOT2C(V0, V2, V3)                                               \
-    if constexpr (std::is_same_v<scalar_t, half>) {                       \
-      asm("v_dot2_f32_f16 %0, %1, %2, %0" : "+v"(V0) : "v"(V2), "v"(V3)); \
-    } else if constexpr (std::is_same_v<scalar_t, __hip_bfloat16>) {      \
-      float2 s = __bfloat1622float2(*((__hip_bfloat162*)(&(V2)))) *       \
-                 __bfloat1622float2(*((__hip_bfloat162*)(&(V3))));        \
-      V0 += (s.x + s.y);                                                  \
+  // gfx1x: v_dot2_f32_f16 / v_dot2_f32_bf16 (VOP3-P, dot10-insts, gfx11+)
+  #define DOT2C(V0, V2, V3)                                                  \
+    if constexpr (std::is_same_v<scalar_t, half>) {                          \
+      asm("v_dot2_f32_f16 %0, %1, %2, %0" : "+v"(V0) : "v"(V2), "v"(V3));  \
+    } else if constexpr (std::is_same_v<scalar_t, __hip_bfloat16>) {         \
+      asm("v_dot2_f32_bf16 %0, %1, %2, %0" : "+v"(V0) : "v"(V2), "v"(V3)); \
     }
 #endif
 
@@ -1242,6 +1240,23 @@ torch::Tensor wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,
       WVSPLITK_CFG(_THRDS, _WVPRGRP, 4, 2, __N)           \
   }
 
+  // wave32 variant: double UNRL to compensate for half the lanes (32 vs 64),
+  // and use WvPrGrp=32 to match GFX9's 1024 threads per workgroup.
+#define WVSPLIT_TILE_W32(_sYT, __N)                       \
+  {                                                       \
+    bool fit_lds = (Kbp_in * N_in <= max_lds_len);        \
+    if (_sYT <= 1)                                        \
+      WVSPLITK_CFG(32, 32, 1, 8, __N)                     \
+    else if ((__N == 1) || (!fit_lds) || (_sYT <= 4 * 2)) \
+      WVSPLITK_CFG(32, 32, 2, 4, __N)                     \
+    else if (_sYT <= 4 * 3)                               \
+      WVSPLITK_CFG(32, 32, 3, 4, __N)                     \
+    else if (__N == 4)                                    \
+      WVSPLITK_CFG(32, 32, 4, 2, __N)                     \
+    else                                                  \
+      WVSPLITK_CFG(32, 32, 4, 4, __N)                     \
+  }
+
   AT_DISPATCH_REDUCED_FLOATING_TYPES(in_b.scalar_type(), "wvSplitK", [&] {
     using fptype = typename scalar<scalar_t>::type;
     fptype* af4 = reinterpret_cast<fptype*>(in_a.data_ptr());
@@ -1260,25 +1275,25 @@ torch::Tensor wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,
     switch (N_in) {
       case 1:
         if (use_wave32)
-          WVSPLIT_TILE_CFG(32, 16, sYT, 1)
+          WVSPLIT_TILE_W32(sYT, 1)
         else
           WVSPLIT_TILE_CFG(64, 16, sYT, 1)
         break;
       case 2:
         if (use_wave32)
-          WVSPLIT_TILE_CFG(32, 16, sYT, 2)
+          WVSPLIT_TILE_W32(sYT, 2)
         else
           WVSPLIT_TILE_CFG(64, 16, sYT, 2)
         break;
       case 3:
         if (use_wave32)
-          WVSPLIT_TILE_CFG(32, 16, sYT, 3)
+          WVSPLIT_TILE_W32(sYT, 3)
         else
           WVSPLIT_TILE_CFG(64, 16, sYT, 3)
         break;
       case 4:
         if (use_wave32)
-          WVSPLIT_TILE_CFG(32, 16, sYT, 4)
+          WVSPLIT_TILE_W32(sYT, 4)
         else
           WVSPLIT_TILE_CFG(64, 16, sYT, 4)
         break;
