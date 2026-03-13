@@ -450,14 +450,32 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
       }
 
       // Do the matrix multiplication in interleaved manner
+      // b-inner on GFX9 preserves the original schedule;
+      // y-inner on GFX1X breaks the RAW chain on sum[n][y] between
+      // consecutive DOT2C ops (each writes a *different* accumulator),
+      // hiding the v_dot2 latency (~8 cy) behind independent work.
+  #pragma unroll
       for (uint32_t k2 = 0; k2 < UNRL; k2++) {
+  #pragma unroll
         for (uint32_t n = 0; n < N; n++) {
-          for (int y = 0; y < YTILE; y++) {
-            if constexpr (!use_mfma)
-              for (uint32_t b = 0; b < A_CHUNK / 2; b++) {
+          if constexpr (!use_mfma) {
+  #if defined(__HIP__GFX1X__)
+    #pragma unroll
+            for (uint32_t b = 0; b < A_CHUNK / 2; b++)
+    #pragma unroll
+              for (int y = 0; y < YTILE; y++)
                 DOT2C(sum[n][y], bigA[n][k2].f[b], bigB[y][k2].f[b])
-              }
-            else
+  #else
+    #pragma unroll
+            for (int y = 0; y < YTILE; y++)
+    #pragma unroll
+              for (uint32_t b = 0; b < A_CHUNK / 2; b++)
+                DOT2C(sum[n][y], bigA[n][k2].f[b], bigB[y][k2].f[b])
+  #endif
+          } else {
+  #pragma unroll
+            for (int y = 0; y < YTILE; y++)
+  #pragma unroll
               for (uint32_t b = 0; b < A_CHUNK / 4; b++)
                 sum4[n][y] = __builtin_amdgcn_mfma_f32_4x4x4bf16_1k(
                     bigA[n][k2].h4[b], bigB[y][k2].h4[b], sum4[n][y], 0, 0, 0);
@@ -465,7 +483,9 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
         }
       }
     }
+  #if defined(__HIP__GFX9__)
     __builtin_amdgcn_sched_barrier(0);
+  #endif
     //----------------------------------------------------
     // Final reduction step using shuffle
     //----------------------------------------------------
@@ -671,14 +691,28 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
       }
 
       // Do the matrix multiplication in interleaved manner
+  #pragma unroll
       for (uint32_t n = 0; n < N; n++) {
+  #pragma unroll
         for (uint32_t k2 = 0; k2 < UNRL; k2++) {
-          for (int y = 0; y < YTILE; y++) {
-            if constexpr (!use_mfma)
-              for (uint32_t b = 0; b < A_CHUNK / 2; b++) {
+          if constexpr (!use_mfma) {
+  #if defined(__HIP__GFX1X__)
+    #pragma unroll
+            for (uint32_t b = 0; b < A_CHUNK / 2; b++)
+    #pragma unroll
+              for (int y = 0; y < YTILE; y++)
                 DOT2C(sum[n][y], bigA[n][k2].f[b], bigB[y][k2].f[b])
-              }
-            else
+  #else
+    #pragma unroll
+            for (int y = 0; y < YTILE; y++)
+    #pragma unroll
+              for (uint32_t b = 0; b < A_CHUNK / 2; b++)
+                DOT2C(sum[n][y], bigA[n][k2].f[b], bigB[y][k2].f[b])
+  #endif
+          } else {
+  #pragma unroll
+            for (int y = 0; y < YTILE; y++)
+  #pragma unroll
               for (uint32_t b = 0; b < A_CHUNK / 4; b++)
                 sum4[n][y] = __builtin_amdgcn_mfma_f32_4x4x4bf16_1k(
                     bigA[n][k2].h4[b], bigB[y][k2].h4[b], sum4[n][y], 0, 0, 0);
@@ -691,7 +725,9 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
     // Final reduction step using shuffle
     //----------------------------------------------------
     if constexpr (!use_mfma) {
+  #pragma unroll
       for (int n = 0; n < N; n++) {
+  #pragma unroll
         for (int y = 0; y < YTILE; y++) {
           sum[n][y] += __builtin_amdgcn_mov_dpp(sum[n][y], 0x118, 0xf, 0xf,
                                                 1);  // row_shr8
@@ -739,9 +775,6 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
       for (int n = 0; n < N; n++) {
     #pragma unroll
         for (int y = 0; y < YTILE; y++) {
-          // float accm1 = 0;
-          // for (int i=0; i<64; i++)
-          //    accm1 += __shfl(sum4[n][y][i%4], i);
           float accm = sum4[n][y][0];
           accm += __builtin_amdgcn_mov_dpp(sum4[n][y][1], 0x101, 0xf, 0xf,
                                            1);  // row_shl1
@@ -1017,13 +1050,26 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
       // Do the matrix multiplication in interleaved manner
   #pragma unroll
       for (uint32_t k2 = 0; k2 < UNRL; k2++) {
+  #pragma unroll
         for (uint32_t n = 0; n < N; n++) {
-          for (int y = 0; y < YTILE; y++) {
-            if constexpr (!use_mfma)
-              for (uint32_t b = 0; b < A_CHUNK / 2; b++) {
+          if constexpr (!use_mfma) {
+  #if defined(__HIP__GFX1X__)
+    #pragma unroll
+            for (uint32_t b = 0; b < A_CHUNK / 2; b++)
+    #pragma unroll
+              for (int y = 0; y < YTILE; y++)
                 DOT2C(sum[n][y], bigA[n][k2].f[b], bigB[y][k2].f[b])
-              }
-            else
+  #else
+    #pragma unroll
+            for (int y = 0; y < YTILE; y++)
+    #pragma unroll
+              for (uint32_t b = 0; b < A_CHUNK / 2; b++)
+                DOT2C(sum[n][y], bigA[n][k2].f[b], bigB[y][k2].f[b])
+  #endif
+          } else {
+  #pragma unroll
+            for (int y = 0; y < YTILE; y++)
+  #pragma unroll
               for (uint32_t b = 0; b < A_CHUNK / 4; b++)
                 sum4[n][y] = __builtin_amdgcn_mfma_f32_4x4x4bf16_1k(
                     bigA[n][k2].h4[b], bigB[y][k2].h4[b], sum4[n][y], 0, 0, 0);
@@ -1044,7 +1090,9 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
     // Final reduction step using shuffle
     //----------------------------------------------------
     if constexpr (!use_mfma) {
+  #pragma unroll
       for (int n = 0; n < N; n++) {
+  #pragma unroll
         for (int y = 0; y < YTILE; y++) {
           sum[n][y] += __builtin_amdgcn_mov_dpp(sum[n][y], 0x118, 0xf, 0xf,
                                                 1);  // row_shr8
