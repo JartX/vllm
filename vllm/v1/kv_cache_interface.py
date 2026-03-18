@@ -44,6 +44,18 @@ class KVCacheSpec:
         """
         raise NotImplementedError
 
+    @property
+    def auxiliary_memory_per_block(self) -> int:
+        """Extra per-block memory not stored in the KV cache tensor itself.
+
+        Override in subclasses that allocate auxiliary buffers (e.g.
+        per-token quantization scale caches for INT8).
+        This is subtracted from available memory when computing how many
+        blocks fit, but is NOT included in page_size_bytes (which sizes
+        the KV cache tensor).
+        """
+        return 0
+
     def copy_with_new_block_size(self, block_size: int) -> Self:
         """
         Create a new KVCacheSpec from self but replacing the block size.
@@ -75,6 +87,20 @@ class AttentionSpec(KVCacheSpec):
             assert self.page_size_padded >= real_page_size
             return self.page_size_padded
         return real_page_size
+
+    @property
+    def auxiliary_memory_per_block(self) -> int:
+        """Per-block memory for auxiliary buffers allocated outside the KV
+        cache tensor (e.g. INT8 per-token scale caches).
+
+        This is factored into the block count calculation but NOT into
+        page_size_bytes, which must match the KV cache tensor layout
+        exactly for reshape/view to work.
+        """
+        if self.dtype != torch.int8:
+            return 0
+        # Two scale buffers (K and V), each [block_size, num_kv_heads] f32.
+        return 2 * self.block_size * self.num_kv_heads * get_dtype_size(torch.float32)
 
     @property
     def real_page_size_bytes(self) -> int:

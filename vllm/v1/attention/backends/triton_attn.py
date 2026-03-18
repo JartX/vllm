@@ -26,11 +26,13 @@ from vllm.v1.attention.backend import (
     AttentionMetadataBuilder,
     AttentionType,
     CommonAttentionMetadata,
+    KVQuantMode,
     MultipleOf,
 )
 from vllm.v1.attention.ops.triton_prefill_attention import context_attention_fwd
 from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash,
+    triton_reshape_and_cache_flash_int8_per_token,
 )
 from vllm.v1.attention.ops.triton_unified_attention import unified_attention
 from vllm.v1.kv_cache_interface import AttentionSpec
@@ -268,6 +270,7 @@ class TritonAttentionBackend(AttentionBackend):
         "fp8",
         "fp8_e4m3",
         "fp8_e5m2",
+        "int8",
     ]
 
     @staticmethod
@@ -472,13 +475,33 @@ class TritonAttentionImpl(AttentionImpl):
 
         # For decoder and cross-attention, use KV cache as before
         key_cache, value_cache = kv_cache.unbind(1)
-        if self.kv_cache_dtype.startswith("fp8"):
-            if key_cache.dtype != self.fp8_dtype:
-                key_cache = key_cache.view(self.fp8_dtype)
-                value_cache = value_cache.view(self.fp8_dtype)
-            assert layer._q_scale_float == 1.0, (
-                "A non 1.0 q_scale is not currently supported."
+
+        # INT8 KV cache: view as int8, use per-token scale caches.
+        if self.kv_quant_mode == KVQuantMode.INT8:
+            if key_cache.dtype != torch.int8:
+                key_cache = key_cache.view(torch.int8)
+                value_cache = value_cache.view(torch.int8)
+            k_descale = None
+            v_descale = None
+            k_scale_cache = self._k_scale_cache
+            v_scale_cache = self._v_scale_cache
+        # FP8 / auto path (original flow).
+        else:
+            if self.kv_quant_mode == KVQuantMode.FP8:
+                if key_cache.dtype != self.fp8_dtype:
+                    key_cache = key_cache.view(self.fp8_dtype)
+                    value_cache = value_cache.view(self.fp8_dtype)
+                assert layer._q_scale_float == 1.0, (
+                    "A non 1.0 q_scale is not currently supported."
+                )
+            descale_shape = (
+                attn_metadata.query_start_loc.shape[0] - 1,
+                key_cache.shape[2],
             )
+            k_descale = layer._k_scale.expand(descale_shape)
+            v_descale = layer._v_scale.expand(descale_shape)
+            k_scale_cache = None
+            v_scale_cache = None
 
         cu_seqlens_q = attn_metadata.query_start_loc
         seqused_k = attn_metadata.seq_lens
@@ -492,7 +515,6 @@ class TritonAttentionImpl(AttentionImpl):
         softmax_segm_max = attn_metadata.softmax_segm_max
         softmax_segm_expsum = attn_metadata.softmax_segm_expsum
 
-        descale_shape = (cu_seqlens_q.shape[0] - 1, key_cache.shape[2])
         mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
 
         unified_attention(
@@ -512,8 +534,8 @@ class TritonAttentionImpl(AttentionImpl):
             block_table=block_table,
             softcap=self.logits_soft_cap,
             q_descale=None,  # Not supported
-            k_descale=layer._k_scale.expand(descale_shape),
-            v_descale=layer._v_scale.expand(descale_shape),
+            k_descale=k_descale,
+            v_descale=v_descale,
             seq_threshold_3D=seq_threshold_3D,
             num_par_softmax_segments=num_par_softmax_segments,
             softmax_segm_output=softmax_segm_output,
@@ -522,6 +544,9 @@ class TritonAttentionImpl(AttentionImpl):
             sinks=self.sinks,
             output_scale=output_scale,
             mm_prefix_range=mm_prefix_range_tensor,
+            kv_quant_mode=self.kv_quant_mode,
+            k_scale_cache=k_scale_cache,
+            v_scale_cache=v_scale_cache,
         )
 
         return output
@@ -545,10 +570,10 @@ class TritonAttentionImpl(AttentionImpl):
             attn_metadata: Encoder attention metadata
             layer: The attention layer
         """
-        # For encoder attention, process FP8 quantization if needed
-        if self.kv_cache_dtype.startswith("fp8"):
+        # Quantized KV cache is not supported for encoder attention.
+        if self.kv_quant_mode != KVQuantMode.NONE:
             raise NotImplementedError(
-                "quantization is not supported for encoder attention"
+                "quantized KV cache is not supported for encoder attention"
             )
 
         # Use encoder-specific metadata for sequence information
@@ -588,12 +613,24 @@ class TritonAttentionImpl(AttentionImpl):
         key_cache, value_cache = kv_cache.unbind(1)
 
         # Reshape the input keys and values and store them in the cache.
-        if self.kv_cache_dtype.startswith("fp8"):
+        quant_mode = self.kv_quant_mode
+        if quant_mode == KVQuantMode.INT8:
+            key_cache = key_cache.view(torch.int8)
+            value_cache = value_cache.view(torch.int8)
+            k_sc, v_sc = self.ensure_int8_scale_caches(key_cache)
+            triton_reshape_and_cache_flash_int8_per_token(
+                key,
+                value,
+                key_cache,
+                value_cache,
+                k_sc,
+                v_sc,
+                slot_mapping,
+            )
+            return
+        if quant_mode == KVQuantMode.FP8:
             key_cache = key_cache.view(self.fp8_dtype)
             value_cache = value_cache.view(self.fp8_dtype)
-            # triton kernel does not support uint8 kv_cache
-            #  (because some explicit casts (e.g. float8_e4m3fnuz)
-            #   are not supported)
         triton_reshape_and_cache_flash(
             key,
             value,
@@ -623,7 +660,7 @@ class TritonAttentionImpl(AttentionImpl):
         key_cache, value_cache = kv_cache.unbind(1)
         flash_layout = True
 
-        is_fp8_kv_cache = self.kv_cache_dtype.startswith("fp8")
+        is_fp8_kv_cache = self.kv_quant_mode == KVQuantMode.FP8
         if is_fp8_kv_cache:
             key_cache = key_cache.view(self.fp8_dtype)
             value_cache = value_cache.view(self.fp8_dtype)
