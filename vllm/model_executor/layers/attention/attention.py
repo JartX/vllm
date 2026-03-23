@@ -40,6 +40,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     SlidingWindowSpec,
     get_kv_quant_mode,
+    kv_cache_uses_per_token_scales,
 )
 
 if TYPE_CHECKING:
@@ -363,7 +364,7 @@ class Attention(nn.Module, AttentionLayerBase):
         self.query_quant = None
         if self.impl.supports_quant_query_input and self.kv_cache_dtype.startswith(
             "fp8"
-        ):
+        ) and not kv_cache_uses_per_token_scales(self.kv_cache_dtype):
             is_per_head = (
                 hasattr(self, "q_scale") and self.q_scale.numel() == self.num_kv_heads
             )

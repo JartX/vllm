@@ -246,6 +246,8 @@ def _reshape_cache_per_token(
 # appropriate fp8 torch dtype with its representable range).
 _PER_TOKEN_QUANT_PARAMS: dict[torch.dtype, tuple[float, float]] = {
     torch.int8: (127.0, -128.0),
+    torch.float8_e4m3fn: (448.0, -448.0),
+    torch.float8_e4m3fnuz: (240.0, -240.0),
 }
 
 
@@ -313,6 +315,206 @@ def triton_reshape_and_cache_flash_per_token_quant(
         head_size_v=head_size_v,
         head_size_padded=head_size_padded,
         NUM_KV_HEADS=num_kv_heads,
+        QUANT_MAX=quant_max,
+        QUANT_MIN=quant_min,
+        num_warps=num_warps,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Per-token-group dynamic quantization kernel
+# Grid: (num_tokens,)
+# Each instance handles one token (all KV heads, all groups):
+#   1. For each (head, group): scale = absmax(group) / QUANT_MAX
+#   2. Quantizes and writes each group to kv_cache
+#   3. Writes each group scale to k_scale_cache / v_scale_cache
+#
+# Scale cache shape: [num_blocks, block_size, num_kv_heads, num_groups]
+# ---------------------------------------------------------------------------
+@triton.jit
+def _reshape_cache_per_token_group(
+    key_ptr,  # [num_tokens, num_kv_heads, head_size]
+    value_ptr,  # [num_tokens, num_kv_heads, head_size_v]
+    key_cache_ptr,  # [num_blocks, block_size, num_kv_heads, head_size]
+    value_cache_ptr,  # [num_blocks, block_size, num_kv_heads, head_size_v]
+    k_scale_cache_ptr,  # [num_blocks, block_size, num_kv_heads, num_groups]
+    v_scale_cache_ptr,  # [num_blocks, block_size, num_kv_heads, num_groups]
+    slot_mapping_ptr,  # [num_tokens]
+    stride_key_tok: tl.int64,
+    stride_key_head: tl.int64,
+    stride_val_tok: tl.int64,
+    stride_val_head: tl.int64,
+    stride_kc_blk: tl.int64,
+    stride_kc_slot: tl.int64,
+    stride_kc_head: tl.int64,
+    stride_vc_blk: tl.int64,
+    stride_vc_slot: tl.int64,
+    stride_vc_head: tl.int64,
+    stride_ks_blk: tl.int64,
+    stride_ks_slot: tl.int64,
+    stride_ks_head: tl.int64,
+    stride_vs_blk: tl.int64,
+    stride_vs_slot: tl.int64,
+    stride_vs_head: tl.int64,
+    block_size: tl.constexpr,
+    head_size: tl.constexpr,
+    head_size_v: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    NUM_KV_HEADS: tl.constexpr,
+    NUM_GROUPS_K: tl.constexpr,
+    NUM_GROUPS_V: tl.constexpr,
+    QUANT_MAX: tl.constexpr = 448.0,
+    QUANT_MIN: tl.constexpr = -448.0,
+):
+    tok = tl.program_id(0)
+
+    slot = tl.load(slot_mapping_ptr + tok).to(tl.int64)
+    if slot < 0:
+        return
+
+    blk = slot // block_size
+    slot_in_blk = slot % block_size
+
+    offs = tl.arange(0, GROUP_SIZE)
+
+    # ---- Key: per-(head, group) quantization --------------------------------
+    for h in tl.static_range(NUM_KV_HEADS):
+        for g in tl.static_range(NUM_GROUPS_K):
+            dim_offs = g * GROUP_SIZE + offs
+            mask = dim_offs < head_size
+
+            k = tl.load(
+                key_ptr + tok * stride_key_tok + h * stride_key_head + dim_offs,
+                mask=mask,
+                other=0.0,
+            ).to(tl.float32)
+
+            absmax = tl.max(tl.abs(tl.where(mask, k, 0.0)), axis=0)
+            scale = tl.maximum(absmax / QUANT_MAX, 1e-6)
+
+            tl.store(
+                k_scale_cache_ptr
+                + blk * stride_ks_blk
+                + slot_in_blk * stride_ks_slot
+                + h * stride_ks_head
+                + g,
+                scale,
+            )
+
+            k_q = tl.clamp(k / scale, QUANT_MIN, QUANT_MAX)
+            tl.store(
+                key_cache_ptr
+                + blk * stride_kc_blk
+                + slot_in_blk * stride_kc_slot
+                + h * stride_kc_head
+                + dim_offs,
+                k_q,
+                mask=mask,
+            )
+
+    # ---- Value: same approach -----------------------------------------------
+    for h in tl.static_range(NUM_KV_HEADS):
+        for g in tl.static_range(NUM_GROUPS_V):
+            dim_offs = g * GROUP_SIZE + offs
+            mask = dim_offs < head_size_v
+
+            v = tl.load(
+                value_ptr + tok * stride_val_tok + h * stride_val_head + dim_offs,
+                mask=mask,
+                other=0.0,
+            ).to(tl.float32)
+
+            absmax = tl.max(tl.abs(tl.where(mask, v, 0.0)), axis=0)
+            scale = tl.maximum(absmax / QUANT_MAX, 1e-6)
+
+            tl.store(
+                v_scale_cache_ptr
+                + blk * stride_vs_blk
+                + slot_in_blk * stride_vs_slot
+                + h * stride_vs_head
+                + g,
+                scale,
+            )
+
+            v_q = tl.clamp(v / scale, QUANT_MIN, QUANT_MAX)
+            tl.store(
+                value_cache_ptr
+                + blk * stride_vc_blk
+                + slot_in_blk * stride_vc_slot
+                + h * stride_vc_head
+                + dim_offs,
+                v_q,
+                mask=mask,
+            )
+
+
+def triton_reshape_and_cache_flash_per_token_group_quant(
+    key: torch.Tensor,  # [num_tokens, num_kv_heads, head_size]
+    value: torch.Tensor,  # [num_tokens, num_kv_heads, head_size_v]
+    key_cache: torch.Tensor,  # [num_blocks, block_size, num_kv_heads, head_size]
+    value_cache: torch.Tensor,  # [num_blocks, block_size, num_kv_heads, hs_v]
+    k_scale_cache: torch.Tensor,  # [num_blocks, block_size, num_kv_heads, ng]
+    v_scale_cache: torch.Tensor,  # [num_blocks, block_size, num_kv_heads, ng]
+    slot_mapping: torch.Tensor,  # [num_tokens]
+    group_size: int = 128,
+):
+    """Quantize key/value per (token, head, group) and write to paged cache.
+
+    Computes one scale per group of ``group_size`` elements within each
+    KV head, stores quantized data in key_cache/value_cache, and stores
+    the float32 scales in k_scale_cache/v_scale_cache.
+    """
+    cache_dtype = key_cache.dtype
+    quant_params = _PER_TOKEN_QUANT_PARAMS.get(cache_dtype)
+    if quant_params is None:
+        raise ValueError(
+            f"Per-token-group quantization not supported for cache dtype "
+            f"{cache_dtype}.  Supported: {list(_PER_TOKEN_QUANT_PARAMS)}"
+        )
+    quant_max, quant_min = quant_params
+
+    num_tokens, num_kv_heads, head_size = key.shape
+    head_size_v = value.shape[2]
+    num_groups_k = (head_size + group_size - 1) // group_size
+    num_groups_v = (head_size_v + group_size - 1) // group_size
+    block_size = key_cache.shape[1]
+
+    if current_platform.is_rocm() or current_platform.is_xpu():
+        num_warps = 4
+    else:
+        num_warps = min(16, max(1, group_size // 32))
+
+    _reshape_cache_per_token_group[(num_tokens,)](
+        key_ptr=key,
+        value_ptr=value,
+        key_cache_ptr=key_cache,
+        value_cache_ptr=value_cache,
+        k_scale_cache_ptr=k_scale_cache,
+        v_scale_cache_ptr=v_scale_cache,
+        slot_mapping_ptr=slot_mapping,
+        stride_key_tok=key.stride(0),
+        stride_key_head=key.stride(1),
+        stride_val_tok=value.stride(0),
+        stride_val_head=value.stride(1),
+        stride_kc_blk=key_cache.stride(0),
+        stride_kc_slot=key_cache.stride(1),
+        stride_kc_head=key_cache.stride(2),
+        stride_vc_blk=value_cache.stride(0),
+        stride_vc_slot=value_cache.stride(1),
+        stride_vc_head=value_cache.stride(2),
+        stride_ks_blk=k_scale_cache.stride(0),
+        stride_ks_slot=k_scale_cache.stride(1),
+        stride_ks_head=k_scale_cache.stride(2),
+        stride_vs_blk=v_scale_cache.stride(0),
+        stride_vs_slot=v_scale_cache.stride(1),
+        stride_vs_head=v_scale_cache.stride(2),
+        block_size=block_size,
+        head_size=head_size,
+        head_size_v=head_size_v,
+        GROUP_SIZE=group_size,
+        NUM_KV_HEADS=num_kv_heads,
+        NUM_GROUPS_K=num_groups_k,
+        NUM_GROUPS_V=num_groups_v,
         QUANT_MAX=quant_max,
         QUANT_MIN=quant_min,
         num_warps=num_warps,

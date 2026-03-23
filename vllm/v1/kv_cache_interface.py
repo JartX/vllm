@@ -75,8 +75,11 @@ def is_quantized_kv_cache(kv_cache_dtype: str) -> bool:
 
 
 def kv_cache_uses_per_token_scales(kv_cache_dtype: str) -> bool:
-    """Return True if *kv_cache_dtype* needs per-token scales."""
-    return get_kv_quant_mode(kv_cache_dtype) == KVQuantMode.PER_TOKEN
+    """Return True if *kv_cache_dtype* needs dynamic per-token/per-group scales."""
+    return get_kv_quant_mode(kv_cache_dtype) in (
+        KVQuantMode.PER_TOKEN,
+        KVQuantMode.PER_TOKEN_GROUP,
+    )
 
 
 @dataclass(frozen=True)

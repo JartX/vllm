@@ -106,16 +106,23 @@ def kernel_unified_attention_2d(
     num_seqs: tl.int32,
     BLOCK_M: tl.constexpr,  # int
     USE_FP8: tl.constexpr,  # bool
-    # KV cache quantization: 0=none, 1=fp8, 2=per-token
+    # KV cache quantization: 0=none, 1=fp8, 2=per-token, 3=per-token-group
     KV_QUANT_MODE: tl.constexpr = 0,
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
-    # Per-token scale caches (KV_QUANT_MODE == 2 only)
-    # Shape: [num_blocks, block_size] — one scale per token, shared across heads.
+    # Scale caches (KV_QUANT_MODE == 2 or 3)
+    # Mode 2: [num_blocks, block_size] — one scale per token.
+    # Mode 3: [num_blocks, block_size, num_kv_heads, num_groups].
     k_scale_cache_ptr=None,
     v_scale_cache_ptr=None,
     stride_ks_blk=0,
     stride_vs_blk=0,
+    # Extra strides for per-token-group (KV_QUANT_MODE == 3 only)
+    stride_ks_slot: tl.int64 = 0,
+    stride_ks_head: tl.int64 = 0,
+    stride_vs_slot: tl.int64 = 0,
+    stride_vs_head: tl.int64 = 0,
+    GROUP_SIZE: tl.constexpr = 128,
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -279,6 +286,23 @@ def kernel_unified_attention_2d(
             k_token_scales = tl.load(
                 k_scale_cache_ptr + k_scale_idx, mask=tile_mask, other=1.0
             )
+        elif KV_QUANT_MODE == 3:  # per-token-group quant
+            slot_in_blk = seq_offset % BLOCK_SIZE
+            k_sg_base = (
+                physical_block_idx * stride_ks_blk
+                + slot_in_blk * stride_ks_slot
+                + kv_head_idx * stride_ks_head
+            )  # [TILE_SIZE]
+            dim_offs = tl.arange(0, HEAD_SIZE_PADDED)
+            group_offs = dim_offs // GROUP_SIZE
+            k_sg_idx = k_sg_base[:, None] + group_offs[None, :]
+            k_group_scales = tl.load(
+                k_scale_cache_ptr + k_sg_idx,
+                mask=tile_mask[:, None] & (dim_offs[None, :] < HEAD_SIZE),
+                other=1.0,
+            )
+            # K_load: (HEAD_SIZE, TILE_SIZE), scales: (TILE_SIZE, HEAD_SIZE)
+            K = (K_load.to(tl.float32) * tl.trans(k_group_scales)).to(Q.dtype)
         else:
             K = K_load
 
@@ -300,6 +324,22 @@ def kernel_unified_attention_2d(
             v_token_scales = tl.load(
                 v_scale_cache_ptr + v_scale_idx, mask=tile_mask, other=1.0
             )
+        elif KV_QUANT_MODE == 3:  # per-token-group quant
+            slot_in_blk_v = seq_offset % BLOCK_SIZE
+            v_sg_base = (
+                physical_block_idx * stride_vs_blk
+                + slot_in_blk_v * stride_vs_slot
+                + kv_head_idx * stride_vs_head
+            )
+            dim_offs_v = tl.arange(0, HEAD_SIZE_PADDED)
+            group_offs_v = dim_offs_v // GROUP_SIZE
+            v_sg_idx = v_sg_base[:, None] + group_offs_v[None, :]
+            v_group_scales = tl.load(
+                v_scale_cache_ptr + v_sg_idx,
+                mask=tile_mask[:, None] & (dim_offs_v[None, :] < HEAD_SIZE),
+                other=1.0,
+            )
+            V = (V_load.to(tl.float32) * v_group_scales).to(Q.dtype)
         else:
             V = V_load
 
@@ -482,14 +522,19 @@ def kernel_unified_attention_3d(
     USE_MM_PREFIX: tl.constexpr,  # bool
     MAX_MM_RANGES: tl.constexpr,  # int
     mm_prefix_range_ptr,  # [num_seqs] - prefix length for each sequence
-    # KV cache quantization: 0=none, 1=fp8, 2=per-token
+    # KV cache quantization: 0=none, 1=fp8, 2=per-token, 3=per-token-group
     KV_QUANT_MODE: tl.constexpr = 0,
-    # Per-token scale caches (KV_QUANT_MODE == 2 only)
-    # Shape: [num_blocks, block_size] — one scale per token, shared across heads.
+    # Scale caches (KV_QUANT_MODE == 2 or 3)
     k_scale_cache_ptr=None,
     v_scale_cache_ptr=None,
     stride_ks_blk=0,
     stride_vs_blk=0,
+    # Extra strides for per-token-group (KV_QUANT_MODE == 3 only)
+    stride_ks_slot: tl.int64 = 0,
+    stride_ks_head: tl.int64 = 0,
+    stride_vs_slot: tl.int64 = 0,
+    stride_vs_head: tl.int64 = 0,
+    GROUP_SIZE: tl.constexpr = 128,
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -662,6 +707,22 @@ def kernel_unified_attention_3d(
             k_token_scales = tl.load(
                 k_scale_cache_ptr + k_scale_idx, mask=tile_mask, other=1.0
             )
+        elif KV_QUANT_MODE == 3:  # per-token-group quant
+            slot_in_blk = seq_offset % BLOCK_SIZE
+            k_sg_base = (
+                physical_block_idx * stride_ks_blk
+                + slot_in_blk * stride_ks_slot
+                + kv_head_idx * stride_ks_head
+            )
+            dim_offs = tl.arange(0, HEAD_SIZE_PADDED)
+            group_offs = dim_offs // GROUP_SIZE
+            k_sg_idx = k_sg_base[:, None] + group_offs[None, :]
+            k_group_scales = tl.load(
+                k_scale_cache_ptr + k_sg_idx,
+                mask=tile_mask[:, None] & (dim_offs[None, :] < HEAD_SIZE),
+                other=1.0,
+            )
+            K = (K_load.to(tl.float32) * tl.trans(k_group_scales)).to(Q.dtype)
         else:
             K = K_load
 
@@ -683,6 +744,22 @@ def kernel_unified_attention_3d(
             v_token_scales = tl.load(
                 v_scale_cache_ptr + v_scale_idx, mask=tile_mask, other=1.0
             )
+        elif KV_QUANT_MODE == 3:  # per-token-group quant
+            slot_in_blk_v = seq_offset % BLOCK_SIZE
+            v_sg_base = (
+                physical_block_idx * stride_vs_blk
+                + slot_in_blk_v * stride_vs_slot
+                + kv_head_idx * stride_vs_head
+            )
+            dim_offs_v = tl.arange(0, HEAD_SIZE_PADDED)
+            group_offs_v = dim_offs_v // GROUP_SIZE
+            v_sg_idx = v_sg_base[:, None] + group_offs_v[None, :]
+            v_group_scales = tl.load(
+                v_scale_cache_ptr + v_sg_idx,
+                mask=tile_mask[:, None] & (dim_offs_v[None, :] < HEAD_SIZE),
+                other=1.0,
+            )
+            V = (V_load.to(tl.float32) * v_group_scales).to(Q.dtype)
         else:
             V = V_load
 
@@ -968,10 +1045,11 @@ def unified_attention(
     # Optional tensor for prefix lengths (PrefixLM support)
     mm_prefix_range=None,
     use_alibi_sqrt=False,
-    # KV cache quantization mode and per-token scale caches.
+    # KV cache quantization mode and scale caches.
     kv_quant_mode: KVQuantMode = KVQuantMode.NONE,
-    k_scale_cache=None,  # [num_blocks, block_size] float32
-    v_scale_cache=None,  # [num_blocks, block_size] float32
+    k_scale_cache=None,  # [num_blocks, block_size] or [num_blocks, bs, heads, ng]
+    v_scale_cache=None,  # [num_blocks, block_size] or [num_blocks, bs, heads, ng]
+    group_size: int = 128,  # group size for PER_TOKEN_GROUP mode
 ):
     assert causal, "Only causal attention is supported"
     assert q_descale is None, "Q scales not supported"
@@ -998,14 +1076,17 @@ def unified_attention(
     # kv_quant_mode explicitly.  This fallback exists for backward
     # compatibility with tests that call unified_attention() directly.
     if kv_quant_mode == KVQuantMode.NONE:
-        if k_scale_cache is not None:
-            # Per-token scale caches provided → per-token quant,
-            # regardless of whether the cache dtype is int8 or fp8.
+        if k_scale_cache is not None and k_scale_cache.ndim == 4:
+            kv_quant_mode = KVQuantMode.PER_TOKEN_GROUP
+        elif k_scale_cache is not None:
             kv_quant_mode = KVQuantMode.PER_TOKEN
         elif k.dtype == torch.int8:
             kv_quant_mode = KVQuantMode.PER_TOKEN
         elif k.is_floating_point() and k.element_size() == 1:
             kv_quant_mode = KVQuantMode.FP8
+
+    # Per-token-group needs extra strides from the 4D scale cache.
+    _is_group = kv_quant_mode == KVQuantMode.PER_TOKEN_GROUP
 
     block_size = v.shape[1]
     num_seqs = len(seqused_k)
@@ -1120,6 +1201,15 @@ def unified_attention(
             v_scale_cache_ptr=v_scale_cache,
             stride_ks_blk=k_scale_cache.stride(0) if k_scale_cache is not None else 0,
             stride_vs_blk=v_scale_cache.stride(0) if v_scale_cache is not None else 0,
+            stride_ks_slot=k_scale_cache.stride(1) if _is_group else 0,
+            stride_ks_head=k_scale_cache.stride(2) if _is_group else 0,
+            stride_vs_slot=v_scale_cache.stride(1) if _is_group else 0,
+            stride_vs_head=v_scale_cache.stride(2) if _is_group else 0,
+            GROUP_SIZE=group_size,
+            # Per-group dequant loads [TILE, HEAD_SIZE_PADDED] scale tensors
+            # in float32, which can exceed shared memory with default
+            # pipelining.  Reduce num_stages to 1 to stay within limits.
+            **({'num_stages': 1} if _is_group else {}),
         )
     else:
         kernel_unified_attention_3d[
@@ -1177,6 +1267,12 @@ def unified_attention(
             v_scale_cache_ptr=v_scale_cache,
             stride_ks_blk=k_scale_cache.stride(0) if k_scale_cache is not None else 0,
             stride_vs_blk=v_scale_cache.stride(0) if v_scale_cache is not None else 0,
+            stride_ks_slot=k_scale_cache.stride(1) if _is_group else 0,
+            stride_ks_head=k_scale_cache.stride(2) if _is_group else 0,
+            stride_vs_slot=v_scale_cache.stride(1) if _is_group else 0,
+            stride_vs_head=v_scale_cache.stride(2) if _is_group else 0,
+            GROUP_SIZE=group_size,
+            **({'num_stages': 1} if _is_group else {}),
         )
         reduce_segments[(q.shape[0], num_query_heads)](
             output_ptr=out,
