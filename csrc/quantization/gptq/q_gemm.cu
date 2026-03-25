@@ -63,11 +63,25 @@ __forceinline__ __device__ half2 dot22_8(half2 (&dq)[4], const half* a_ptr,
 }
 
 __forceinline__ __device__ float dot22_8_f(half2 (&dq)[4], const half* a_ptr) {
+#if defined(USE_ROCM) && (defined(__gfx1100__) || defined(__gfx1101__) || \
+    defined(__gfx1150__) || defined(__gfx1151__) ||                       \
+    defined(__gfx1200__) || defined(__gfx1201__))
+  // RDNA 3/4: use v_dot2_f32_f16 to accumulate directly in fp32
+  float result = 0.f;
+  const half2* a2_ptr = (const half2*)a_ptr;
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    auto a_val = *a2_ptr++;
+    asm("v_dot2_f32_f16 %0, %1, %2, %0" : "+v"(result) : "v"(dq[i]), "v"(a_val));
+  }
+  return result;
+#else
   half2 result = {};
   const half2* a2_ptr = (const half2*)a_ptr;
 #pragma unroll
   for (int i = 0; i < 4; i++) result = __hfma2(dq[i], *a2_ptr++, result);
   return __half2float(__low2half(result)) + __half2float(__high2half(result));
+#endif
 }
 
 __forceinline__ __device__ half2 dot22_8(half2 (&dq)[4], const half* a_ptr,
@@ -103,6 +117,18 @@ __forceinline__ __device__ half2 dot22_32(half2 (&dq)[16], const half* a_ptr,
 __forceinline__ __device__ float dot22_8_f(half2 (&dq)[4], const half* a_ptr,
                                            const float g_result,
                                            const float qs_f) {
+#if defined(USE_ROCM) && (defined(__gfx1100__) || defined(__gfx1101__) || \
+    defined(__gfx1150__) || defined(__gfx1151__) ||                       \
+    defined(__gfx1200__) || defined(__gfx1201__))
+  float result_f = 0.f;
+  const half2* a2_ptr = (const half2*)a_ptr;
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    auto a_val = *a2_ptr++;
+    asm("v_dot2_f32_f16 %0, %1, %2, %0" : "+v"(result_f) : "v"(dq[i]), "v"(a_val));
+  }
+  return fma(result_f, qs_f, g_result);
+#else
   half2 result = {};
   const half2* a2_ptr = (const half2*)a_ptr;
 #pragma unroll
@@ -110,11 +136,24 @@ __forceinline__ __device__ float dot22_8_f(half2 (&dq)[4], const half* a_ptr,
   float result_f =
       __half2float(__low2half(result)) + __half2float(__high2half(result));
   return fma(result_f, qs_f, g_result);
+#endif
 }
 
 __forceinline__ __device__ float dot22_16_f(half2 (&dq)[8], const half* a_ptr,
                                             const float g_result,
                                             const float qs_f) {
+#if defined(USE_ROCM) && (defined(__gfx1100__) || defined(__gfx1101__) || \
+    defined(__gfx1150__) || defined(__gfx1151__) ||                       \
+    defined(__gfx1200__) || defined(__gfx1201__))
+  float result_f = 0.f;
+  const half2* a2_ptr = (const half2*)a_ptr;
+#pragma unroll
+  for (int i = 0; i < 8; i++) {
+    auto a_val = *a2_ptr++;
+    asm("v_dot2_f32_f16 %0, %1, %2, %0" : "+v"(result_f) : "v"(dq[i]), "v"(a_val));
+  }
+  return fma(result_f, qs_f, g_result);
+#else
   half2 result = {};
   const half2* a2_ptr = (const half2*)a_ptr;
 #pragma unroll
@@ -122,11 +161,24 @@ __forceinline__ __device__ float dot22_16_f(half2 (&dq)[8], const half* a_ptr,
   float result_f =
       __half2float(__low2half(result)) + __half2float(__high2half(result));
   return fma(result_f, qs_f, g_result);
+#endif
 }
 
 __forceinline__ __device__ float dot22_32_f(half2 (&dq)[16], const half* a_ptr,
                                             const float g_result,
                                             const float qs_f) {
+#if defined(USE_ROCM) && (defined(__gfx1100__) || defined(__gfx1101__) || \
+    defined(__gfx1150__) || defined(__gfx1151__) ||                       \
+    defined(__gfx1200__) || defined(__gfx1201__))
+  float result_f = 0.f;
+  const half2* a2_ptr = (const half2*)a_ptr;
+#pragma unroll
+  for (int i = 0; i < 16; i++) {
+    auto a_val = *a2_ptr++;
+    asm("v_dot2_f32_f16 %0, %1, %2, %0" : "+v"(result_f) : "v"(dq[i]), "v"(a_val));
+  }
+  return fma(result_f, qs_f, g_result);
+#else
   half2 result = {};
   const half2* a2_ptr = (const half2*)a_ptr;
 #pragma unroll
@@ -134,6 +186,7 @@ __forceinline__ __device__ float dot22_32_f(half2 (&dq)[16], const half* a_ptr,
   float result_f =
       __half2float(__low2half(result)) + __half2float(__high2half(result));
   return fma(result_f, qs_f, g_result);
+#endif
 }
 
 __forceinline__ __device__ half dot22_8_h(half2 (&dq)[4], const half* a_ptr,
@@ -143,6 +196,16 @@ __forceinline__ __device__ half dot22_8_h(half2 (&dq)[4], const half* a_ptr,
   // in the range -128..127
 
   float result = {};
+#if defined(USE_ROCM) && (defined(__gfx1100__) || defined(__gfx1101__) || \
+    defined(__gfx1150__) || defined(__gfx1151__) ||                       \
+    defined(__gfx1200__) || defined(__gfx1201__))
+  const half2* a2_ptr = (const half2*)a_ptr;
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    auto a_val = *a2_ptr++;
+    asm("v_dot2_f32_f16 %0, %1, %2, %0" : "+v"(result) : "v"(dq[i]), "v"(a_val));
+  }
+#else
 #pragma unroll
   for (int i = 0; i < 4; i++) {
     half2 w01 = dq[i];
@@ -153,6 +216,7 @@ __forceinline__ __device__ half dot22_8_h(half2 (&dq)[4], const half* a_ptr,
     result = fma(w0, x0, result);
     result = fma(w1, x1, result);
   }
+#endif
   float qs = __half2float(qs_h);
   result *= qs;
   half result_h = __float2half_rn(result);
