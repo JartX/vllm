@@ -6572,22 +6572,25 @@ class GPUModelRunner(
                 if layer_name in self.runner_only_attn_layers:
                     continue
                 raw_tensor = kv_cache_raw_tensors[layer_name]
-                num_blocks = kv_cache_config.num_blocks
-                assert (
-                    raw_tensor.numel()
-                    >= kv_cache_spec.total_bytes_per_block * num_blocks
-                )
+                reshape_fn = getattr(attn_backend, "reshape_kv_cache_tensor", None)
+                if (
+                    reshape_fn is not None
+                    and isinstance(kv_cache_spec, AttentionSpec)
+                    and kv_cache_spec.kv_quant_mode.is_per_token
+                ):
+                    has_attn = True
+                    kv_caches[layer_name] = reshape_fn(
+                        raw_tensor,
+                        kv_cache_spec,
+                        kv_cache_config.num_blocks,
+                        kernel_block_size,
+                        cache_dtype_str=self.cache_config.cache_dtype,
+                    )
+                    continue
+                assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
+                num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
                 if isinstance(kv_cache_spec, AttentionSpec):
                     has_attn = True
-                    if kv_cache_spec.kv_quant_mode.is_per_token:
-                        kv_caches[layer_name] = attn_backend.reshape_kv_cache_tensor(
-                            raw_tensor,
-                            kv_cache_spec,
-                            num_blocks,
-                            kernel_block_size,
-                            cache_dtype_str=(self.cache_config.cache_dtype),
-                        )
-                        continue
                     num_blocks_per_kv_block = (
                         kv_cache_spec.block_size // kernel_block_size
                     )
@@ -6603,8 +6606,7 @@ class GPUModelRunner(
                     dtype = kv_cache_spec.dtype
                     try:
                         kv_cache_stride_order = attn_backend.get_kv_cache_stride_order()
-                        if len(kv_cache_stride_order) != len(kv_cache_shape):
-                            kv_cache_stride_order = tuple(range(len(kv_cache_shape)))
+                        assert len(kv_cache_stride_order) == len(kv_cache_shape)
                     except (AttributeError, NotImplementedError):
                         kv_cache_stride_order = tuple(range(len(kv_cache_shape)))
                     # The allocation respects the backend-defined stride order
