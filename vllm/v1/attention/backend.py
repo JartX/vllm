@@ -722,6 +722,13 @@ class AttentionImplBase(ABC, Generic[T]):
 class AttentionImpl(AttentionImplBase[T], Generic[T]):
     """Standard attention implementation with forward method."""
 
+    kv_cache_dtype: str
+
+    @property
+    def kv_quant_mode(self) -> "KVQuantMode":
+        """Return the KV cache quantization mode for this layer."""
+        return get_kv_quant_mode(self.kv_cache_dtype)
+
     @abstractmethod
     def __init__(
         self,
@@ -936,8 +943,13 @@ class SparseMLAAttentionImpl(AttentionImplBase[T], Generic[T]):
         )
 
 
-def is_quantized_kv_cache(kv_cache_dtype: str) -> bool:
-    return kv_cache_dtype.startswith("fp8")
+# Re-exported from kv_cache_interface for backward compatibility.
+from vllm.v1.kv_cache_interface import (  # noqa: E402, F401, F811
+    KVQuantMode,
+    get_kv_quant_mode,
+    is_quantized_kv_cache,
+    kv_cache_uses_per_token_scales,
+)
 
 
 def subclass_attention_backend(

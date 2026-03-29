@@ -1110,14 +1110,16 @@ def get_kv_cache_config_from_groups(
         # Special case: all layers have the same type of KV cache but with
         # different hidden size. Allocate different amount of memory for each
         # layer based on its hidden size.
-        num_blocks = (
-            available_memory // kv_cache_groups[0].kv_cache_spec.page_size_bytes
+        spec = kv_cache_groups[0].kv_cache_spec
+        alloc_per_block = sum(
+            s.total_bytes_per_block for s in spec.kv_cache_specs.values()
         )
+        num_blocks = available_memory // alloc_per_block
         num_blocks = may_override_num_blocks(vllm_config, num_blocks)
-        per_layer_specs = kv_cache_groups[0].kv_cache_spec.kv_cache_specs
+        per_layer_specs = spec.kv_cache_specs
         kv_cache_tensors = [
             KVCacheTensor(
-                size=per_layer_specs[layer_name].page_size_bytes * num_blocks,
+                size=per_layer_specs[layer_name].total_bytes_per_block * num_blocks,
                 shared_by=[layer_name],
             )
             for layer_name in kv_cache_groups[0].layer_names
@@ -1133,12 +1135,15 @@ def get_kv_cache_config_from_groups(
         # full.1, sw.2: share another Tensor with size=available_memory//2
         group_size = max(len(group.layer_names) for group in kv_cache_groups)
 
-        page_size = get_uniform_page_size(
-            [group.kv_cache_spec for group in kv_cache_groups]
+        effective_page_size = max(
+            group.kv_cache_spec.total_bytes_per_block for group in kv_cache_groups
         )
         assert group_size > 0, "group_size must be greater than 0"
         num_blocks = get_num_blocks(
-            vllm_config, group_size, available_memory, page_size
+            vllm_config,
+            group_size,
+            available_memory,
+            effective_page_size,
         )
         kv_cache_tensors = []
         for i in range(group_size):
@@ -1147,7 +1152,9 @@ def get_kv_cache_config_from_groups(
                 if i < len(kv_cache_groups[j].layer_names):
                     shared_by.append(kv_cache_groups[j].layer_names[i])
             kv_cache_tensors.append(
-                KVCacheTensor(size=page_size * num_blocks, shared_by=shared_by)
+                KVCacheTensor(
+                    size=effective_page_size * num_blocks, shared_by=shared_by
+                )
             )
 
     return KVCacheConfig(

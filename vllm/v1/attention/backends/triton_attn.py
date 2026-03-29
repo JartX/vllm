@@ -26,14 +26,17 @@ from vllm.v1.attention.backend import (
     AttentionMetadataBuilder,
     AttentionType,
     CommonAttentionMetadata,
+    KVQuantMode,
     MultipleOf,
+    get_kv_quant_mode,
 )
 from vllm.v1.attention.ops.triton_prefill_attention import context_attention_fwd
 from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash,
+    triton_reshape_and_cache_flash_per_token_quant,
 )
 from vllm.v1.attention.ops.triton_unified_attention import unified_attention
-from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.kv_cache_interface import AttentionSpec, kv_cache_uses_per_token_scales
 
 logger = init_logger(__name__)
 
@@ -268,6 +271,8 @@ class TritonAttentionBackend(AttentionBackend):
         "fp8",
         "fp8_e4m3",
         "fp8_e5m2",
+        "int8_per_token",
+        "fp8_per_token",
     ]
 
     @staticmethod
@@ -300,6 +305,13 @@ class TritonAttentionBackend(AttentionBackend):
     ) -> tuple[int, ...]:
         if block_size % 16 != 0:
             raise ValueError("Block size must be a multiple of 16.")
+        if kv_cache_uses_per_token_scales(cache_dtype_str):
+            # Flat layout: data + packed float32 scales per kv-half.
+            # The attention backend unpacks this internally.
+            data_per_kv = block_size * num_kv_heads * head_size  # 1-byte dtype
+            scale_per_kv = block_size * 4  # float32
+            kv_half = data_per_kv + scale_per_kv
+            return (num_blocks, 2, kv_half)
         return (num_blocks, 2, block_size, num_kv_heads, head_size)
 
     @staticmethod
@@ -355,6 +367,87 @@ class TritonAttentionBackend(AttentionBackend):
 
 
 class TritonAttentionImpl(AttentionImpl):
+    # Per-token quant: typed data and scale views extracted from the
+    # flat packed KV cache tensor.  Created lazily on first forward.
+    _key_data: torch.Tensor | None = None
+    _value_data: torch.Tensor | None = None
+    _k_scale_cache: torch.Tensor | None = None
+    _v_scale_cache: torch.Tensor | None = None
+    _packed_views_ready: bool = False
+
+    def _unpack_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        """Extract typed data and scale views from packed KV cache.
+
+        The flat tensor has shape ``(num_blocks, 2, kv_half_bytes)``
+        where each kv-half is laid out as::
+
+            [data: bs * nkv * hs bytes][scales: bs * 4 bytes]
+
+        Called once on the first forward pass; the views are cached
+        for subsequent calls.
+        """
+        from vllm.platforms import current_platform
+        from vllm.utils.torch_utils import get_dtype_size
+
+        num_blocks, _, kv_half = kv_cache.shape
+        if self._kv_quant_mode == KVQuantMode.FP8_PER_TOKEN:
+            dtype = current_platform.fp8_dtype()
+        else:
+            dtype = torch.int8
+        dtype_sz = get_dtype_size(dtype)
+        scale_sz = get_dtype_size(torch.float32)
+
+        bs = kv_half // (self.num_kv_heads * self.head_size * dtype_sz + scale_sz)
+        data_per_kv = bs * self.num_kv_heads * self.head_size * dtype_sz
+        assert kv_half == data_per_kv + bs * scale_sz, (
+            f"Packed KV layout mismatch: {kv_half} != {data_per_kv} + {bs * scale_sz}"
+        )
+        full_block = 2 * kv_half
+        raw = kv_cache.untyped_storage()
+
+        # Typed data views
+        base_q = torch.tensor([], dtype=dtype, device=kv_cache.device).set_(raw)
+        self._key_data = torch.as_strided(
+            base_q,
+            size=(num_blocks, bs, self.num_kv_heads, self.head_size),
+            stride=(
+                full_block // dtype_sz,
+                self.num_kv_heads * self.head_size,
+                self.head_size,
+                1,
+            ),
+            storage_offset=0,
+        )
+        self._value_data = torch.as_strided(
+            base_q,
+            size=(num_blocks, bs, self.num_kv_heads, self.head_size),
+            stride=(
+                full_block // dtype_sz,
+                self.num_kv_heads * self.head_size,
+                self.head_size,
+                1,
+            ),
+            storage_offset=kv_half // dtype_sz,
+        )
+
+        # Scale views
+        base_f32 = torch.tensor([], dtype=torch.float32, device=kv_cache.device).set_(
+            raw
+        )
+        self._k_scale_cache = torch.as_strided(
+            base_f32,
+            size=(num_blocks, bs),
+            stride=(full_block // scale_sz, 1),
+            storage_offset=data_per_kv // scale_sz,
+        )
+        self._v_scale_cache = torch.as_strided(
+            base_f32,
+            size=(num_blocks, bs),
+            stride=(full_block // scale_sz, 1),
+            storage_offset=(kv_half + data_per_kv) // scale_sz,
+        )
+        self._packed_views_ready = True
+
     def fused_output_quant_supported(self, quant_key: QuantKey):
         return quant_key == kFp8StaticTensorSym
 
@@ -407,6 +500,9 @@ class TritonAttentionImpl(AttentionImpl):
             )
         self.use_alibi_sqrt = use_alibi_sqrt
         self.supports_quant_query_input = current_platform.is_cuda()
+
+        self._kv_quant_mode = get_kv_quant_mode(kv_cache_dtype)
+        self._is_per_token_quant = self._kv_quant_mode.is_per_token
 
     def forward(
         self,
@@ -470,15 +566,35 @@ class TritonAttentionImpl(AttentionImpl):
                 layer,
             )
 
-        # For decoder and cross-attention, use KV cache as before
-        key_cache, value_cache = kv_cache.unbind(1)
-        if self.kv_cache_dtype.startswith("fp8"):
-            if key_cache.dtype != self.fp8_dtype:
-                key_cache = key_cache.view(self.fp8_dtype)
-                value_cache = value_cache.view(self.fp8_dtype)
-            assert layer._q_scale_float == 1.0, (
-                "A non 1.0 q_scale is not currently supported."
+        # Per-token quantized KV cache: unpack data and scale views
+        # from the flat packed tensor on first call, then reuse.
+        if self._is_per_token_quant:
+            if not self._packed_views_ready:
+                self._unpack_kv_cache(kv_cache)
+            key_cache = self._key_data
+            value_cache = self._value_data
+            k_descale = None
+            v_descale = None
+            k_scale_cache = self._k_scale_cache
+            v_scale_cache = self._v_scale_cache
+        # FP8 per-tensor / auto path (original flow).
+        else:
+            key_cache, value_cache = kv_cache.unbind(1)
+            if self._kv_quant_mode == KVQuantMode.FP8_PER_TENSOR:
+                if key_cache.dtype != self.fp8_dtype:
+                    key_cache = key_cache.view(self.fp8_dtype)
+                    value_cache = value_cache.view(self.fp8_dtype)
+                assert layer._q_scale_float == 1.0, (
+                    "A non 1.0 q_scale is not currently supported."
+                )
+            descale_shape = (
+                attn_metadata.query_start_loc.shape[0] - 1,
+                key_cache.shape[2],
             )
+            k_descale = layer._k_scale.expand(descale_shape)
+            v_descale = layer._v_scale.expand(descale_shape)
+            k_scale_cache = None
+            v_scale_cache = None
 
         cu_seqlens_q = attn_metadata.query_start_loc
         seqused_k = attn_metadata.seq_lens
@@ -492,7 +608,6 @@ class TritonAttentionImpl(AttentionImpl):
         softmax_segm_max = attn_metadata.softmax_segm_max
         softmax_segm_expsum = attn_metadata.softmax_segm_expsum
 
-        descale_shape = (cu_seqlens_q.shape[0] - 1, key_cache.shape[2])
         mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
 
         unified_attention(
@@ -512,8 +627,8 @@ class TritonAttentionImpl(AttentionImpl):
             block_table=block_table,
             softcap=self.logits_soft_cap,
             q_descale=None,  # Not supported
-            k_descale=layer._k_scale.expand(descale_shape),
-            v_descale=layer._v_scale.expand(descale_shape),
+            k_descale=k_descale,
+            v_descale=v_descale,
             seq_threshold_3D=seq_threshold_3D,
             num_par_softmax_segments=num_par_softmax_segments,
             softmax_segm_output=softmax_segm_output,
@@ -522,6 +637,9 @@ class TritonAttentionImpl(AttentionImpl):
             sinks=self.sinks,
             output_scale=output_scale,
             mm_prefix_range=mm_prefix_range_tensor,
+            kv_quant_mode=self._kv_quant_mode,
+            k_scale_cache=k_scale_cache,
+            v_scale_cache=v_scale_cache,
         )
 
         return output
@@ -545,10 +663,10 @@ class TritonAttentionImpl(AttentionImpl):
             attn_metadata: Encoder attention metadata
             layer: The attention layer
         """
-        # For encoder attention, process FP8 quantization if needed
-        if self.kv_cache_dtype.startswith("fp8"):
+        # Quantized KV cache is not supported for encoder attention.
+        if self._kv_quant_mode != KVQuantMode.NONE:
             raise NotImplementedError(
-                "quantization is not supported for encoder attention"
+                "quantized KV cache is not supported for encoder attention"
             )
 
         # Use encoder-specific metadata for sequence information
@@ -584,16 +702,25 @@ class TritonAttentionImpl(AttentionImpl):
             # For encoder attention,
             # we use direct Q, K, V tensors without caching
             return
-        # For decoder and cross-attention, use KV cache as before
-        key_cache, value_cache = kv_cache.unbind(1)
-
         # Reshape the input keys and values and store them in the cache.
-        if self.kv_cache_dtype.startswith("fp8"):
+        if self._is_per_token_quant:
+            if not self._packed_views_ready:
+                self._unpack_kv_cache(kv_cache)
+            triton_reshape_and_cache_flash_per_token_quant(
+                key,
+                value,
+                self._key_data,
+                self._value_data,
+                self._k_scale_cache,
+                self._v_scale_cache,
+                slot_mapping,
+            )
+            return
+        # For decoder and cross-attention, use KV cache as before.
+        key_cache, value_cache = kv_cache.unbind(1)
+        if self._kv_quant_mode == KVQuantMode.FP8_PER_TENSOR:
             key_cache = key_cache.view(self.fp8_dtype)
             value_cache = value_cache.view(self.fp8_dtype)
-            # triton kernel does not support uint8 kv_cache
-            #  (because some explicit casts (e.g. float8_e4m3fnuz)
-            #   are not supported)
         triton_reshape_and_cache_flash(
             key,
             value,
@@ -606,6 +733,8 @@ class TritonAttentionImpl(AttentionImpl):
         )
 
     def fused_rope_kvcache_supported(self):
+        if self._is_per_token_quant:
+            return False
         return rocm_aiter_ops.is_enabled()
 
     def do_rope_and_kv_cache_update(
@@ -623,7 +752,7 @@ class TritonAttentionImpl(AttentionImpl):
         key_cache, value_cache = kv_cache.unbind(1)
         flash_layout = True
 
-        is_fp8_kv_cache = self.kv_cache_dtype.startswith("fp8")
+        is_fp8_kv_cache = self._kv_quant_mode == KVQuantMode.FP8_PER_TENSOR
         if is_fp8_kv_cache:
             key_cache = key_cache.view(self.fp8_dtype)
             value_cache = value_cache.view(self.fp8_dtype)
