@@ -367,28 +367,37 @@ class TritonAttentionBackend(AttentionBackend):
         kernel_block_size: int,
         cache_dtype_str: str = "auto",
     ) -> torch.Tensor:
-        if kv_cache_uses_per_token_scales(cache_dtype_str):
-            # Per-token quant uses a flat packed layout that embeds
-            # float32 scales alongside the quantized data.  The shape
-            # is (num_blocks, 2, kv_half) — the TritonAttentionImpl
-            # unpacks typed data/scale views from this on first use.
-            num_blocks_per_kv_block = kv_cache_spec.block_size // kernel_block_size
-            kernel_num_blocks = num_blocks * num_blocks_per_kv_block
-            kv_cache_shape = cls.get_kv_cache_shape(
-                kernel_num_blocks,
-                kernel_block_size,
-                kv_cache_spec.num_kv_heads,
-                kv_cache_spec.head_size,
-                cache_dtype_str=cache_dtype_str,
-            )
-            return raw_tensor[: prod(kv_cache_shape)].view(kv_cache_shape)
-        return super().reshape_kv_cache_tensor(
-            raw_tensor,
-            kv_cache_spec,
-            num_blocks,
+        """Reshape a raw KV cache buffer for the Triton attention backend.
+
+        For per-token quantized layouts the data and float32 scales are
+        packed into a flat ``(num_blocks, 2, kv_half)`` tensor that
+        ``TritonAttentionImpl`` unpacks on first use.
+
+        For standard layouts the original shape/stride/permute logic is
+        applied inline so that ``gpu_model_runner`` does not need any
+        backend-specific knowledge.
+        """
+        num_blocks_per_kv_block = kv_cache_spec.block_size // kernel_block_size
+        kernel_num_blocks = num_blocks * num_blocks_per_kv_block
+        kv_cache_shape = cls.get_kv_cache_shape(
+            kernel_num_blocks,
             kernel_block_size,
-            cache_dtype_str,
+            kv_cache_spec.num_kv_heads,
+            kv_cache_spec.head_size,
+            cache_dtype_str=cache_dtype_str,
         )
+
+        if kv_cache_uses_per_token_scales(cache_dtype_str):
+            return raw_tensor[: prod(kv_cache_shape)].view(kv_cache_shape)
+
+        # Standard path — reproduces the original gpu_model_runner logic.
+        dtype = kv_cache_spec.dtype
+        stride_order = cls.get_kv_cache_stride_order()
+        if len(stride_order) != len(kv_cache_shape):
+            stride_order = tuple(range(len(kv_cache_shape)))
+        permuted_shape = tuple(kv_cache_shape[i] for i in stride_order)
+        inv_order = [stride_order.index(i) for i in range(len(stride_order))]
+        return raw_tensor.view(dtype).view(permuted_shape).permute(*inv_order)
 
     @classmethod
     def supports_alibi_sqrt(cls) -> bool:
