@@ -6572,23 +6572,34 @@ class GPUModelRunner(
                 if layer_name in self.runner_only_attn_layers:
                     continue
                 raw_tensor = kv_cache_raw_tensors[layer_name]
-                reshape_fn = getattr(attn_backend, "reshape_kv_cache_tensor", None)
+                # Per-token quant changes allocation sizes, so
+                # derive num_blocks from config rather than tensor.
                 if (
-                    reshape_fn is not None
-                    and isinstance(kv_cache_spec, AttentionSpec)
+                    isinstance(kv_cache_spec, AttentionSpec)
                     and kv_cache_spec.kv_quant_mode.is_per_token
                 ):
+                    num_blocks = kv_cache_config.num_blocks
+                    assert (
+                        raw_tensor.numel()
+                        >= kv_cache_spec.total_bytes_per_block * num_blocks
+                    )
                     has_attn = True
+                    reshape_fn = getattr(attn_backend, "reshape_kv_cache_tensor", None)
+                    assert reshape_fn is not None
                     kv_caches[layer_name], num_blocks = reshape_fn(
                         raw_tensor,
                         kv_cache_spec,
-                        kv_cache_config.num_blocks,
+                        num_blocks,
                         kernel_block_size,
                         cache_dtype_str=self.cache_config.cache_dtype,
                     )
                 else:
-                    assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
-                    num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
+                    if raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0:
+                        num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
+                    else:
+                        # Hybrid model: tensor may be oversized due to
+                        # per-token scale bytes in the shared pool.
+                        num_blocks = kv_cache_config.num_blocks
                     if isinstance(kv_cache_spec, AttentionSpec):
                         has_attn = True
                         num_blocks_per_kv_block = (
