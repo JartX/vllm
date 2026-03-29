@@ -3,6 +3,7 @@
 """High-Performance Triton-only Attention layer."""
 
 from dataclasses import dataclass
+from math import prod
 from typing import ClassVar
 
 import torch
@@ -355,6 +356,38 @@ class TritonAttentionBackend(AttentionBackend):
             AttentionType.ENCODER,
             AttentionType.ENCODER_ONLY,
             AttentionType.ENCODER_DECODER,
+        )
+
+    @classmethod
+    def reshape_kv_cache_tensor(
+        cls,
+        raw_tensor: torch.Tensor,
+        kv_cache_spec: AttentionSpec,
+        num_blocks: int,
+        kernel_block_size: int,
+        cache_dtype_str: str = "auto",
+    ) -> torch.Tensor:
+        if kv_cache_uses_per_token_scales(cache_dtype_str):
+            # Per-token quant uses a flat packed layout that embeds
+            # float32 scales alongside the quantized data.  The shape
+            # is (num_blocks, 2, kv_half) — the TritonAttentionImpl
+            # unpacks typed data/scale views from this on first use.
+            num_blocks_per_kv_block = kv_cache_spec.block_size // kernel_block_size
+            kernel_num_blocks = num_blocks * num_blocks_per_kv_block
+            kv_cache_shape = cls.get_kv_cache_shape(
+                kernel_num_blocks,
+                kernel_block_size,
+                kv_cache_spec.num_kv_heads,
+                kv_cache_spec.head_size,
+                cache_dtype_str=cache_dtype_str,
+            )
+            return raw_tensor[: prod(kv_cache_shape)].view(kv_cache_shape)
+        return super().reshape_kv_cache_tensor(
+            raw_tensor,
+            kv_cache_spec,
+            num_blocks,
+            kernel_block_size,
+            cache_dtype_str,
         )
 
     @classmethod
