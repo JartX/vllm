@@ -6569,57 +6569,45 @@ class GPUModelRunner(
                 if layer_name in self.runner_only_attn_layers:
                     continue
                 raw_tensor = kv_cache_raw_tensors[layer_name]
-                num_blocks = kv_cache_config.num_blocks
-                assert (
-                    raw_tensor.numel()
-                    >= kv_cache_spec.total_bytes_per_block * num_blocks
-                )
+                # Derive num_blocks: per-token quant packs extra
+                # scale bytes so we must use the config value;
+                # otherwise derive from tensor size.
+                if (
+                    isinstance(kv_cache_spec, AttentionSpec)
+                    and kv_cache_spec.kv_quant_mode.is_per_token
+                ):
+                    num_blocks = kv_cache_config.num_blocks
+                    assert (
+                        raw_tensor.numel()
+                        >= kv_cache_spec.total_bytes_per_block * num_blocks
+                    )
+                elif raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0:
+                    num_blocks = (
+                        raw_tensor.numel() // kv_cache_spec.page_size_bytes
+                    )
+                else:
+                    # Hybrid model: tensor may be oversized due to
+                    # per-token scale bytes in the shared pool.
+                    num_blocks = kv_cache_config.num_blocks
+
                 if isinstance(kv_cache_spec, AttentionSpec):
                     has_attn = True
-                    num_blocks_per_kv_block = (
-                        kv_cache_spec.block_size // kernel_block_size
-                    )
-                    kernel_num_blocks = num_blocks * num_blocks_per_kv_block
-
-                    kv_cache_shape = attn_backend.get_kv_cache_shape(
-                        kernel_num_blocks,
-                        kernel_block_size,
-                        kv_cache_spec.num_kv_heads,
-                        kv_cache_spec.head_size,
-                        cache_dtype_str=self.cache_config.cache_dtype,
-                    )
-                    dtype = kv_cache_spec.dtype
-                    try:
-                        kv_cache_stride_order = attn_backend.get_kv_cache_stride_order()
-                        if len(kv_cache_stride_order) != len(kv_cache_shape):
-                            kv_cache_stride_order = tuple(range(len(kv_cache_shape)))
-                    except (AttributeError, NotImplementedError):
-                        kv_cache_stride_order = tuple(range(len(kv_cache_shape)))
-                    # The allocation respects the backend-defined stride order
-                    # to ensure the semantic remains consistent for each
-                    # backend. We first obtain the generic kv cache shape and
-                    # then permute it according to the stride order which could
-                    # result in a non-contiguous tensor.
-                    kv_cache_shape = tuple(
-                        kv_cache_shape[i] for i in kv_cache_stride_order
-                    )
-                    # Maintain original KV shape view.
-                    inv_order = [
-                        kv_cache_stride_order.index(i)
-                        for i in range(len(kv_cache_stride_order))
-                    ]
-                    kv_caches[layer_name] = (
-                        kv_cache_raw_tensors[layer_name]
-                        .view(dtype)
-                        .view(kv_cache_shape)
-                        .permute(*inv_order)
+                    kv_caches[layer_name], num_blocks = (
+                        attn_backend.reshape_kv_cache_tensor(
+                            raw_tensor,
+                            kv_cache_spec,
+                            num_blocks,
+                            kernel_block_size,
+                            cache_dtype_str=self.cache_config.cache_dtype,
+                        )
                     )
                 elif isinstance(kv_cache_spec, MambaSpec):
                     has_mamba = True
-                    raw_tensor = kv_cache_raw_tensors[layer_name]
                     state_tensors = []
                     storage_offset_bytes = 0
-                    for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
+                    for shape, dtype in zip(
+                        kv_cache_spec.shapes, kv_cache_spec.dtypes
+                    ):
                         dtype_size = get_dtype_size(dtype)
                         num_element_per_page = (
                             kv_cache_spec.page_size_bytes // dtype_size
@@ -6726,7 +6714,6 @@ class GPUModelRunner(
             self.kv_caches,
             num_attn_module,
         )
-
         return kv_caches
 
     def maybe_add_kv_sharing_layers_to_kv_cache_groups(

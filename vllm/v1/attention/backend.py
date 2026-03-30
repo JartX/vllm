@@ -110,6 +110,62 @@ class AttentionBackend(ABC):
         )
         return shape.index(_S)
 
+    @classmethod
+    def reshape_kv_cache_tensor(
+        cls,
+        raw_tensor: torch.Tensor,
+        kv_cache_spec: "AttentionSpec",
+        num_blocks: int,
+        kernel_block_size: int,
+        cache_dtype_str: str = "auto",
+    ) -> tuple[torch.Tensor, int]:
+        """Reshape a raw KV cache tensor into the backend's expected layout.
+
+        The default implementation computes the shape via
+        ``get_kv_cache_shape``, applies the stride order returned by
+        ``get_kv_cache_stride_order``, and returns the permuted view.
+
+        Backends that need a different layout (e.g. packed per-token
+        quantized data + scales) can override this method.
+
+        Returns ``(tensor, num_blocks)``.
+        """
+        num_blocks_per_kv_block = (
+            kv_cache_spec.block_size // kernel_block_size
+        )
+        kernel_num_blocks = num_blocks * num_blocks_per_kv_block
+
+        kv_cache_shape = cls.get_kv_cache_shape(
+            kernel_num_blocks,
+            kernel_block_size,
+            kv_cache_spec.num_kv_heads,
+            kv_cache_spec.head_size,
+            cache_dtype_str=cache_dtype_str,
+        )
+        dtype = kv_cache_spec.dtype
+        try:
+            kv_cache_stride_order = cls.get_kv_cache_stride_order()
+            assert len(kv_cache_stride_order) == len(kv_cache_shape)
+        except (AttributeError, NotImplementedError):
+            kv_cache_stride_order = tuple(range(len(kv_cache_shape)))
+        # The allocation respects the backend-defined stride order
+        # to ensure the semantic remains consistent for each
+        # backend. We first obtain the generic kv cache shape and
+        # then permute it according to the stride order which could
+        # result in a non-contiguous tensor.
+        kv_cache_shape = tuple(
+            kv_cache_shape[i] for i in kv_cache_stride_order
+        )
+        # Maintain original KV shape view.
+        inv_order = [
+            kv_cache_stride_order.index(i)
+            for i in range(len(kv_cache_stride_order))
+        ]
+        tensor = raw_tensor.view(dtype).view(kv_cache_shape).permute(
+            *inv_order
+        )
+        return tensor, num_blocks
+
     @staticmethod
     def get_kv_cache_stride_order(
         include_num_layers_dimension: bool = False,
