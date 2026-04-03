@@ -346,52 +346,9 @@ def _asymmetric_ls_int4_quantize(
         15.0,
     )
 
-    # Phase 3: MSE-optimal scale via least squares
-    # Residuals: r_i = q_i - zp   (centred quantisation levels)
-    # s* = Σ(x·r) / Σ(r²)
-    even_r = even_q - zp_f
-    odd_r = odd_q - zp_f
-    xr = tl.sum(tl.where(even_mask, x_even * even_r, 0.0)) + tl.sum(
-        tl.where(odd_mask, x_odd * odd_r, 0.0)
-    )
-    rr = tl.sum(tl.where(even_mask, even_r * even_r, 0.0)) + tl.sum(
-        tl.where(odd_mask, odd_r * odd_r, 0.0)
-    )
-    scale = tl.maximum(xr / tl.maximum(rr, 1e-6), 1e-6)
+    scale = scale_init
 
-    # Phase 4: re-quantize with optimal scale
-    inv_s = 1.0 / scale
-    zp_f = tl.clamp(
-        tl.where(
-            -x_min * inv_s >= 0,
-            (-x_min * inv_s + 0.5).to(tl.int32),
-            (-x_min * inv_s - 0.5).to(tl.int32),
-        ).to(tl.float32),
-        0.0,
-        15.0,
-    )
-    even_s = x_even * inv_s + zp_f
-    odd_s = x_odd * inv_s + zp_f
-    even_q = tl.clamp(
-        tl.where(
-            even_s >= 0,
-            (even_s + 0.5).to(tl.int32),
-            (even_s - 0.5).to(tl.int32),
-        ).to(tl.float32),
-        0.0,
-        15.0,
-    )
-    odd_q = tl.clamp(
-        tl.where(
-            odd_s >= 0,
-            (odd_s + 0.5).to(tl.int32),
-            (odd_s - 0.5).to(tl.int32),
-        ).to(tl.float32),
-        0.0,
-        15.0,
-    )
-
-    # Phase 5: pack zp into low 4 bits of scale (steganography)
+    # Phase 3 (pack zp into low 4 bits of scale):
     # Loses ~0.001% scale precision (4 of 23 mantissa bits) — negligible.
     zp_int = zp_f.to(tl.int32)
     scale_bits = scale.to(tl.int32, bitcast=True)
