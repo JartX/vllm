@@ -277,14 +277,127 @@ def _reshape_cache_per_token_head(
 #    correction at near-zero cost:
 #      For K:  S += (dot(Q, K_uint) - zp · sum(Q)) × scale
 #      For V:  acc += dot(P·scale, V_uint) - Σ(P·scale·zp)
-#
-# The OPTIMAL_CLIP_RATIO below is only used as the initial scale seed
-# before the LS refinement.  It is the MSE-optimal symmetric clipping
-# point for Gaussian data at 4-bit resolution:
-#   clip = 2.83σ, σ ≈ mean(|x|) · √(π/2)
-#   → clip ≈ 3.55 · mean(|x|)
 # ---------------------------------------------------------------------------
-_INT4_OPTIMAL_CLIP_RATIO: float = 3.55
+
+
+@triton.jit
+def _asymmetric_ls_int4_quantize(
+    x_even,  # float32 vector — even-indexed elements of one (token, head)
+    x_odd,  # float32 vector — odd-indexed elements
+    even_mask,  # bool mask for valid even positions
+    odd_mask,  # bool mask for valid odd positions
+):
+    """Asymmetric LS-optimal INT4 quantization with zero-point steganography.
+
+    Standalone helper so it can be reused across different per-token kernels.
+    Operates on the even/odd split of a single (token, head) vector and
+    returns quantized unsigned [0, 15] values plus a float32 scale whose
+    low 4 mantissa bits encode the 4-bit zero-point.
+
+    Algorithm (5 phases):
+      1. Asymmetric range  → initial scale + zero-point from min/max.
+      2. Initial quantize  → unsigned [0, 15] with round-to-nearest.
+      3. LS-optimal scale  → closed-form OLS:  s* = Σ(x·r) / Σ(r²).
+      4. Re-quantize       → repeat phase 2 with the optimal scale.
+      5. Steganography     → pack 4-bit zp into low mantissa bits of scale.
+
+    Returns ``(even_q, odd_q, scale_packed)``.
+    """
+    # Phase 1: asymmetric range → scale + zero_point
+    x_min = tl.minimum(
+        tl.min(tl.where(even_mask, x_even, float("inf"))),
+        tl.min(tl.where(odd_mask, x_odd, float("inf"))),
+    )
+    x_max = tl.maximum(
+        tl.max(tl.where(even_mask, x_even, float("-inf"))),
+        tl.max(tl.where(odd_mask, x_odd, float("-inf"))),
+    )
+    scale_init = tl.maximum((x_max - x_min) / 15.0, 1e-6)
+    zp_f = tl.clamp(
+        tl.where(
+            -x_min / scale_init >= 0,
+            (-x_min / scale_init + 0.5).to(tl.int32),
+            (-x_min / scale_init - 0.5).to(tl.int32),
+        ).to(tl.float32),
+        0.0,
+        15.0,
+    )
+
+    # Phase 2: quantize to unsigned [0, 15]
+    inv_s = 1.0 / scale_init
+    even_s = x_even * inv_s + zp_f
+    odd_s = x_odd * inv_s + zp_f
+    even_q = tl.clamp(
+        tl.where(
+            even_s >= 0,
+            (even_s + 0.5).to(tl.int32),
+            (even_s - 0.5).to(tl.int32),
+        ).to(tl.float32),
+        0.0,
+        15.0,
+    )
+    odd_q = tl.clamp(
+        tl.where(
+            odd_s >= 0,
+            (odd_s + 0.5).to(tl.int32),
+            (odd_s - 0.5).to(tl.int32),
+        ).to(tl.float32),
+        0.0,
+        15.0,
+    )
+
+    # Phase 3: MSE-optimal scale via least squares
+    # Residuals: r_i = q_i - zp   (centred quantisation levels)
+    # s* = Σ(x·r) / Σ(r²)
+    even_r = even_q - zp_f
+    odd_r = odd_q - zp_f
+    xr = tl.sum(tl.where(even_mask, x_even * even_r, 0.0)) + tl.sum(
+        tl.where(odd_mask, x_odd * odd_r, 0.0)
+    )
+    rr = tl.sum(tl.where(even_mask, even_r * even_r, 0.0)) + tl.sum(
+        tl.where(odd_mask, odd_r * odd_r, 0.0)
+    )
+    scale = tl.maximum(xr / tl.maximum(rr, 1e-6), 1e-6)
+
+    # Phase 4: re-quantize with optimal scale
+    inv_s = 1.0 / scale
+    zp_f = tl.clamp(
+        tl.where(
+            -x_min * inv_s >= 0,
+            (-x_min * inv_s + 0.5).to(tl.int32),
+            (-x_min * inv_s - 0.5).to(tl.int32),
+        ).to(tl.float32),
+        0.0,
+        15.0,
+    )
+    even_s = x_even * inv_s + zp_f
+    odd_s = x_odd * inv_s + zp_f
+    even_q = tl.clamp(
+        tl.where(
+            even_s >= 0,
+            (even_s + 0.5).to(tl.int32),
+            (even_s - 0.5).to(tl.int32),
+        ).to(tl.float32),
+        0.0,
+        15.0,
+    )
+    odd_q = tl.clamp(
+        tl.where(
+            odd_s >= 0,
+            (odd_s + 0.5).to(tl.int32),
+            (odd_s - 0.5).to(tl.int32),
+        ).to(tl.float32),
+        0.0,
+        15.0,
+    )
+
+    # Phase 5: pack zp into low 4 bits of scale (steganography)
+    # Loses ~0.001% scale precision (4 of 23 mantissa bits) — negligible.
+    zp_int = zp_f.to(tl.int32)
+    scale_bits = scale.to(tl.int32, bitcast=True)
+    scale_packed = ((scale_bits & -16) | (zp_int & 0xF)).to(tl.float32, bitcast=True)
+
+    return even_q, odd_q, scale_packed
 
 
 @triton.jit
@@ -316,7 +429,6 @@ def _reshape_cache_int4_packed(
     head_size: tl.constexpr,
     head_size_v: tl.constexpr,
     HALF_HEAD_PADDED: tl.constexpr,  # next_power_of_2(max(head_size, head_size_v) // 2)
-    OPTIMAL_CLIP_RATIO: tl.constexpr,
 ):
     """Asymmetric INT4 quantization with zero-point steganography.
 
@@ -346,100 +458,11 @@ def _reshape_cache_int4_packed(
     k_even = tl.load(key_base + even_offs, mask=even_k_mask, other=0.0).to(tl.float32)
     k_odd = tl.load(key_base + odd_offs, mask=odd_k_mask, other=0.0).to(tl.float32)
 
-    # Phase 1: asymmetric range → scale + zero_point
-    k_min = tl.minimum(
-        tl.min(tl.where(even_k_mask, k_even, float("inf"))),
-        tl.min(tl.where(odd_k_mask, k_odd, float("inf"))),
-    )
-    k_max = tl.maximum(
-        tl.max(tl.where(even_k_mask, k_even, float("-inf"))),
-        tl.max(tl.where(odd_k_mask, k_odd, float("-inf"))),
-    )
-    k_scale_init = tl.maximum((k_max - k_min) / 15.0, 1e-6)
-    k_zp_f = tl.clamp(
-        tl.where(
-            -k_min / k_scale_init >= 0,
-            (-k_min / k_scale_init + 0.5).to(tl.int32),
-            (-k_min / k_scale_init - 0.5).to(tl.int32),
-        ).to(tl.float32),
-        0.0,
-        15.0,
-    )
-
-    # Phase 2: quantize to unsigned [0, 15]
-    inv_k = 1.0 / k_scale_init
-    k_even_s = k_even * inv_k + k_zp_f
-    k_odd_s = k_odd * inv_k + k_zp_f
-    k_even_q = tl.clamp(
-        tl.where(
-            k_even_s >= 0,
-            (k_even_s + 0.5).to(tl.int32),
-            (k_even_s - 0.5).to(tl.int32),
-        ).to(tl.float32),
-        0.0,
-        15.0,
-    )
-    k_odd_q = tl.clamp(
-        tl.where(
-            k_odd_s >= 0,
-            (k_odd_s + 0.5).to(tl.int32),
-            (k_odd_s - 0.5).to(tl.int32),
-        ).to(tl.float32),
-        0.0,
-        15.0,
-    )
-
-    # Phase 3: MSE-optimal scale via least squares
-    # Residuals: r_i = q_i - zp   (centred quantisation levels)
-    # s* = Σ(x·r) / Σ(r²)
-    k_even_r = k_even_q - k_zp_f
-    k_odd_r = k_odd_q - k_zp_f
-    xr = tl.sum(tl.where(even_k_mask, k_even * k_even_r, 0.0)) + tl.sum(
-        tl.where(odd_k_mask, k_odd * k_odd_r, 0.0)
-    )
-    rr = tl.sum(tl.where(even_k_mask, k_even_r * k_even_r, 0.0)) + tl.sum(
-        tl.where(odd_k_mask, k_odd_r * k_odd_r, 0.0)
-    )
-    k_scale = tl.maximum(xr / tl.maximum(rr, 1e-6), 1e-6)
-
-    # Phase 4: re-quantize with optimal scale
-    inv_k = 1.0 / k_scale
-    k_zp_f = tl.clamp(
-        tl.where(
-            -k_min * inv_k >= 0,
-            (-k_min * inv_k + 0.5).to(tl.int32),
-            (-k_min * inv_k - 0.5).to(tl.int32),
-        ).to(tl.float32),
-        0.0,
-        15.0,
-    )
-    k_even_s = k_even * inv_k + k_zp_f
-    k_odd_s = k_odd * inv_k + k_zp_f
-    k_even_q = tl.clamp(
-        tl.where(
-            k_even_s >= 0,
-            (k_even_s + 0.5).to(tl.int32),
-            (k_even_s - 0.5).to(tl.int32),
-        ).to(tl.float32),
-        0.0,
-        15.0,
-    )
-    k_odd_q = tl.clamp(
-        tl.where(
-            k_odd_s >= 0,
-            (k_odd_s + 0.5).to(tl.int32),
-            (k_odd_s - 0.5).to(tl.int32),
-        ).to(tl.float32),
-        0.0,
-        15.0,
-    )
-
-    # Phase 5: pack zp into low 4 bits of scale (steganography)
-    # Loses ~0.001% scale precision (4 of 23 mantissa bits) — negligible.
-    k_zp_int = k_zp_f.to(tl.int32)
-    k_scale_bits = k_scale.to(tl.int32, bitcast=True)
-    k_scale_packed = ((k_scale_bits & -16) | (k_zp_int & 0xF)).to(
-        tl.float32, bitcast=True
+    k_even_q, k_odd_q, k_scale_packed = _asymmetric_ls_int4_quantize(
+        k_even,
+        k_odd,
+        even_k_mask,
+        odd_k_mask,
     )
 
     tl.store(
@@ -475,92 +498,11 @@ def _reshape_cache_int4_packed(
     v_even = tl.load(val_base + even_offs, mask=even_v_mask, other=0.0).to(tl.float32)
     v_odd = tl.load(val_base + odd_offs, mask=odd_v_mask, other=0.0).to(tl.float32)
 
-    v_min = tl.minimum(
-        tl.min(tl.where(even_v_mask, v_even, float("inf"))),
-        tl.min(tl.where(odd_v_mask, v_odd, float("inf"))),
-    )
-    v_max = tl.maximum(
-        tl.max(tl.where(even_v_mask, v_even, float("-inf"))),
-        tl.max(tl.where(odd_v_mask, v_odd, float("-inf"))),
-    )
-    v_scale_init = tl.maximum((v_max - v_min) / 15.0, 1e-6)
-    v_zp_f = tl.clamp(
-        tl.where(
-            -v_min / v_scale_init >= 0,
-            (-v_min / v_scale_init + 0.5).to(tl.int32),
-            (-v_min / v_scale_init - 0.5).to(tl.int32),
-        ).to(tl.float32),
-        0.0,
-        15.0,
-    )
-
-    inv_v = 1.0 / v_scale_init
-    v_even_s = v_even * inv_v + v_zp_f
-    v_odd_s = v_odd * inv_v + v_zp_f
-    v_even_q = tl.clamp(
-        tl.where(
-            v_even_s >= 0,
-            (v_even_s + 0.5).to(tl.int32),
-            (v_even_s - 0.5).to(tl.int32),
-        ).to(tl.float32),
-        0.0,
-        15.0,
-    )
-    v_odd_q = tl.clamp(
-        tl.where(
-            v_odd_s >= 0,
-            (v_odd_s + 0.5).to(tl.int32),
-            (v_odd_s - 0.5).to(tl.int32),
-        ).to(tl.float32),
-        0.0,
-        15.0,
-    )
-
-    v_even_r = v_even_q - v_zp_f
-    v_odd_r = v_odd_q - v_zp_f
-    xr_v = tl.sum(tl.where(even_v_mask, v_even * v_even_r, 0.0)) + tl.sum(
-        tl.where(odd_v_mask, v_odd * v_odd_r, 0.0)
-    )
-    rr_v = tl.sum(tl.where(even_v_mask, v_even_r * v_even_r, 0.0)) + tl.sum(
-        tl.where(odd_v_mask, v_odd_r * v_odd_r, 0.0)
-    )
-    v_scale = tl.maximum(xr_v / tl.maximum(rr_v, 1e-6), 1e-6)
-
-    inv_v = 1.0 / v_scale
-    v_zp_f = tl.clamp(
-        tl.where(
-            -v_min * inv_v >= 0,
-            (-v_min * inv_v + 0.5).to(tl.int32),
-            (-v_min * inv_v - 0.5).to(tl.int32),
-        ).to(tl.float32),
-        0.0,
-        15.0,
-    )
-    v_even_s = v_even * inv_v + v_zp_f
-    v_odd_s = v_odd * inv_v + v_zp_f
-    v_even_q = tl.clamp(
-        tl.where(
-            v_even_s >= 0,
-            (v_even_s + 0.5).to(tl.int32),
-            (v_even_s - 0.5).to(tl.int32),
-        ).to(tl.float32),
-        0.0,
-        15.0,
-    )
-    v_odd_q = tl.clamp(
-        tl.where(
-            v_odd_s >= 0,
-            (v_odd_s + 0.5).to(tl.int32),
-            (v_odd_s - 0.5).to(tl.int32),
-        ).to(tl.float32),
-        0.0,
-        15.0,
-    )
-
-    v_zp_int = v_zp_f.to(tl.int32)
-    v_scale_bits = v_scale.to(tl.int32, bitcast=True)
-    v_scale_packed = ((v_scale_bits & -16) | (v_zp_int & 0xF)).to(
-        tl.float32, bitcast=True
+    v_even_q, v_odd_q, v_scale_packed = _asymmetric_ls_int4_quantize(
+        v_even,
+        v_odd,
+        even_v_mask,
+        odd_v_mask,
     )
 
     tl.store(
@@ -666,7 +608,6 @@ def triton_reshape_and_cache_flash_per_token_head_quant(
             head_size=head_size,
             head_size_v=head_size_v,
             HALF_HEAD_PADDED=half_head_padded,
-            OPTIMAL_CLIP_RATIO=_INT4_OPTIMAL_CLIP_RATIO,
             num_warps=num_warps,
         )
         return
