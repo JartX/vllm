@@ -289,7 +289,7 @@ def test_reshape_and_cache_per_token_head(
 
         if is_turboquant:
             from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
-                fast_hadamard_transform,
+                randomized_hadamard_transform,
             )
             for label, data, cache, sc in [
                 ("key", key, key_cache, k_scale_cache),
@@ -330,7 +330,9 @@ def test_reshape_and_cache_per_token_head(
                 # stored_scale = norm / d^1.5 = σ/d where σ = norm/sqrt(d)
                 # V_hat = σ/d × WHT(c) = stored_scale × WHT(c)
                 # = WHT(stored_scale × c)  (scalar per head)
-                deq = fast_hadamard_transform(full * stored_scale[:, None])
+                deq = randomized_hadamard_transform(
+                    full * stored_scale[:, None], inverse=True
+                )
                 ref_deq = data[i].float()
                 torch.testing.assert_close(deq, ref_deq, atol=deq_atol, rtol=deq_rtol)
 
@@ -493,7 +495,9 @@ def test_per_token_head_round_trip_accuracy(
                     full[:, 1::4] = _LM4[b1]
                     full[:, 2::4] = _LM4[b2]
                     full[:, 3::4] = _LM4[b3]
-                deq = fast_hadamard_transform(full * stored_scale[:, None])
+                deq = randomized_hadamard_transform(
+                    full * stored_scale[:, None], inverse=True
+                )
                 ref = data[i].float()
                 torch.testing.assert_close(deq, ref, atol=rt_atol, rtol=rt_atol)
     else:

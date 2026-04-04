@@ -499,6 +499,42 @@ def fast_hadamard_transform(x: torch.Tensor) -> torch.Tensor:
     return x
 
 
+# Deterministic ±1 signs for Randomized Hadamard Transform.
+# RHT = H × D × x where D = diag(signs). The random sign flip before
+# WHT breaks residual structure in the data and produces a distribution
+# closer to Gaussian, which makes Lloyd-Max centroids more optimal.
+_RHT_SIGNS_CACHE: dict[tuple[int, str], torch.Tensor] = {}
+
+
+def _get_rht_signs(d: int, device: torch.device) -> torch.Tensor:
+    """Return a cached deterministic ±1 sign vector of length *d*."""
+    key = (d, str(device))
+    if key not in _RHT_SIGNS_CACHE:
+        gen = torch.Generator()
+        gen.manual_seed(0x9E3779B9)
+        signs = 2.0 * torch.bernoulli(
+            torch.full((d,), 0.5), generator=gen
+        ) - 1.0
+        _RHT_SIGNS_CACHE[key] = signs.to(device)
+    return _RHT_SIGNS_CACHE[key]
+
+
+def randomized_hadamard_transform(
+    x: torch.Tensor, inverse: bool = False
+) -> torch.Tensor:
+    """Randomized Hadamard Transform (RHT) along the last dimension.
+
+    Forward:  y = WHT(D × x)    where D = diag(±1 signs)
+    Inverse:  x = D × WHT(y)    (note: no /d — scale absorbed in stored norms)
+    """
+    d = x.shape[-1]
+    signs = _get_rht_signs(d, x.device)
+    if inverse:
+        return fast_hadamard_transform(x) * signs
+    else:
+        return fast_hadamard_transform(x * signs)
+
+
 @triton.jit
 def _lloyd_max_quantize_4(z):
     """Quantize N(0,1) values to 4 Lloyd-Max centroids (INT2).
@@ -894,9 +930,11 @@ def triton_reshape_and_cache_flash_per_token_head_quant(
         KVQuantMode.INT2_PER_TOKEN_HEAD,
         KVQuantMode.INT4_TURBO_PER_TOKEN_HEAD,
     ):
-        # Apply Walsh-Hadamard Transform (pre-rotation for Gaussian distribution)
-        key_wht = fast_hadamard_transform(key.float()).to(key.dtype)
-        value_wht = fast_hadamard_transform(value.float()).to(value.dtype)
+        # Apply Randomized Hadamard Transform (RHT = WHT after random sign flip).
+        # The random signs break residual structure → better Gaussian fit →
+        # more optimal Lloyd-Max centroids → lower quantization error.
+        key_wht = randomized_hadamard_transform(key.float()).to(key.dtype)
+        value_wht = randomized_hadamard_transform(value.float()).to(value.dtype)
 
         if kv_quant_mode == KVQuantMode.INT2_PER_TOKEN_HEAD:
             assert head_size % 4 == 0 and head_size_v % 4 == 0

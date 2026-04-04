@@ -1670,17 +1670,17 @@ def unified_attention(
     assert causal, "Only causal attention is supported"
     assert q_descale is None, "Q scales not supported"
 
-    # TurboQuant: apply WHT to queries before attention
+    # TurboQuant: apply Randomized Hadamard Transform to queries
     is_turboquant = kv_quant_mode in (
         KVQuantMode.INT2_PER_TOKEN_HEAD,
         KVQuantMode.INT4_TURBO_PER_TOKEN_HEAD,
     )
     if is_turboquant:
         from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
-            fast_hadamard_transform,
+            randomized_hadamard_transform,
         )
         q_orig_dtype = q.dtype
-        q = fast_hadamard_transform(q.float()).to(q_orig_dtype)
+        q = randomized_hadamard_transform(q.float()).to(q_orig_dtype)
 
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
@@ -1903,9 +1903,10 @@ def unified_attention(
             USE_FP8=output_scale is not None,
         )
 
-    # TurboQuant: apply inverse WHT to output.
+    # TurboQuant: apply inverse RHT to output.
+    # Inverse RHT: x = D × WHT(y) where D = diag(±1 signs).
     # The stored scale already absorbs 1/d (scale = norm/d^1.5 = σ/d),
-    # so we only need the unnormalized WHT here (no extra /d).
+    # so no extra /d needed.
     if is_turboquant:
-        out_f = fast_hadamard_transform(out.float())
+        out_f = randomized_hadamard_transform(out.float(), inverse=True)
         out.copy_(out_f.to(q_orig_dtype))
