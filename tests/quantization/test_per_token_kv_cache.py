@@ -289,7 +289,7 @@ def test_reshape_and_cache_per_token_head(
 
         if is_turboquant:
             from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
-                randomized_hadamard_transform,
+                _single_rht,
             )
             for label, data, cache, sc in [
                 ("key", key, key_cache, k_scale_cache),
@@ -321,11 +321,9 @@ def test_reshape_and_cache_per_token_head(
                     full[:, 2::4] = _LM4[b2]
                     full[:, 3::4] = _LM4[b3]
 
-                # stored_scale = norm/d^2.5 for double RHT.
-                # IRHT_double(c × scale) = D₁×H×D₂×H×(c × scale)
-                # = scale × d² × IRHT_double_normalized(c)
-                # Reconstructs original x correctly.
-                deq = randomized_hadamard_transform(
+                # stored_scale = norm/d^1.5.
+                # IRHT(c × scale) = D₁ × H × (c × scale)
+                deq = _single_rht(
                     full * stored_scale[:, None], inverse=True
                 )
                 ref_deq = data[i].float()

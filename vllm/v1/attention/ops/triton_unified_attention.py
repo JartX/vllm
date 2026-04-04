@@ -1634,24 +1634,17 @@ def unified_attention(
     assert causal, "Only causal attention is supported"
     assert q_descale is None, "Q scales not supported"
 
-    # TurboQuant: apply RHT to queries (must match storage transform).
-    # INT2 uses double RHT; INT4 turbo uses single RHT.
+    # TurboQuant: apply single RHT to queries (must match storage transform).
     is_turboquant = kv_quant_mode in (
         KVQuantMode.INT2_PER_TOKEN_HEAD,
         KVQuantMode.INT4_TURBO_PER_TOKEN_HEAD,
     )
     if is_turboquant:
+        from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
+            _single_rht,
+        )
         q_orig_dtype = q.dtype
-        if kv_quant_mode == KVQuantMode.INT2_PER_TOKEN_HEAD:
-            from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
-                randomized_hadamard_transform,
-            )
-            q = randomized_hadamard_transform(q.float()).to(q_orig_dtype)
-        else:
-            from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
-                _single_rht,
-            )
-            q = _single_rht(q.float()).to(q_orig_dtype)
+        q = _single_rht(q.float()).to(q_orig_dtype)
 
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
@@ -1879,8 +1872,5 @@ def unified_attention(
     # The stored scale already absorbs 1/d (scale = norm/d^1.5 = σ/d),
     # so no extra /d needed.
     if is_turboquant:
-        if kv_quant_mode == KVQuantMode.INT2_PER_TOKEN_HEAD:
-            out_f = randomized_hadamard_transform(out.float(), inverse=True)
-        else:
-            out_f = _single_rht(out.float(), inverse=True)
+        out_f = _single_rht(out.float(), inverse=True)
         out.copy_(out_f.to(q_orig_dtype))

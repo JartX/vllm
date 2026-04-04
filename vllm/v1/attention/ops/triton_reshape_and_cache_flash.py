@@ -841,10 +841,10 @@ def _reshape_cache_turboquant_int2(
         mask=qtr_offs < qtr_k,
     )
 
-    # Store norm/d^2.5 as scale. Double RHT gives dot(Q,K) × d².
-    # IRHT_double multiplies by d². Scale absorbs both: 1/d² for scores,
+    # Store norm/d^1.5 as scale. Single RHT gives dot(Q,K) × d.
+    # IRHT multiplies by d. Scale absorbs both: 1/d for scores,
     # 1/sqrt(d) for de-normalizing z back to original magnitude.
-    k_scale = k_norm / float(head_size ** 2.5)
+    k_scale = k_norm / float(head_size ** 1.5)
     tl.store(
         k_scale_cache_ptr
         + blk * stride_ks_blk
@@ -897,7 +897,7 @@ def _reshape_cache_turboquant_int2(
         mask=qtr_offs < qtr_v,
     )
 
-    v_scale = v_norm / float(head_size_v ** 2.5)
+    v_scale = v_norm / float(head_size_v ** 1.5)
     tl.store(
         v_scale_cache_ptr
         + blk * stride_vs_blk
@@ -956,12 +956,9 @@ def triton_reshape_and_cache_flash_per_token_head_quant(
         KVQuantMode.INT4_TURBO_PER_TOKEN_HEAD,
     ):
         if kv_quant_mode == KVQuantMode.INT2_PER_TOKEN_HEAD:
-            # INT2: double RHT for maximum gaussianization (QuIP# insight).
-            # dot(Q_drht, K_drht) = d² × dot(Q, K) — absorbed in scale.
-            key_wht = randomized_hadamard_transform(key.float()).to(key.dtype)
-            value_wht = randomized_hadamard_transform(
-                value.float()
-            ).to(value.dtype)
+            # INT2: single RHT (H × D₁ × x).
+            key_wht = _single_rht(key.float()).to(key.dtype)
+            value_wht = _single_rht(value.float()).to(value.dtype)
             assert head_size % 4 == 0 and head_size_v % 4 == 0
             qtr_head_padded = triton.next_power_of_2(
                 max(head_size, head_size_v) // 4
