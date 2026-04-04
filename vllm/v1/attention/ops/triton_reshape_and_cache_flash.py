@@ -519,6 +519,19 @@ def _get_rht_signs(d: int, round_idx: int, device: torch.device) -> torch.Tensor
     return _RHT_SIGNS_CACHE[key]
 
 
+def _single_rht(x: torch.Tensor, inverse: bool = False) -> torch.Tensor:
+    """Single Randomized Hadamard Transform: H × D₁ × x.
+
+    Used by INT4 TurboQuant where 16 levels don't need double rotation.
+    """
+    d = x.shape[-1]
+    d1 = _get_rht_signs(d, 0, x.device)
+    if inverse:
+        return fast_hadamard_transform(x) * d1
+    else:
+        return fast_hadamard_transform(x * d1)
+
+
 def randomized_hadamard_transform(
     x: torch.Tensor, inverse: bool = False
 ) -> torch.Tensor:
@@ -937,18 +950,18 @@ def triton_reshape_and_cache_flash_per_token_head_quant(
     head_size_v = value.shape[2]
     block_size = key_cache.shape[1]
 
-    # TurboQuant modes: apply WHT first, then dispatch to dedicated kernel.
+    # TurboQuant modes: apply RHT first, then dispatch to dedicated kernel.
     if kv_quant_mode in (
         KVQuantMode.INT2_PER_TOKEN_HEAD,
         KVQuantMode.INT4_TURBO_PER_TOKEN_HEAD,
     ):
-        # Apply Randomized Hadamard Transform (RHT = WHT after random sign flip).
-        # The random signs break residual structure → better Gaussian fit →
-        # more optimal Lloyd-Max centroids → lower quantization error.
-        key_wht = randomized_hadamard_transform(key.float()).to(key.dtype)
-        value_wht = randomized_hadamard_transform(value.float()).to(value.dtype)
-
         if kv_quant_mode == KVQuantMode.INT2_PER_TOKEN_HEAD:
+            # INT2: double RHT for maximum gaussianization (QuIP# insight).
+            # dot(Q_drht, K_drht) = d² × dot(Q, K) — absorbed in scale.
+            key_wht = randomized_hadamard_transform(key.float()).to(key.dtype)
+            value_wht = randomized_hadamard_transform(
+                value.float()
+            ).to(value.dtype)
             assert head_size % 4 == 0 and head_size_v % 4 == 0
             qtr_head_padded = triton.next_power_of_2(
                 max(head_size, head_size_v) // 4
@@ -989,11 +1002,12 @@ def triton_reshape_and_cache_flash_per_token_head_quant(
             )
             return
         else:
-            # INT4 TurboQuant: use the same asymmetric quantizer as mode 4
-            # but in the WHT domain.  RHT gaussianizes, then adaptive
-            # min/max quantization adapts to the actual per-token range.
-            # This falls through to the INT4_PER_TOKEN_HEAD path below
-            # with the WHT-transformed data.
+            # INT4 TurboQuant: single RHT (sufficient for 16 levels),
+            # then fall through to the mode 4 asymmetric quantizer.
+            # Single RHT: dot(Q_rht, K_rht) = d × dot(Q, K), which is
+            # absorbed by the adaptive per-token scale (no extra factor).
+            key_wht = _single_rht(key.float()).to(key.dtype)
+            value_wht = _single_rht(value.float()).to(value.dtype)
             key = key_wht
             value = value_wht
             kv_quant_mode = KVQuantMode.INT4_PER_TOKEN_HEAD
