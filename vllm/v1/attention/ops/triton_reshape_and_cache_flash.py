@@ -306,14 +306,20 @@ def _reshape_cache_int4_packed(
     k_odd = tl.load(key_base + odd_offs, mask=odd_k_mask, other=0.0).to(tl.float32)
 
     # Asymmetric range → scale + zero_point
-    k_min = tl.minimum(
+    # Optimal clipping: shrink range by α=0.975 to reduce MSE on the
+    # 99%+ central values at the cost of saturating ~0.5% outliers.
+    k_min_raw = tl.minimum(
         tl.min(tl.where(even_k_mask, k_even, float("inf"))),
         tl.min(tl.where(odd_k_mask, k_odd, float("inf"))),
     )
-    k_max = tl.maximum(
+    k_max_raw = tl.maximum(
         tl.max(tl.where(even_k_mask, k_even, float("-inf"))),
         tl.max(tl.where(odd_k_mask, k_odd, float("-inf"))),
     )
+    k_mid = (k_max_raw + k_min_raw) * 0.5
+    k_half = (k_max_raw - k_min_raw) * 0.5
+    k_min = k_mid - k_half * 0.975
+    k_max = k_mid + k_half * 0.975
     k_scale = tl.maximum((k_max - k_min) / 15.0, 1e-6)
     k_zp_f = tl.clamp(
         tl.where(
@@ -385,14 +391,18 @@ def _reshape_cache_int4_packed(
     v_even = tl.load(val_base + even_offs, mask=even_v_mask, other=0.0).to(tl.float32)
     v_odd = tl.load(val_base + odd_offs, mask=odd_v_mask, other=0.0).to(tl.float32)
 
-    v_min = tl.minimum(
+    v_min_raw = tl.minimum(
         tl.min(tl.where(even_v_mask, v_even, float("inf"))),
         tl.min(tl.where(odd_v_mask, v_odd, float("inf"))),
     )
-    v_max = tl.maximum(
+    v_max_raw = tl.maximum(
         tl.max(tl.where(even_v_mask, v_even, float("-inf"))),
         tl.max(tl.where(odd_v_mask, v_odd, float("-inf"))),
     )
+    v_mid = (v_max_raw + v_min_raw) * 0.5
+    v_half = (v_max_raw - v_min_raw) * 0.5
+    v_min = v_mid - v_half * 0.975
+    v_max = v_mid + v_half * 0.975
     v_scale = tl.maximum((v_max - v_min) / 15.0, 1e-6)
     v_zp_f = tl.clamp(
         tl.where(
