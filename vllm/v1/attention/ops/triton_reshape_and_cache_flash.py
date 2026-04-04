@@ -615,7 +615,7 @@ def _reshape_cache_turboquant_int4(
     k_norm = tl.sqrt(k_sq + 1e-12)
 
     # Normalize to N(0,1): z = x_wht / (norm / sqrt(d)) = x_wht * sqrt(d) / norm
-    k_inv_sigma = tl.sqrt(head_size.to(tl.float32)) / k_norm
+    k_inv_sigma = tl.sqrt(float(head_size)) / k_norm
     k_even_z = k_even * k_inv_sigma
     k_odd_z = k_odd * k_inv_sigma
 
@@ -636,7 +636,7 @@ def _reshape_cache_turboquant_int4(
     )
 
     # Store norm/head_size as scale (attention multiplies directly)
-    k_scale = k_norm / head_size.to(tl.float32)
+    k_scale = k_norm / float(head_size)
     tl.store(
         k_scale_cache_ptr
         + blk * stride_ks_blk
@@ -658,7 +658,7 @@ def _reshape_cache_turboquant_int4(
         tl.where(odd_v_mask, v_odd * v_odd, 0.0)
     )
     v_norm = tl.sqrt(v_sq + 1e-12)
-    v_inv_sigma = tl.sqrt(head_size_v.to(tl.float32)) / v_norm
+    v_inv_sigma = tl.sqrt(float(head_size_v)) / v_norm
     v_even_z = v_even * v_inv_sigma
     v_odd_z = v_odd * v_inv_sigma
 
@@ -676,7 +676,7 @@ def _reshape_cache_turboquant_int4(
         mask=half_offs < half_v,
     )
 
-    v_scale = v_norm / head_size_v.to(tl.float32)
+    v_scale = v_norm / float(head_size_v)
     tl.store(
         v_scale_cache_ptr
         + blk * stride_vs_blk
@@ -759,7 +759,7 @@ def _reshape_cache_turboquant_int2(
     k_norm = tl.sqrt(k_sq + 1e-12)
 
     # Normalize to N(0,1)
-    k_inv_sigma = tl.sqrt(head_size.to(tl.float32)) / k_norm
+    k_inv_sigma = tl.sqrt(float(head_size)) / k_norm
     k0_z = k0 * k_inv_sigma
     k1_z = k1 * k_inv_sigma
     k2_z = k2 * k_inv_sigma
@@ -783,7 +783,7 @@ def _reshape_cache_turboquant_int2(
         mask=qtr_offs < qtr_k,
     )
 
-    k_scale = k_norm / head_size.to(tl.float32)
+    k_scale = k_norm / float(head_size)
     tl.store(
         k_scale_cache_ptr
         + blk * stride_ks_blk
@@ -812,7 +812,7 @@ def _reshape_cache_turboquant_int2(
         + tl.sum(tl.where(mask_3v, v3 * v3, 0.0))
     )
     v_norm = tl.sqrt(v_sq + 1e-12)
-    v_inv_sigma = tl.sqrt(head_size_v.to(tl.float32)) / v_norm
+    v_inv_sigma = tl.sqrt(float(head_size_v)) / v_norm
     v0_z = v0 * v_inv_sigma
     v1_z = v1 * v_inv_sigma
     v2_z = v2 * v_inv_sigma
@@ -836,7 +836,7 @@ def _reshape_cache_turboquant_int2(
         mask=qtr_offs < qtr_v,
     )
 
-    v_scale = v_norm / head_size_v.to(tl.float32)
+    v_scale = v_norm / float(head_size_v)
     tl.store(
         v_scale_cache_ptr
         + blk * stride_vs_blk
