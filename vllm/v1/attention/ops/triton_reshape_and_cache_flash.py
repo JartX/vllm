@@ -252,168 +252,6 @@ def _reshape_cache_per_token_head(
 
 
 @triton.jit
-def _reshape_cache_int4_symmetric(
-    key_ptr,  # [num_tokens, num_kv_heads, head_size]
-    value_ptr,  # [num_tokens, num_kv_heads, head_size_v]
-    key_cache_ptr,  # [num_blocks, block_size, num_kv_heads, head_size//2] uint8
-    value_cache_ptr,
-    k_scale_cache_ptr,  # [num_blocks, block_size, num_kv_heads] float32
-    v_scale_cache_ptr,
-    slot_mapping_ptr,
-    stride_key_tok: tl.int64,
-    stride_key_head: tl.int64,
-    stride_val_tok: tl.int64,
-    stride_val_head: tl.int64,
-    stride_kc_blk: tl.int64,
-    stride_kc_slot: tl.int64,
-    stride_kc_head: tl.int64,
-    stride_vc_blk: tl.int64,
-    stride_vc_slot: tl.int64,
-    stride_vc_head: tl.int64,
-    stride_ks_blk: tl.int64,
-    stride_ks_slot: tl.int64,
-    stride_ks_head: tl.int64,
-    stride_vs_blk: tl.int64,
-    stride_vs_slot: tl.int64,
-    stride_vs_head: tl.int64,
-    block_size: tl.constexpr,
-    head_size: tl.constexpr,
-    head_size_v: tl.constexpr,
-    HALF_HEAD_PADDED: tl.constexpr,
-):
-    """Symmetric INT4 quantization for RHT-rotated data.
-
-    Maps [-absmax, +absmax] to signed [-7, +7] stored as unsigned [0, 14].
-    Level 15 is unused (sacrifice 1 level for perfect symmetry around 0).
-    Scale = absmax / 7.0, stored as plain float32.
-    Dequant: x = (q - 7) * scale.
-    """
-    tok = tl.program_id(0)
-    head = tl.program_id(1)
-
-    slot = tl.load(slot_mapping_ptr + tok).to(tl.int64)
-    if slot < 0:
-        return
-
-    blk = slot // block_size
-    slot_in_blk = slot % block_size
-
-    half_offs = tl.arange(0, HALF_HEAD_PADDED)
-    even_offs = half_offs * 2
-    odd_offs = half_offs * 2 + 1
-
-    # ---- Key ----------------------------------------------------------------
-    half_k = head_size // 2
-    even_k_mask = even_offs < head_size
-    odd_k_mask = odd_offs < head_size
-    key_base = key_ptr + tok * stride_key_tok + head * stride_key_head
-
-    k_even = tl.load(key_base + even_offs, mask=even_k_mask, other=0.0).to(tl.float32)
-    k_odd = tl.load(key_base + odd_offs, mask=odd_k_mask, other=0.0).to(tl.float32)
-
-    # Symmetric: scale = absmax / 7
-    k_absmax = tl.maximum(
-        tl.max(tl.where(even_k_mask, tl.abs(k_even), 0.0)),
-        tl.max(tl.where(odd_k_mask, tl.abs(k_odd), 0.0)),
-    )
-    k_scale = tl.maximum(k_absmax / 7.0, 1e-6)
-
-    # Quantize to signed [-7, +7], store as unsigned [0, 14] (offset by +7)
-    inv_k = 1.0 / k_scale
-    k_even_q = tl.clamp(
-        tl.where(
-            k_even * inv_k >= 0,
-            (k_even * inv_k + 0.5).to(tl.int32),
-            (k_even * inv_k - 0.5).to(tl.int32),
-        ).to(tl.float32) + 7.0,
-        0.0,
-        14.0,
-    )
-    k_odd_q = tl.clamp(
-        tl.where(
-            k_odd * inv_k >= 0,
-            (k_odd * inv_k + 0.5).to(tl.int32),
-            (k_odd * inv_k - 0.5).to(tl.int32),
-        ).to(tl.float32) + 7.0,
-        0.0,
-        14.0,
-    )
-
-    k_packed = (k_even_q.to(tl.uint8) & 0xF) | ((k_odd_q.to(tl.uint8) & 0xF) << 4)
-    tl.store(
-        key_cache_ptr
-        + blk * stride_kc_blk
-        + slot_in_blk * stride_kc_slot
-        + head * stride_kc_head
-        + half_offs,
-        k_packed,
-        mask=half_offs < half_k,
-    )
-
-    tl.store(
-        k_scale_cache_ptr
-        + blk * stride_ks_blk
-        + slot_in_blk * stride_ks_slot
-        + head * stride_ks_head,
-        k_scale,
-    )
-
-    # ---- Value (same symmetric scheme) -------------------------------------
-    half_v = head_size_v // 2
-    even_v_mask = even_offs < head_size_v
-    odd_v_mask = odd_offs < head_size_v
-    val_base = value_ptr + tok * stride_val_tok + head * stride_val_head
-
-    v_even = tl.load(val_base + even_offs, mask=even_v_mask, other=0.0).to(tl.float32)
-    v_odd = tl.load(val_base + odd_offs, mask=odd_v_mask, other=0.0).to(tl.float32)
-
-    v_absmax = tl.maximum(
-        tl.max(tl.where(even_v_mask, tl.abs(v_even), 0.0)),
-        tl.max(tl.where(odd_v_mask, tl.abs(v_odd), 0.0)),
-    )
-    v_scale = tl.maximum(v_absmax / 7.0, 1e-6)
-
-    inv_v = 1.0 / v_scale
-    v_even_q = tl.clamp(
-        tl.where(
-            v_even * inv_v >= 0,
-            (v_even * inv_v + 0.5).to(tl.int32),
-            (v_even * inv_v - 0.5).to(tl.int32),
-        ).to(tl.float32) + 7.0,
-        0.0,
-        14.0,
-    )
-    v_odd_q = tl.clamp(
-        tl.where(
-            v_odd * inv_v >= 0,
-            (v_odd * inv_v + 0.5).to(tl.int32),
-            (v_odd * inv_v - 0.5).to(tl.int32),
-        ).to(tl.float32) + 7.0,
-        0.0,
-        14.0,
-    )
-
-    v_packed = (v_even_q.to(tl.uint8) & 0xF) | ((v_odd_q.to(tl.uint8) & 0xF) << 4)
-    tl.store(
-        value_cache_ptr
-        + blk * stride_vc_blk
-        + slot_in_blk * stride_vc_slot
-        + head * stride_vc_head
-        + half_offs,
-        v_packed,
-        mask=half_offs < half_v,
-    )
-
-    tl.store(
-        v_scale_cache_ptr
-        + blk * stride_vs_blk
-        + slot_in_blk * stride_vs_slot
-        + head * stride_vs_head,
-        v_scale,
-    )
-
-
-@triton.jit
 def _reshape_cache_int4_packed(
     key_ptr,  # [num_tokens, num_kv_heads, head_size]
     value_ptr,  # [num_tokens, num_kv_heads, head_size_v]
@@ -625,18 +463,9 @@ def _reshape_cache_int4_packed(
 # The vector norm is stored separately (float32 per head) as norm/head_size
 # so the attention kernel just multiplies by the stored scale.
 #
-# INT4 TurboQuant (16 centroids, KV_QUANT_MODE=6):
-#   Same packing as asymmetric INT4 (2 indices per byte).
-#   Enabled via VLLM_INT4_TURBOQUANT=1 env var.
 # INT2 TurboQuant (4 centroids, KV_QUANT_MODE=5):
 #   4 indices per byte → head_size/4 bytes per head.
 # ---------------------------------------------------------------------------
-
-# Lloyd-Max centroids for N(0,1) — 16 levels (INT4 TurboQuant)
-# Symmetric: centroid[i] = -centroid[15-i]
-_LLOYD_MAX_16_POS = [0.1284, 0.3882, 0.6568, 0.9424, 1.2562, 1.6180, 2.0690, 2.7326]
-# Decision boundaries (midpoints between consecutive centroids)
-_LLOYD_MAX_16_BOUNDS = [0.2583, 0.5225, 0.7996, 1.0993, 1.4371, 1.8435, 2.4008]
 
 # Lloyd-Max centroids for N(0,1) — 4 levels (INT2 TurboQuant)
 _LLOYD_MAX_4_CENTROIDS = [-1.5104, -0.4528, 0.4528, 1.5104]
@@ -661,10 +490,9 @@ def fast_hadamard_transform(x: torch.Tensor) -> torch.Tensor:
     return x
 
 
-# Deterministic ±1 signs for Double Randomized Hadamard Transform.
-# Double RHT = H × D₂ × H × D₁ × x  (two rounds of sign flip + WHT).
-# A single RHT leaves residual structure; two rounds square the
-# incoherence, producing a near-perfect Gaussian (QuIP# insight).
+# Deterministic ±1 signs for Randomized Hadamard Transform.
+# RHT = H × D × x  (sign flip + WHT).  Breaks residual structure
+# in KV vectors, improving quantization quality.
 _RHT_SIGNS_CACHE: dict[tuple[int, int, str], torch.Tensor] = {}
 
 
@@ -684,7 +512,8 @@ def _get_rht_signs(d: int, round_idx: int, device: torch.device) -> torch.Tensor
 def _single_rht(x: torch.Tensor, inverse: bool = False) -> torch.Tensor:
     """Single Randomized Hadamard Transform: H × D₁ × x.
 
-    Used by INT4 TurboQuant where 16 levels don't need double rotation.
+    Used by INT4 per-token-head quantization to gaussianize data
+    before asymmetric quantization.
     """
     d = x.shape[-1]
     d1 = _get_rht_signs(d, 0, x.device)
@@ -692,31 +521,6 @@ def _single_rht(x: torch.Tensor, inverse: bool = False) -> torch.Tensor:
         return fast_hadamard_transform(x) * d1
     else:
         return fast_hadamard_transform(x * d1)
-
-
-def randomized_hadamard_transform(
-    x: torch.Tensor, inverse: bool = False
-) -> torch.Tensor:
-    """Double Randomized Hadamard Transform along the last dimension.
-
-    Forward:  y = H × D₂ × H × D₁ × x
-    Inverse:  x = D₁ × H × D₂ × H × y   (no /d² — absorbed in stored norms)
-    """
-    d = x.shape[-1]
-    d1 = _get_rht_signs(d, 0, x.device)
-    d2 = _get_rht_signs(d, 1, x.device)
-    if inverse:
-        # Reverse order: D₁ × H × D₂ × H × y
-        y = fast_hadamard_transform(x)
-        y = y * d2
-        y = fast_hadamard_transform(y)
-        return y * d1
-    else:
-        # Forward: H × D₂ × H × D₁ × x
-        y = x * d1
-        y = fast_hadamard_transform(y)
-        y = y * d2
-        return fast_hadamard_transform(y)
 
 
 @triton.jit
@@ -730,178 +534,6 @@ def _lloyd_max_quantize_4(z):
         z < 0.0,
         tl.where(z < -0.9816, 0, 1).to(tl.uint8),
         tl.where(z < 0.9816, 2, 3).to(tl.uint8),
-    )
-
-
-@triton.jit
-def _lloyd_max_quantize_16(z):
-    """Quantize N(0,1) values to 16 Lloyd-Max centroids (INT4).
-
-    Returns index in [0, 15].  Binary search on decision boundaries.
-    """
-    return tl.where(
-        z < 0.0,
-        tl.where(
-            z < -1.0993,
-            tl.where(
-                z < -1.8435,
-                tl.where(z < -2.4008, 0, 1).to(tl.uint8),
-                tl.where(z < -1.4371, 2, 3).to(tl.uint8),
-            ),
-            tl.where(
-                z < -0.5225,
-                tl.where(z < -0.7996, 4, 5).to(tl.uint8),
-                tl.where(z < -0.2583, 6, 7).to(tl.uint8),
-            ),
-        ),
-        tl.where(
-            z < 1.0993,
-            tl.where(
-                z < 0.5225,
-                tl.where(z < 0.2583, 8, 9).to(tl.uint8),
-                tl.where(z < 0.7996, 10, 11).to(tl.uint8),
-            ),
-            tl.where(
-                z < 1.8435,
-                tl.where(z < 1.4371, 12, 13).to(tl.uint8),
-                tl.where(z < 2.4008, 14, 15).to(tl.uint8),
-            ),
-        ),
-    )
-
-
-@triton.jit
-def _reshape_cache_turboquant_int4(
-    key_ptr,  # [num_tokens, num_kv_heads, head_size]  (WHT-transformed)
-    value_ptr,  # [num_tokens, num_kv_heads, head_size_v] (WHT-transformed)
-    key_cache_ptr,  # [num_blocks, block_size, num_kv_heads, head_size//2] uint8
-    value_cache_ptr,
-    k_scale_cache_ptr,  # [num_blocks, block_size, num_kv_heads] float32 (norm/d)
-    v_scale_cache_ptr,
-    slot_mapping_ptr,
-    stride_key_tok: tl.int64,
-    stride_key_head: tl.int64,
-    stride_val_tok: tl.int64,
-    stride_val_head: tl.int64,
-    stride_kc_blk: tl.int64,
-    stride_kc_slot: tl.int64,
-    stride_kc_head: tl.int64,
-    stride_vc_blk: tl.int64,
-    stride_vc_slot: tl.int64,
-    stride_vc_head: tl.int64,
-    stride_ks_blk: tl.int64,
-    stride_ks_slot: tl.int64,
-    stride_ks_head: tl.int64,
-    stride_vs_blk: tl.int64,
-    stride_vs_slot: tl.int64,
-    stride_vs_head: tl.int64,
-    block_size: tl.constexpr,
-    head_size: tl.constexpr,
-    head_size_v: tl.constexpr,
-    HALF_HEAD_PADDED: tl.constexpr,
-):
-    """TurboQuant INT4: Lloyd-Max 16-centroid quantization of WHT-rotated data.
-
-    Input is already WHT-transformed.  The norm/head_size is stored as the
-    scale so attention can multiply directly.
-    """
-    tok = tl.program_id(0)
-    head = tl.program_id(1)
-
-    slot = tl.load(slot_mapping_ptr + tok).to(tl.int64)
-    if slot < 0:
-        return
-
-    blk = slot // block_size
-    slot_in_blk = slot % block_size
-
-    half_offs = tl.arange(0, HALF_HEAD_PADDED)
-    even_offs = half_offs * 2
-    odd_offs = half_offs * 2 + 1
-
-    # ---- Key ----------------------------------------------------------------
-    half_k = head_size // 2
-    even_k_mask = even_offs < head_size
-    odd_k_mask = odd_offs < head_size
-    key_base = key_ptr + tok * stride_key_tok + head * stride_key_head
-
-    k_even = tl.load(key_base + even_offs, mask=even_k_mask, other=0.0).to(tl.float32)
-    k_odd = tl.load(key_base + odd_offs, mask=odd_k_mask, other=0.0).to(tl.float32)
-
-    # Compute norm of the WHT-transformed vector (= norm of original vector)
-    k_sq = tl.sum(tl.where(even_k_mask, k_even * k_even, 0.0)) + tl.sum(
-        tl.where(odd_k_mask, k_odd * k_odd, 0.0)
-    )
-    k_norm = tl.sqrt(k_sq + 1e-12)
-
-    # Normalize to N(0,1): z = x_wht / (norm / sqrt(d)) = x_wht * sqrt(d) / norm
-    k_inv_sigma = tl.sqrt(float(head_size)) / k_norm
-    k_even_z = k_even * k_inv_sigma
-    k_odd_z = k_odd * k_inv_sigma
-
-    # Lloyd-Max quantize to [0, 15]
-    k_even_q = _lloyd_max_quantize_16(k_even_z)
-    k_odd_q = _lloyd_max_quantize_16(k_odd_z)
-
-    # Pack two 4-bit indices per byte: lo=even, hi=odd
-    k_packed = (k_even_q & 0xF) | ((k_odd_q & 0xF) << 4)
-    tl.store(
-        key_cache_ptr
-        + blk * stride_kc_blk
-        + slot_in_blk * stride_kc_slot
-        + head * stride_kc_head
-        + half_offs,
-        k_packed,
-        mask=half_offs < half_k,
-    )
-
-    k_scale = k_norm / float(head_size ** 1.5)
-    tl.store(
-        k_scale_cache_ptr
-        + blk * stride_ks_blk
-        + slot_in_blk * stride_ks_slot
-        + head * stride_ks_head,
-        k_scale,
-    )
-
-    # ---- Value (same algorithm) --------------------------------------------
-    half_v = head_size_v // 2
-    even_v_mask = even_offs < head_size_v
-    odd_v_mask = odd_offs < head_size_v
-    val_base = value_ptr + tok * stride_val_tok + head * stride_val_head
-
-    v_even = tl.load(val_base + even_offs, mask=even_v_mask, other=0.0).to(tl.float32)
-    v_odd = tl.load(val_base + odd_offs, mask=odd_v_mask, other=0.0).to(tl.float32)
-
-    v_sq = tl.sum(tl.where(even_v_mask, v_even * v_even, 0.0)) + tl.sum(
-        tl.where(odd_v_mask, v_odd * v_odd, 0.0)
-    )
-    v_norm = tl.sqrt(v_sq + 1e-12)
-    v_inv_sigma = tl.sqrt(float(head_size_v)) / v_norm
-    v_even_z = v_even * v_inv_sigma
-    v_odd_z = v_odd * v_inv_sigma
-
-    v_even_q = _lloyd_max_quantize_16(v_even_z)
-    v_odd_q = _lloyd_max_quantize_16(v_odd_z)
-
-    v_packed = (v_even_q & 0xF) | ((v_odd_q & 0xF) << 4)
-    tl.store(
-        value_cache_ptr
-        + blk * stride_vc_blk
-        + slot_in_blk * stride_vc_slot
-        + head * stride_vc_head
-        + half_offs,
-        v_packed,
-        mask=half_offs < half_v,
-    )
-
-    v_scale = v_norm / float(head_size_v ** 1.5)
-    tl.store(
-        v_scale_cache_ptr
-        + blk * stride_vs_blk
-        + slot_in_blk * stride_vs_slot
-        + head * stride_vs_head,
-        v_scale,
     )
 
 

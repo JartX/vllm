@@ -120,7 +120,7 @@ def find_seq_idx(
 
 
 # ---------------------------------------------------------------------------
-# TurboQuant: Lloyd-Max centroid dequantization for attention kernels
+# INT2 TurboQuant: Lloyd-Max centroid dequantization for attention kernels
 # ---------------------------------------------------------------------------
 
 
@@ -132,30 +132,6 @@ def _lloyd_max_dequant_4(idx):
         tl.where(idx == 0, -1.5104, -0.4528),
         tl.where(idx == 2, 0.4528, 1.5104),
     )
-
-
-@triton.jit
-def _lloyd_max_dequant_16(idx):
-    """Look up INT4 Lloyd-Max centroid for N(0,1).  idx in [0..15].
-
-    Uses symmetry: centroid[i] = -centroid[15-i].
-    """
-    sign = tl.where(idx >= 8, 1.0, -1.0)
-    abs_idx = tl.where(idx >= 8, idx - 8, 7 - idx)
-    abs_c = tl.where(
-        abs_idx < 4,
-        tl.where(
-            abs_idx < 2,
-            tl.where(abs_idx == 0, 0.1284, 0.3882),
-            tl.where(abs_idx == 2, 0.6568, 0.9424),
-        ),
-        tl.where(
-            abs_idx < 6,
-            tl.where(abs_idx == 4, 1.2562, 1.6180),
-            tl.where(abs_idx == 6, 2.0690, 2.7326),
-        ),
-    )
-    return sign * abs_c
 
 
 @triton.jit
@@ -425,7 +401,7 @@ def kernel_unified_attention_2d(
             block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
         ).to(tl.int64)
 
-        # ---- INT4 2-way split: modes 4 (asymmetric) and 6 (TurboQuant)
+        # ---- INT4 2-way split: mode 4 (RHT + asymmetric)
         if KV_QUANT_MODE == 4:
             slot_in_blk = seq_offset % BLOCK_SIZE
             k_off_i4 = (
@@ -1085,7 +1061,7 @@ def kernel_unified_attention_3d(
             block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
         ).to(tl.int64)
 
-        # ---- INT4 2-way split: modes 4 (asymmetric) and 6 (TurboQuant)
+        # ---- INT4 2-way split: mode 4 (RHT + asymmetric)
         if KV_QUANT_MODE == 4:
             slot_in_blk = seq_offset % BLOCK_SIZE
             k_off_i4 = (
