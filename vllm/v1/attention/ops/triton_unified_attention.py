@@ -131,8 +131,8 @@ def _lloyd_max_dequant_4(idx):
     """Look up INT2 Lloyd-Max centroid for N(0,1).  idx in [0..3]."""
     return tl.where(
         idx < 2,
-        tl.where(idx == 0, -1.60, -0.46),
-        tl.where(idx == 2, 0.46, 1.60),
+        tl.where(idx == 0, -1.5104, -0.4528),
+        tl.where(idx == 2, 0.4528, 1.5104),
     )
 
 

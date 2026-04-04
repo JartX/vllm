@@ -275,7 +275,7 @@ def test_reshape_and_cache_per_token_head(
 
     # Lloyd-Max centroids for dequant reference
     _LM4 = torch.tensor(
-        [-1.60, -0.46, 0.46, 1.60], device="cuda", dtype=torch.float32
+        [-1.5104, -0.4528, 0.4528, 1.5104], device="cuda", dtype=torch.float32
     )
     _LM16 = torch.tensor(
         [-2.7326, -2.0690, -1.6180, -1.2562, -0.9424, -0.6568, -0.3882, -0.1284,
@@ -321,10 +321,10 @@ def test_reshape_and_cache_per_token_head(
                     full[:, 2::4] = _LM4[b2]
                     full[:, 3::4] = _LM4[b3]
 
-                # stored_scale = norm/d^1.5.
-                # Our IRHT = D × WHT (no /d), so:
-                # D × WHT(c × norm/d^1.5) = (norm/d^1.5) × D × WHT(c)
-                # = correct reconstruction of original x
+                # stored_scale = norm/d^2.5 for double RHT.
+                # IRHT_double(c × scale) = D₁×H×D₂×H×(c × scale)
+                # = scale × d² × IRHT_double_normalized(c)
+                # Reconstructs original x correctly.
                 deq = randomized_hadamard_transform(
                     full * stored_scale[:, None], inverse=True
                 )
@@ -458,7 +458,7 @@ def test_per_token_head_round_trip_accuracy(
             fast_hadamard_transform,
         )
         _LM4 = torch.tensor(
-            [-1.60, -0.46, 0.46, 1.60], device="cuda", dtype=torch.float32
+            [-1.5104, -0.4528, 0.4528, 1.5104], device="cuda", dtype=torch.float32
         )
         _LM16 = torch.tensor(
             [-2.7326, -2.0690, -1.6180, -1.2562, -0.9424, -0.6568, -0.3882, -0.1284,

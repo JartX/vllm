@@ -476,12 +476,9 @@ _LLOYD_MAX_16_POS = [0.1284, 0.3882, 0.6568, 0.9424, 1.2562, 1.6180, 2.0690, 2.7
 # Decision boundaries (midpoints between consecutive centroids)
 _LLOYD_MAX_16_BOUNDS = [0.2583, 0.5225, 0.7996, 1.0993, 1.4371, 1.8435, 2.4008]
 
-# Lloyd-Max centroids for 4 levels (INT2 TurboQuant).
-# Slightly wider than pure N(0,1) optimal [-1.51, -0.45, +0.45, +1.51]
-# to better capture the heavier tails of post-RHT attention activations
-# (empirically closer to a generalized Gaussian with β≈1.7).
-_LLOYD_MAX_4_CENTROIDS = [-1.60, -0.46, 0.46, 1.60]
-_LLOYD_MAX_4_BOUNDS = [-0.96, 0.0, 0.96]
+# Lloyd-Max centroids for N(0,1) — 4 levels (INT2 TurboQuant)
+_LLOYD_MAX_4_CENTROIDS = [-1.5104, -0.4528, 0.4528, 1.5104]
+_LLOYD_MAX_4_BOUNDS = [-0.9816, 0.0, 0.9816]
 
 
 def fast_hadamard_transform(x: torch.Tensor) -> torch.Tensor:
@@ -502,19 +499,19 @@ def fast_hadamard_transform(x: torch.Tensor) -> torch.Tensor:
     return x
 
 
-# Deterministic ±1 signs for Randomized Hadamard Transform.
-# RHT = H × D × x where D = diag(signs). The random sign flip before
-# WHT breaks residual structure in the data and produces a distribution
-# closer to Gaussian, which makes Lloyd-Max centroids more optimal.
-_RHT_SIGNS_CACHE: dict[tuple[int, str], torch.Tensor] = {}
+# Deterministic ±1 signs for Double Randomized Hadamard Transform.
+# Double RHT = H × D₂ × H × D₁ × x  (two rounds of sign flip + WHT).
+# A single RHT leaves residual structure; two rounds square the
+# incoherence, producing a near-perfect Gaussian (QuIP# insight).
+_RHT_SIGNS_CACHE: dict[tuple[int, int, str], torch.Tensor] = {}
 
 
-def _get_rht_signs(d: int, device: torch.device) -> torch.Tensor:
+def _get_rht_signs(d: int, round_idx: int, device: torch.device) -> torch.Tensor:
     """Return a cached deterministic ±1 sign vector of length *d*."""
-    key = (d, str(device))
+    key = (d, round_idx, str(device))
     if key not in _RHT_SIGNS_CACHE:
         gen = torch.Generator()
-        gen.manual_seed(0x9E3779B9)
+        gen.manual_seed(0x9E3779B9 + round_idx * 0x517CC1B7)
         signs = 2.0 * torch.bernoulli(
             torch.full((d,), 0.5), generator=gen
         ) - 1.0
@@ -525,17 +522,26 @@ def _get_rht_signs(d: int, device: torch.device) -> torch.Tensor:
 def randomized_hadamard_transform(
     x: torch.Tensor, inverse: bool = False
 ) -> torch.Tensor:
-    """Randomized Hadamard Transform (RHT) along the last dimension.
+    """Double Randomized Hadamard Transform along the last dimension.
 
-    Forward:  y = WHT(D × x)    where D = diag(±1 signs)
-    Inverse:  x = D × WHT(y)    (note: no /d — scale absorbed in stored norms)
+    Forward:  y = H × D₂ × H × D₁ × x
+    Inverse:  x = D₁ × H × D₂ × H × y   (no /d² — absorbed in stored norms)
     """
     d = x.shape[-1]
-    signs = _get_rht_signs(d, x.device)
+    d1 = _get_rht_signs(d, 0, x.device)
+    d2 = _get_rht_signs(d, 1, x.device)
     if inverse:
-        return fast_hadamard_transform(x) * signs
+        # Reverse order: D₁ × H × D₂ × H × y
+        y = fast_hadamard_transform(x)
+        y = y * d2
+        y = fast_hadamard_transform(y)
+        return y * d1
     else:
-        return fast_hadamard_transform(x * signs)
+        # Forward: H × D₂ × H × D₁ × x
+        y = x * d1
+        y = fast_hadamard_transform(y)
+        y = y * d2
+        return fast_hadamard_transform(y)
 
 
 @triton.jit
@@ -547,8 +553,8 @@ def _lloyd_max_quantize_4(z):
     """
     return tl.where(
         z < 0.0,
-        tl.where(z < -0.96, 0, 1).to(tl.uint8),
-        tl.where(z < 0.96, 2, 3).to(tl.uint8),
+        tl.where(z < -0.9816, 0, 1).to(tl.uint8),
+        tl.where(z < 0.9816, 2, 3).to(tl.uint8),
     )
 
 
@@ -822,10 +828,10 @@ def _reshape_cache_turboquant_int2(
         mask=qtr_offs < qtr_k,
     )
 
-    # Store norm/d^1.5 as scale. This absorbs the 1/d factor from
-    # dot(Q_rht, K_rht) = d × dot(Q, K), and our IRHT implementation
-    # already multiplies by d (D × WHT without /d), so these cancel.
-    k_scale = k_norm / float(head_size ** 1.5)
+    # Store norm/d^2.5 as scale. Double RHT gives dot(Q,K) × d².
+    # IRHT_double multiplies by d². Scale absorbs both: 1/d² for scores,
+    # 1/sqrt(d) for de-normalizing z back to original magnitude.
+    k_scale = k_norm / float(head_size ** 2.5)
     tl.store(
         k_scale_cache_ptr
         + blk * stride_ks_blk
@@ -878,7 +884,7 @@ def _reshape_cache_turboquant_int2(
         mask=qtr_offs < qtr_v,
     )
 
-    v_scale = v_norm / float(head_size_v ** 1.5)
+    v_scale = v_norm / float(head_size_v ** 2.5)
     tl.store(
         v_scale_cache_ptr
         + blk * stride_vs_blk
