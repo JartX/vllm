@@ -956,9 +956,9 @@ def triton_reshape_and_cache_flash_per_token_head_quant(
         KVQuantMode.INT4_TURBO_PER_TOKEN_HEAD,
     ):
         if kv_quant_mode == KVQuantMode.INT2_PER_TOKEN_HEAD:
-            # INT2: single RHT (H × D₁ × x).
-            key_wht = _single_rht(key.float()).to(key.dtype)
-            value_wht = _single_rht(value.float()).to(value.dtype)
+            # INT2: plain WHT (no random signs — empirically best).
+            key_wht = fast_hadamard_transform(key.float()).to(key.dtype)
+            value_wht = fast_hadamard_transform(value.float()).to(value.dtype)
             assert head_size % 4 == 0 and head_size_v % 4 == 0
             qtr_head_padded = triton.next_power_of_2(
                 max(head_size, head_size_v) // 4

@@ -289,7 +289,7 @@ def test_reshape_and_cache_per_token_head(
 
         if is_turboquant:
             from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
-                _single_rht,
+                fast_hadamard_transform,
             )
             for label, data, cache, sc in [
                 ("key", key, key_cache, k_scale_cache),
@@ -323,8 +323,8 @@ def test_reshape_and_cache_per_token_head(
 
                 # stored_scale = norm/d^1.5.
                 # IRHT(c × scale) = D₁ × H × (c × scale)
-                deq = _single_rht(
-                    full * stored_scale[:, None], inverse=True
+                deq = fast_hadamard_transform(
+                    full * stored_scale[:, None]
                 )
                 ref_deq = data[i].float()
                 torch.testing.assert_close(deq, ref_deq, atol=deq_atol, rtol=deq_rtol)
