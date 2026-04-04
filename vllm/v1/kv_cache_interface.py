@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import copy
-import os
 from dataclasses import dataclass, fields, replace
 from enum import IntEnum
 from math import prod
@@ -39,22 +38,13 @@ class KVQuantMode(IntEnum):
     FP8_PER_TENSOR = 1  # per-tensor scales (current fp8 path)
     INT8_PER_TOKEN_HEAD = 2  # per-token-head dynamic scales for int8
     FP8_PER_TOKEN_HEAD = 3  # per-token-head dynamic scales for fp8
-    INT4_PER_TOKEN_HEAD = 4  # packed 2×int4/byte, asymmetric zp in scale bits
-    INT2_PER_TOKEN_HEAD = 5  # TurboQuant: WHT + Lloyd-Max 4 centroids, 4×int2/byte
-    INT4_TURBO_PER_TOKEN_HEAD = 6  # TurboQuant: WHT + Lloyd-Max 16 centroids
+    INT4_PER_TOKEN_HEAD = 4  # packed 2×int4/byte, RHT + asymmetric zp
+    INT2_PER_TOKEN_HEAD = 5  # WHT + Lloyd-Max 4 centroids, 4×int2/byte
 
     @property
     def is_per_token_head(self) -> bool:
         """True for any per-token-head quantization mode."""
         return self >= 2
-
-    @property
-    def is_turboquant(self) -> bool:
-        """True for TurboQuant modes (WHT + Lloyd-Max)."""
-        return self in (
-            KVQuantMode.INT2_PER_TOKEN_HEAD,
-            KVQuantMode.INT4_TURBO_PER_TOKEN_HEAD,
-        )
 
 
 def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
@@ -62,8 +52,6 @@ def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
     if kv_cache_dtype == "int2_per_token_head":
         return KVQuantMode.INT2_PER_TOKEN_HEAD
     if kv_cache_dtype == "int4_per_token_head":
-        if os.environ.get("VLLM_INT4_TURBOQUANT") == "1":
-            return KVQuantMode.INT4_TURBO_PER_TOKEN_HEAD
         return KVQuantMode.INT4_PER_TOKEN_HEAD
     if kv_cache_dtype == "int8_per_token_head":
         return KVQuantMode.INT8_PER_TOKEN_HEAD
@@ -153,10 +141,7 @@ class AttentionSpec(KVCacheSpec):
 
     def _effective_head_size(self, hs: int) -> int:
         """Return the storage head size: halved for INT4, quartered for INT2."""
-        if self.kv_quant_mode in (
-            KVQuantMode.INT4_PER_TOKEN_HEAD,
-            KVQuantMode.INT4_TURBO_PER_TOKEN_HEAD,
-        ):
+        if self.kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD:
             return hs // 2
         if self.kv_quant_mode == KVQuantMode.INT2_PER_TOKEN_HEAD:
             return hs // 4

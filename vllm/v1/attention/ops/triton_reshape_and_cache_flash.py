@@ -1111,66 +1111,56 @@ def triton_reshape_and_cache_flash_per_token_head_quant(
     head_size_v = value.shape[2]
     block_size = key_cache.shape[1]
 
-    # TurboQuant modes: apply transform, then dispatch to dedicated kernel.
-    if kv_quant_mode in (
-        KVQuantMode.INT2_PER_TOKEN_HEAD,
-        KVQuantMode.INT4_TURBO_PER_TOKEN_HEAD,
-    ):
-        if kv_quant_mode == KVQuantMode.INT2_PER_TOKEN_HEAD:
-            # INT2: plain WHT (no random signs — empirically best).
-            key_wht = fast_hadamard_transform(key.float()).to(key.dtype)
-            value_wht = fast_hadamard_transform(value.float()).to(value.dtype)
-            assert head_size % 4 == 0 and head_size_v % 4 == 0
-            qtr_head_padded = triton.next_power_of_2(
-                max(head_size, head_size_v) // 4
-            )
-            if current_platform.is_rocm() or current_platform.is_xpu():
-                num_warps = 4
-            else:
-                num_warps = min(16, max(1, qtr_head_padded // 32))
-            _reshape_cache_turboquant_int2[(num_tokens, num_kv_heads)](
-                key_ptr=key_wht,
-                value_ptr=value_wht,
-                key_cache_ptr=key_cache,
-                value_cache_ptr=value_cache,
-                k_scale_cache_ptr=k_scale_cache,
-                v_scale_cache_ptr=v_scale_cache,
-                slot_mapping_ptr=slot_mapping,
-                stride_key_tok=key_wht.stride(0),
-                stride_key_head=key_wht.stride(1),
-                stride_val_tok=value_wht.stride(0),
-                stride_val_head=value_wht.stride(1),
-                stride_kc_blk=key_cache.stride(0),
-                stride_kc_slot=key_cache.stride(1),
-                stride_kc_head=key_cache.stride(2),
-                stride_vc_blk=value_cache.stride(0),
-                stride_vc_slot=value_cache.stride(1),
-                stride_vc_head=value_cache.stride(2),
-                stride_ks_blk=k_scale_cache.stride(0),
-                stride_ks_slot=k_scale_cache.stride(1),
-                stride_ks_head=k_scale_cache.stride(2),
-                stride_vs_blk=v_scale_cache.stride(0),
-                stride_vs_slot=v_scale_cache.stride(1),
-                stride_vs_head=v_scale_cache.stride(2),
-                block_size=block_size,
-                head_size=head_size,
-                head_size_v=head_size_v,
-                QUARTER_HEAD_PADDED=qtr_head_padded,
-                num_warps=num_warps,
-            )
-            return
+    # INT2 TurboQuant: WHT + Lloyd-Max 4 centroids.
+    if kv_quant_mode == KVQuantMode.INT2_PER_TOKEN_HEAD:
+        key_wht = fast_hadamard_transform(key.float()).to(key.dtype)
+        value_wht = fast_hadamard_transform(value.float()).to(value.dtype)
+        assert head_size % 4 == 0 and head_size_v % 4 == 0
+        qtr_head_padded = triton.next_power_of_2(
+            max(head_size, head_size_v) // 4
+        )
+        if current_platform.is_rocm() or current_platform.is_xpu():
+            num_warps = 4
         else:
-            # INT4 TurboQuant: single RHT + asymmetric INT4 quantizer.
-            # Falls through to INT4_PER_TOKEN_HEAD path with RHT'd data.
-            # softmax_scale/d compensates the d amplification from RHT.
-            key_wht = _single_rht(key.float()).to(key.dtype)
-            value_wht = _single_rht(value.float()).to(value.dtype)
-            key = key_wht
-            value = value_wht
-            kv_quant_mode = KVQuantMode.INT4_PER_TOKEN_HEAD
+            num_warps = min(16, max(1, qtr_head_padded // 32))
+        _reshape_cache_turboquant_int2[(num_tokens, num_kv_heads)](
+            key_ptr=key_wht,
+            value_ptr=value_wht,
+            key_cache_ptr=key_cache,
+            value_cache_ptr=value_cache,
+            k_scale_cache_ptr=k_scale_cache,
+            v_scale_cache_ptr=v_scale_cache,
+            slot_mapping_ptr=slot_mapping,
+            stride_key_tok=key_wht.stride(0),
+            stride_key_head=key_wht.stride(1),
+            stride_val_tok=value_wht.stride(0),
+            stride_val_head=value_wht.stride(1),
+            stride_kc_blk=key_cache.stride(0),
+            stride_kc_slot=key_cache.stride(1),
+            stride_kc_head=key_cache.stride(2),
+            stride_vc_blk=value_cache.stride(0),
+            stride_vc_slot=value_cache.stride(1),
+            stride_vc_head=value_cache.stride(2),
+            stride_ks_blk=k_scale_cache.stride(0),
+            stride_ks_slot=k_scale_cache.stride(1),
+            stride_ks_head=k_scale_cache.stride(2),
+            stride_vs_blk=v_scale_cache.stride(0),
+            stride_vs_slot=v_scale_cache.stride(1),
+            stride_vs_head=v_scale_cache.stride(2),
+            block_size=block_size,
+            head_size=head_size,
+            head_size_v=head_size_v,
+            QUARTER_HEAD_PADDED=qtr_head_padded,
+            num_warps=num_warps,
+        )
+        return
 
-    # INT4 packed: dispatch to the dedicated packing kernel.
+    # INT4 packed: RHT + asymmetric quantizer with steganographic zp.
+    # Single RHT gaussianizes data → better quantization.
+    # softmax_scale/d in attention compensates the d amplification.
     if kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD:
+        key = _single_rht(key.float()).to(key.dtype)
+        value = _single_rht(value.float()).to(value.dtype)
         assert head_size % 2 == 0 and head_size_v % 2 == 0
         half_head_padded = triton.next_power_of_2(max(head_size, head_size_v) // 2)
         if current_platform.is_rocm() or current_platform.is_xpu():
