@@ -693,8 +693,8 @@ def _reshape_cache_turboquant_int4(
         mask=half_offs < half_k,
     )
 
-    # Store norm/head_size as scale (attention multiplies directly)
-    k_scale = k_norm / float(head_size ** 1.5)
+    # Store norm/d^2.5 as scale (double RHT: dot products scale by d²)
+    k_scale = k_norm / float(head_size ** 2.5)
     tl.store(
         k_scale_cache_ptr
         + blk * stride_ks_blk
@@ -734,7 +734,7 @@ def _reshape_cache_turboquant_int4(
         mask=half_offs < half_v,
     )
 
-    v_scale = v_norm / float(head_size_v ** 1.5)
+    v_scale = v_norm / float(head_size_v ** 2.5)
     tl.store(
         v_scale_cache_ptr
         + blk * stride_vs_blk
@@ -999,10 +999,12 @@ def triton_reshape_and_cache_flash_per_token_head_quant(
             )
             return
         else:
-            # INT4 TurboQuant: single RHT + Lloyd-Max 16 centroides.
-            # Same structure as INT2 but with INT4 packing.
-            key_wht = _single_rht(key.float()).to(key.dtype)
-            value_wht = _single_rht(value.float()).to(value.dtype)
+            # INT4 TurboQuant: double RHT + Lloyd-Max 16 centroids.
+            # Double RHT squares the incoherence → near-perfect Gaussian.
+            key_wht = randomized_hadamard_transform(key.float()).to(key.dtype)
+            value_wht = randomized_hadamard_transform(
+                value.float()
+            ).to(value.dtype)
             assert head_size % 2 == 0 and head_size_v % 2 == 0
             half_head_padded = triton.next_power_of_2(
                 max(head_size, head_size_v) // 2

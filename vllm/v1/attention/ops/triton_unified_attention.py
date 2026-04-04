@@ -1684,9 +1684,9 @@ def unified_attention(
             q = fast_hadamard_transform(q.float()).to(q_orig_dtype)
         else:
             from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
-                _single_rht,
+                randomized_hadamard_transform,
             )
-            q = _single_rht(q.float()).to(q_orig_dtype)
+            q = randomized_hadamard_transform(q.float()).to(q_orig_dtype)
 
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
@@ -1917,5 +1917,5 @@ def unified_attention(
         if kv_quant_mode == KVQuantMode.INT2_PER_TOKEN_HEAD:
             out_f = fast_hadamard_transform(out.float())
         else:
-            out_f = _single_rht(out.float(), inverse=True)
+            out_f = randomized_hadamard_transform(out.float(), inverse=True)
         out.copy_(out_f.to(q_orig_dtype))
