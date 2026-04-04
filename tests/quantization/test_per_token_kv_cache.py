@@ -89,11 +89,30 @@ INT4_CONFIG = QuantConfig(
     kv_quant_mode=KVQuantMode.INT4_PER_TOKEN_HEAD,
     uses_trunc=False,  # INT4 uses round-to-nearest via rint
 )
+INT2_CONFIG = QuantConfig(
+    cache_dtype=torch.uint8,
+    kv_cache_dtype_str="int2_per_token_head",
+    quant_max=3.0,
+    quant_min=0.0,
+    kv_quant_mode=KVQuantMode.INT2_PER_TOKEN_HEAD,
+    uses_trunc=False,  # TurboQuant: WHT + Lloyd-Max
+)
+INT4_TURBO_CONFIG = QuantConfig(
+    cache_dtype=torch.uint8,
+    kv_cache_dtype_str="int4_per_token_head",
+    quant_max=15.0,
+    quant_min=0.0,
+    kv_quant_mode=KVQuantMode.INT4_TURBO_PER_TOKEN_HEAD,
+    uses_trunc=False,  # TurboQuant: WHT + Lloyd-Max
+)
 
-QUANT_CONFIGS = [INT4_CONFIG, INT8_CONFIG, FP8_CONFIG]
+QUANT_CONFIGS = [INT2_CONFIG, INT4_CONFIG, INT4_TURBO_CONFIG, INT8_CONFIG, FP8_CONFIG]
 
 
-@pytest.fixture(params=QUANT_CONFIGS, ids=["int4", "int8", "fp8"])
+@pytest.fixture(
+    params=QUANT_CONFIGS,
+    ids=["int2_turbo", "int4", "int4_turbo", "int8", "fp8"],
+)
 def qcfg(request) -> QuantConfig:
     return request.param
 
@@ -128,6 +147,9 @@ class TestIsQuantizedKvCache:
         assert is_quantized_kv_cache("fp8_e4m3")
         assert is_quantized_kv_cache("fp8_e5m2")
 
+    def test_int2_per_token_head(self):
+        assert is_quantized_kv_cache("int2_per_token_head")
+
     def test_int4_per_token_head(self):
         assert is_quantized_kv_cache("int4_per_token_head")
 
@@ -142,6 +164,13 @@ class TestIsQuantizedKvCache:
 
     def test_bfloat16(self):
         assert not is_quantized_kv_cache("bfloat16")
+
+    def test_kv_quant_mode_int2(self):
+        from vllm.v1.kv_cache_interface import get_kv_quant_mode
+
+        assert (
+            get_kv_quant_mode("int2_per_token_head") == KVQuantMode.INT2_PER_TOKEN_HEAD
+        )
 
     def test_kv_quant_mode_int4(self):
         from vllm.v1.kv_cache_interface import get_kv_quant_mode
@@ -190,7 +219,15 @@ def test_reshape_and_cache_per_token_head(
 
     num_blocks = (num_tokens + block_size - 1) // block_size + 4
     is_int4 = qcfg.kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD
-    cache_head_size = head_size // 2 if is_int4 else head_size
+    is_int2_turbo = qcfg.kv_quant_mode == KVQuantMode.INT2_PER_TOKEN_HEAD
+    is_int4_turbo = qcfg.kv_quant_mode == KVQuantMode.INT4_TURBO_PER_TOKEN_HEAD
+    is_turboquant = is_int2_turbo or is_int4_turbo
+    if is_int4 or is_int4_turbo:
+        cache_head_size = head_size // 2
+    elif is_int2_turbo:
+        cache_head_size = head_size // 4
+    else:
+        cache_head_size = head_size
 
     key = torch.randn(num_tokens, num_heads, head_size, dtype=torch.bfloat16)
     value = torch.randn(num_tokens, num_heads, head_size, dtype=torch.bfloat16)
@@ -220,49 +257,106 @@ def test_reshape_and_cache_per_token_head(
         kv_quant_mode=qcfg.kv_quant_mode,
     )
 
-    # INT4 uses asymmetric quantization with steganographic zero-point —
-    # no simple PyTorch reference exists, so we only check dequantized
-    # round-trip.  INT8/FP8 use symmetric quantization: we verify both
-    # dequantized values AND per-head scales against the PyTorch reference.
-    if not is_int4:
-        # Reference
+    # TurboQuant, INT4 asymmetric, and INT8/FP8 have different dequant paths.
+    # For TurboQuant: IWHT(centroid_lookup(indices) × norm)
+    # For INT4 asym: (q_uint - zp) * scale (steganographic zp)
+    # For INT8/FP8: simple symmetric dequant + PyTorch reference comparison
+    if not is_int4 and not is_turboquant:
         ref_k_quant, ref_k_scales = _quantize_per_token_head_ref(key, qcfg)
         ref_v_quant, ref_v_scales = _quantize_per_token_head_ref(value, qcfg)
 
-    # Compare dequantized values rather than raw quantized values.
-    # Triton and PyTorch reductions can differ at FP8 rounding boundaries
-    # (up to 32 in quantized domain for fp8_e4m3), but the dequantized
-    # error is bounded by the scale.
-    # INT4 has much coarser quantization + optimal clipping, so wider tolerance.
-    deq_atol = 0.5 if is_int4 else 0.1
-    deq_rtol = 0.5 if is_int4 else 0.1
+    # Tolerance: coarser quantization → wider tolerance.
+    if is_int2_turbo:
+        deq_atol, deq_rtol = 1.0, 1.0
+    elif is_int4 or is_int4_turbo:
+        deq_atol, deq_rtol = 0.5, 0.5
+    else:
+        deq_atol, deq_rtol = 0.1, 0.1
+
+    # Lloyd-Max centroids for dequant reference
+    _LM4 = torch.tensor(
+        [-1.5104, -0.4528, 0.4528, 1.5104], device="cuda", dtype=torch.float32
+    )
+    _LM16 = torch.tensor(
+        [-2.7326, -2.0690, -1.6180, -1.2562, -0.9424, -0.6568, -0.3882, -0.1284,
+         0.1284, 0.3882, 0.6568, 0.9424, 1.2562, 1.6180, 2.0690, 2.7326],
+        device="cuda", dtype=torch.float32,
+    )
+
     for i, slot in enumerate(slot_mapping.tolist()):
         blk = slot // block_size
         off = slot % block_size
 
-        if is_int4:
+        if is_turboquant:
+            from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
+                fast_hadamard_transform,
+            )
+            for label, data, cache, sc in [
+                ("key", key, key_cache, k_scale_cache),
+                ("val", value, value_cache, v_scale_cache),
+            ]:
+                stored_scale = sc[blk, off]  # [num_heads] = norm/d
+                packed = cache[blk, off]  # [num_heads, cache_head_size] uint8
+
+                if is_int4_turbo:
+                    lo = (packed & 0xF).long()
+                    hi = ((packed >> 4) & 0xF).long()
+                    centroids_lo = _LM16[lo]
+                    centroids_hi = _LM16[hi]
+                    full = torch.zeros(
+                        num_heads, head_size, dtype=torch.float32, device="cuda"
+                    )
+                    full[:, 0::2] = centroids_lo
+                    full[:, 1::2] = centroids_hi
+                else:  # INT2
+                    b0 = (packed & 0x3).long()
+                    b1 = ((packed >> 2) & 0x3).long()
+                    b2 = ((packed >> 4) & 0x3).long()
+                    b3 = ((packed >> 6) & 0x3).long()
+                    full = torch.zeros(
+                        num_heads, head_size, dtype=torch.float32, device="cuda"
+                    )
+                    full[:, 0::4] = _LM4[b0]
+                    full[:, 1::4] = _LM4[b1]
+                    full[:, 2::4] = _LM4[b2]
+                    full[:, 3::4] = _LM4[b3]
+
+                # Dequant: IWHT(centroids × norm) = WHT(centroids × norm) / d
+                # stored_scale = norm/d, so centroids × stored_scale × d = centroids × norm
+                # output = WHT(centroids × norm) / d = WHT(centroids × stored_scale × d) / d
+                #        = WHT(centroids × stored_scale)  (since WHT(ax) = a*WHT(x) and d/d = 1... no)
+                # Actually: stored_scale = norm/d. Dequant in attention does:
+                #   acc = sum P_t * stored_scale_t * centroids_t  (in WHT domain)
+                #   out = WHT(acc) / d ... wait, let me just do the full reference.
+                # Forward: x_wht = WHT(x), norm = ||x_wht||, z = x_wht * sqrt(d)/norm
+                # Stored: indices(z), stored_scale = norm/d
+                # Reverse: z_hat = centroids[indices]
+                #          x_wht_hat = z_hat * norm / sqrt(d) = z_hat * stored_scale * d / sqrt(d)
+                #                    = z_hat * stored_scale * sqrt(d)
+                #          x_hat = IWHT(x_wht_hat) = WHT(x_wht_hat) / d
+                deq_wht = full * stored_scale[:, None] * (head_size ** 0.5)
+                deq = fast_hadamard_transform(deq_wht) / head_size
+                ref_deq = data[i].float()
+                torch.testing.assert_close(deq, ref_deq, atol=deq_atol, rtol=deq_rtol)
+
+        elif is_int4:
             for label, data, cache, sc in [
                 ("key", key, key_cache, k_scale_cache),
                 ("val", value, value_cache, v_scale_cache),
             ]:
                 packed_scale = sc[blk, off]  # [num_heads] float32
-                # Extract zp and clean scale via steganography (zp in
-                # low 4 mantissa bits of the float32 scale).
                 scale_bits = packed_scale.view(torch.int32)
-                zp = (scale_bits & 0xF).to(torch.float32)  # [num_heads]
+                zp = (scale_bits & 0xF).to(torch.float32)
                 clean_scale = (scale_bits & -16).view(torch.float32)
 
-                # Unpack uint8 → two unsigned int4 values per byte
-                packed = cache[blk, off]  # [num_heads, head_size//2] uint8
-                lo = (packed & 0xF).to(torch.float32)  # unsigned [0,15]
+                packed = cache[blk, off]
+                lo = (packed & 0xF).to(torch.float32)
                 hi = ((packed >> 4) & 0xF).to(torch.float32)
-                # Interleave: even indices from lo, odd from hi
                 full = torch.zeros(
                     num_heads, head_size, dtype=torch.float32, device=packed.device
                 )
                 full[:, 0::2] = lo
                 full[:, 1::2] = hi
-                # Asymmetric dequant: (q_uint - zp) * scale
                 deq = (full - zp[:, None]) * clean_scale[:, None]
                 ref_deq = data[i].float()
                 torch.testing.assert_close(deq, ref_deq, atol=deq_atol, rtol=deq_rtol)
@@ -322,8 +416,16 @@ def test_per_token_head_round_trip_accuracy(
     set_random_seed(42)
 
     is_int4 = qcfg.kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD
+    is_int2_turbo = qcfg.kv_quant_mode == KVQuantMode.INT2_PER_TOKEN_HEAD
+    is_int4_turbo = qcfg.kv_quant_mode == KVQuantMode.INT4_TURBO_PER_TOKEN_HEAD
+    is_turboquant = is_int2_turbo or is_int4_turbo
     num_blocks = (num_tokens + block_size - 1) // block_size + 2
-    cache_head_size = head_size // 2 if is_int4 else head_size
+    if is_int4 or is_int4_turbo:
+        cache_head_size = head_size // 2
+    elif is_int2_turbo:
+        cache_head_size = head_size // 4
+    else:
+        cache_head_size = head_size
 
     key = torch.randn(num_tokens, num_heads, head_size, dtype=torch.bfloat16) * 0.5
     value = torch.randn(num_tokens, num_heads, head_size, dtype=torch.bfloat16) * 0.5
@@ -350,44 +452,83 @@ def test_per_token_head_round_trip_accuracy(
         kv_quant_mode=qcfg.kv_quant_mode,
     )
 
-    rt_atol = 0.5 if is_int4 else 0.1
-    for i in range(num_tokens):
-        blk = i // block_size
-        off = i % block_size
+    if is_int2_turbo:
+        rt_atol = 1.0
+    elif is_int4 or is_int4_turbo:
+        rt_atol = 0.5
+    else:
+        rt_atol = 0.1
 
-        for label, data, cache, sc in [
-            ("key", key, key_cache, k_scale_cache),
-            ("val", value, value_cache, v_scale_cache),
-        ]:
-            for h in range(num_heads):
-                orig = data[i, h].float()  # [head_size]
-                actual_sc = sc[blk, off, h]
-
-                if is_int4:
-                    # Extract zp and clean scale via steganography
-                    sc_bits = actual_sc.view(torch.int32)
-                    zp = (sc_bits & 0xF).to(torch.float32)
-                    clean_sc = (sc_bits & -16).view(torch.float32)
-
-                    packed = cache[blk, off, h]  # [head_size//2] uint8
-                    lo = (packed & 0xF).to(torch.float32)  # unsigned [0,15]
-                    hi = ((packed >> 4) & 0xF).to(torch.float32)
-                    full = torch.zeros(
-                        head_size, dtype=torch.float32, device=packed.device
-                    )
-                    full[0::2] = lo
-                    full[1::2] = hi
-                    # Asymmetric dequant: (q_uint - zp) * scale
-                    actual_deq = (full - zp) * clean_sc
+    # TurboQuant round-trip operates on the full (token, head) vector
+    # since dequant requires IWHT which mixes all dimensions.
+    if is_turboquant:
+        from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
+            fast_hadamard_transform,
+        )
+        _LM4 = torch.tensor(
+            [-1.5104, -0.4528, 0.4528, 1.5104], device="cuda", dtype=torch.float32
+        )
+        _LM16 = torch.tensor(
+            [-2.7326, -2.0690, -1.6180, -1.2562, -0.9424, -0.6568, -0.3882, -0.1284,
+             0.1284, 0.3882, 0.6568, 0.9424, 1.2562, 1.6180, 2.0690, 2.7326],
+            device="cuda", dtype=torch.float32,
+        )
+        for i in range(num_tokens):
+            blk = i // block_size
+            off = i % block_size
+            for label, data, cache, sc in [
+                ("key", key, key_cache, k_scale_cache),
+                ("val", value, value_cache, v_scale_cache),
+            ]:
+                stored_scale = sc[blk, off]  # [num_heads]
+                packed = cache[blk, off]  # [num_heads, cache_head_size]
+                if is_int4_turbo:
+                    lo = (packed & 0xF).long()
+                    hi = ((packed >> 4) & 0xF).long()
+                    full = torch.zeros(num_heads, head_size, device="cuda")
+                    full[:, 0::2] = _LM16[lo]
+                    full[:, 1::2] = _LM16[hi]
                 else:
-                    actual_deq = cache[blk, off, h].float() * actual_sc
-
-                torch.testing.assert_close(
-                    actual_deq,
-                    orig,
-                    atol=rt_atol,
-                    rtol=rt_atol,
-                )
+                    b0 = (packed & 0x3).long()
+                    b1 = ((packed >> 2) & 0x3).long()
+                    b2 = ((packed >> 4) & 0x3).long()
+                    b3 = ((packed >> 6) & 0x3).long()
+                    full = torch.zeros(num_heads, head_size, device="cuda")
+                    full[:, 0::4] = _LM4[b0]
+                    full[:, 1::4] = _LM4[b1]
+                    full[:, 2::4] = _LM4[b2]
+                    full[:, 3::4] = _LM4[b3]
+                deq_wht = full * stored_scale[:, None] * (head_size ** 0.5)
+                deq = fast_hadamard_transform(deq_wht) / head_size
+                ref = data[i].float()
+                torch.testing.assert_close(deq, ref, atol=rt_atol, rtol=rt_atol)
+    else:
+        for i in range(num_tokens):
+            blk = i // block_size
+            off = i % block_size
+            for label, data, cache, sc in [
+                ("key", key, key_cache, k_scale_cache),
+                ("val", value, value_cache, v_scale_cache),
+            ]:
+                for h in range(num_heads):
+                    orig = data[i, h].float()
+                    actual_sc = sc[blk, off, h]
+                    if is_int4:
+                        sc_bits = actual_sc.view(torch.int32)
+                        zp = (sc_bits & 0xF).to(torch.float32)
+                        clean_sc = (sc_bits & -16).view(torch.float32)
+                        packed = cache[blk, off, h]
+                        lo = (packed & 0xF).to(torch.float32)
+                        hi = ((packed >> 4) & 0xF).to(torch.float32)
+                        full = torch.zeros(head_size, device=packed.device)
+                        full[0::2] = lo
+                        full[1::2] = hi
+                        actual_deq = (full - zp) * clean_sc
+                    else:
+                        actual_deq = cache[blk, off, h].float() * actual_sc
+                    torch.testing.assert_close(
+                        actual_deq, orig, atol=rt_atol, rtol=rt_atol,
+                    )
 
 
 # ===========================================================================
@@ -407,7 +548,14 @@ def test_per_token_head_negative_slot_skipped(qcfg: QuantConfig):
     block_size = 16
     num_blocks = 2
     is_int4 = qcfg.kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD
-    cache_head_size = head_size // 2 if is_int4 else head_size
+    is_int4_turbo = qcfg.kv_quant_mode == KVQuantMode.INT4_TURBO_PER_TOKEN_HEAD
+    is_int2_turbo = qcfg.kv_quant_mode == KVQuantMode.INT2_PER_TOKEN_HEAD
+    if is_int4 or is_int4_turbo:
+        cache_head_size = head_size // 2
+    elif is_int2_turbo:
+        cache_head_size = head_size // 4
+    else:
+        cache_head_size = head_size
 
     key = torch.randn(num_tokens, num_heads, head_size, dtype=torch.bfloat16)
     value = torch.randn(num_tokens, num_heads, head_size, dtype=torch.bfloat16)
@@ -453,7 +601,12 @@ def test_per_token_head_negative_slot_skipped(qcfg: QuantConfig):
 # ===========================================================================
 @pytest.mark.parametrize(
     "kv_cache_dtype",
-    ["int4_per_token_head", "int8_per_token_head", "fp8_per_token_head"],
+    [
+        "int2_per_token_head",
+        "int4_per_token_head",
+        "int8_per_token_head",
+        "fp8_per_token_head",
+    ],
 )
 def test_process_weights_sets_placeholder_scales(kv_cache_dtype: str):
     """Per-token-head should set _k_scale=1.0, _v_scale=1.0
