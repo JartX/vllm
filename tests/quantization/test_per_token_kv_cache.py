@@ -321,15 +321,8 @@ def test_reshape_and_cache_per_token_head(
                     full[:, 2::4] = _LM4[b2]
                     full[:, 3::4] = _LM4[b3]
 
-                # Dequant: IWHT(centroids × norm) = WHT(centroids × norm) / d
-                # stored_scale = norm/d, so centroids × stored_scale × d = centroids × norm
-                # output = WHT(centroids × norm) / d = WHT(centroids × stored_scale × d) / d
-                #        = WHT(centroids × stored_scale)  (since WHT(ax) = a*WHT(x) and d/d = 1... no)
-                # Actually: stored_scale = norm/d. Dequant in attention does:
-                #   acc = sum P_t * stored_scale_t * centroids_t  (in WHT domain)
-                # stored_scale = norm / d^1.5 = σ/d where σ = norm/sqrt(d)
-                # V_hat = σ/d × WHT(c) = stored_scale × WHT(c)
-                # = WHT(stored_scale × c)  (scalar per head)
+                # stored_scale = σ = norm/sqrt(d).
+                # Dequant: x_hat = IRHT(c × σ) = σ × D × WHT(c)
                 deq = randomized_hadamard_transform(
                     full * stored_scale[:, None], inverse=True
                 )
