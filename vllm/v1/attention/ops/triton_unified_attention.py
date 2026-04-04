@@ -62,7 +62,7 @@ def _prepare_kv_tile(
       them after the dot product for better numerical efficiency.
     - ``KV_QUANT_MODE == 4`` (INT4 packed): handled entirely by the
       caller via split-dot product with asymmetric zero-point correction.
-    - ``KV_QUANT_MODE == 5`` (INT2 TurboQuant): 4-way split-dot with
+    - ``KV_QUANT_MODE == 5`` (INT2 WHT + Lloyd-Max): 4-way split-dot with
       Lloyd-Max centroid lookup.  Handled by caller.
       This function is NOT called for modes 4, 5.
 
@@ -120,7 +120,7 @@ def find_seq_idx(
 
 
 # ---------------------------------------------------------------------------
-# INT2 TurboQuant: Lloyd-Max centroid dequantization for attention kernels
+# INT2: Lloyd-Max centroid dequantization for attention kernels
 # ---------------------------------------------------------------------------
 
 
@@ -247,7 +247,7 @@ def kernel_unified_attention_2d(
 
     # Split-dot prologue: split Q for packed quantization modes.
     # Mode 4 (INT4 RHT + asymmetric): 2-way split.
-    # Mode 5 (INT2 turbo): 4-way split.
+    # Mode 5 (INT2 WHT + Lloyd-Max): 4-way split.
     if KV_QUANT_MODE == 4:
         half_offs = tl.arange(0, HALF_HEAD_PADDED)
         even_head_offs = half_offs * 2
@@ -456,7 +456,7 @@ def kernel_unified_attention_2d(
                 v_zp = (vs_bits & 0xF).to(tl.float32)
                 v_token_head_scales = (vs_bits & -16).to(tl.float32, bitcast=True)
 
-        # ---- INT2 TurboQuant: 4-way split, centroid lookup
+        # ---- INT2: 4-way split, Lloyd-Max centroid lookup
         if KV_QUANT_MODE == 5:
             slot_in_blk = seq_offset % BLOCK_SIZE
             k_off_i2 = (
@@ -605,7 +605,7 @@ def kernel_unified_attention_2d(
                 scale * k_token_head_scales[None, :]
             )
         elif KV_QUANT_MODE == 5:
-            # TurboQuant INT2: 4-way split-dot with centroids
+            # INT2: 4-way split-dot with Lloyd-Max centroids
             raw_dot = (
                 tl.dot(Q_s0, KC0) + tl.dot(Q_s1, KC1)
                 + tl.dot(Q_s2, KC2) + tl.dot(Q_s3, KC3)
@@ -1116,7 +1116,7 @@ def kernel_unified_attention_3d(
                 v_zp = (vs_bits & 0xF).to(tl.float32)
                 v_token_head_scales = (vs_bits & -16).to(tl.float32, bitcast=True)
 
-        # ---- INT2 TurboQuant: 4-way split, centroid lookup
+        # ---- INT2: 4-way split, Lloyd-Max centroid lookup
         if KV_QUANT_MODE == 5:
             slot_in_blk = seq_offset % BLOCK_SIZE
             k_off_i2 = (
@@ -1265,7 +1265,7 @@ def kernel_unified_attention_3d(
                 scale * k_token_head_scales[None, :]
             )
         elif KV_QUANT_MODE == 5:
-            # TurboQuant INT2: 4-way split-dot with centroids
+            # INT2: 4-way split-dot with Lloyd-Max centroids
             raw_dot = (
                 tl.dot(Q_s0, KC0) + tl.dot(Q_s1, KC1)
                 + tl.dot(Q_s2, KC2) + tl.dot(Q_s3, KC3)

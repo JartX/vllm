@@ -455,19 +455,18 @@ def _reshape_cache_int4_packed(
 
 
 # ---------------------------------------------------------------------------
-# TurboQuant: WHT (Walsh-Hadamard Transform) + Lloyd-Max quantization
+# INT2 WHT + Lloyd-Max quantization (KV_QUANT_MODE=5)
 # ---------------------------------------------------------------------------
-# The rotation WHT transforms any distribution into a known Gaussian.
+# The Walsh-Hadamard Transform gaussianizes any distribution.
 # After rotation, all values follow a predictable N(0, σ) distribution.
 # Lloyd-Max centroids are placed optimally for N(0,1).
-# The vector norm is stored separately (float32 per head) as norm/head_size
+# The vector norm is stored separately (float32 per head) as norm/d^1.5
 # so the attention kernel just multiplies by the stored scale.
 #
-# INT2 TurboQuant (4 centroids, KV_QUANT_MODE=5):
-#   4 indices per byte → head_size/4 bytes per head.
+# 4 centroids packed 4 per byte → head_size/4 bytes per head.
 # ---------------------------------------------------------------------------
 
-# Lloyd-Max centroids for N(0,1) — 4 levels (INT2 TurboQuant)
+# Lloyd-Max centroids for N(0,1) — 4 levels
 _LLOYD_MAX_4_CENTROIDS = [-1.5104, -0.4528, 0.4528, 1.5104]
 _LLOYD_MAX_4_BOUNDS = [-0.9816, 0.0, 0.9816]
 
@@ -538,7 +537,7 @@ def _lloyd_max_quantize_4(z):
 
 
 @triton.jit
-def _reshape_cache_turboquant_int2(
+def _reshape_cache_int2_wht(
     key_ptr,  # [num_tokens, num_kv_heads, head_size]  (WHT-transformed)
     value_ptr,  # [num_tokens, num_kv_heads, head_size_v] (WHT-transformed)
     key_cache_ptr,  # [num_blocks, block_size, num_kv_heads, head_size//4] uint8
@@ -567,7 +566,7 @@ def _reshape_cache_turboquant_int2(
     head_size_v: tl.constexpr,
     QUARTER_HEAD_PADDED: tl.constexpr,
 ):
-    """TurboQuant INT2: Lloyd-Max 4-centroid quantization of WHT-rotated data.
+    """INT2 WHT + Lloyd-Max 4-centroid quantization.
 
     Packs 4 × 2-bit indices per byte → head_size/4 bytes per head.
     """
@@ -743,7 +742,7 @@ def triton_reshape_and_cache_flash_per_token_head_quant(
     head_size_v = value.shape[2]
     block_size = key_cache.shape[1]
 
-    # INT2 TurboQuant: WHT + Lloyd-Max 4 centroids.
+    # INT2: WHT + Lloyd-Max 4 centroids.
     if kv_quant_mode == KVQuantMode.INT2_PER_TOKEN_HEAD:
         key_wht = fast_hadamard_transform(key.float()).to(key.dtype)
         value_wht = fast_hadamard_transform(value.float()).to(value.dtype)
@@ -755,7 +754,7 @@ def triton_reshape_and_cache_flash_per_token_head_quant(
             num_warps = 4
         else:
             num_warps = min(16, max(1, qtr_head_padded // 32))
-        _reshape_cache_turboquant_int2[(num_tokens, num_kv_heads)](
+        _reshape_cache_int2_wht[(num_tokens, num_kv_heads)](
             key_ptr=key_wht,
             value_ptr=value_wht,
             key_cache_ptr=key_cache,

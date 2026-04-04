@@ -95,14 +95,14 @@ INT2_CONFIG = QuantConfig(
     quant_max=3.0,
     quant_min=0.0,
     kv_quant_mode=KVQuantMode.INT2_PER_TOKEN_HEAD,
-    uses_trunc=False,  # TurboQuant: WHT + Lloyd-Max
+    uses_trunc=False,  # WHT + Lloyd-Max
 )
 QUANT_CONFIGS = [INT2_CONFIG, INT4_CONFIG, INT8_CONFIG, FP8_CONFIG]
 
 
 @pytest.fixture(
     params=QUANT_CONFIGS,
-    ids=["int2_turbo", "int4", "int8", "fp8"],
+    ids=["int2", "int4", "int8", "fp8"],
 )
 def qcfg(request) -> QuantConfig:
     return request.param
@@ -246,7 +246,7 @@ def test_reshape_and_cache_per_token_head(
         kv_quant_mode=qcfg.kv_quant_mode,
     )
 
-    # INT2 (TurboQuant), INT4 (RHT + asymmetric), INT8/FP8 have different
+    # INT2 (WHT + Lloyd-Max), INT4 (RHT + asymmetric), INT8/FP8 have different
     # dequant paths.  Only INT8/FP8 can be compared to a PyTorch reference.
     if not is_int4 and not is_int2:
         ref_k_quant, ref_k_scales = _quantize_per_token_head_ref(key, qcfg)
@@ -418,7 +418,7 @@ def test_per_token_head_round_trip_accuracy(
     else:
         rt_atol = 0.1
 
-    # INT2 TurboQuant round-trip: IWHT(centroids × scale) ≈ original
+    # INT2 round-trip: IWHT(centroids × scale) ≈ original
     if is_int2:
         from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
             fast_hadamard_transform,
