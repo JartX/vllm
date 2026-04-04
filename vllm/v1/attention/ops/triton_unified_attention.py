@@ -1879,5 +1879,7 @@ def unified_attention(
         if kv_quant_mode == KVQuantMode.INT2_PER_TOKEN_HEAD:
             # INT2 Lloyd-Max: scale norm/d^1.5 absorbs 1/d, no extra division.
             out_f = fast_hadamard_transform(out.float())
-            out.copy_(out_f.to(q_orig_dtype))
-        # INT4 turbo: RHT only on Keys, Values untransformed → no output IRHT needed.
+        else:
+            # INT4 asym in RHT domain: IRHT(acc) = d × original, divide by d.
+            out_f = _single_rht(out.float(), inverse=True) / head_size
+        out.copy_(out_f.to(q_orig_dtype))
