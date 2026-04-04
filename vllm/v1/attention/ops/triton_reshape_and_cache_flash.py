@@ -1160,13 +1160,11 @@ def triton_reshape_and_cache_flash_per_token_head_quant(
             )
             return
         else:
-            # INT4 TurboQuant: single RHT + asymmetric INT4 quantizer.
-            # Falls through to INT4_PER_TOKEN_HEAD path with RHT'd data.
-            # softmax_scale/d compensates the d amplification from RHT.
-            key_wht = _single_rht(key.float()).to(key.dtype)
-            value_wht = _single_rht(value.float()).to(value.dtype)
-            key = key_wht
-            value = value_wht
+            # INT4 TurboQuant: single RHT on Keys only.
+            # Keys benefit most from RHT (outliers → exponential softmax error).
+            # Values are averaged linearly — asymmetric quant is sufficient.
+            # Only Q and output need RHT/IRHT compensation for the K domain.
+            key = _single_rht(key.float()).to(key.dtype)
             kv_quant_mode = KVQuantMode.INT4_PER_TOKEN_HEAD
 
     # INT4 packed: dispatch to the dedicated packing kernel.
