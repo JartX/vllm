@@ -296,7 +296,7 @@ def kernel_unified_attention_2d(
             mask=odd_head_mask[None, :] & q_mask,
             other=0.0,
         ).to(tl.float32)
-        if KV_QUANT_MODE == 4:
+        if KV_QUANT_MODE == 4 or KV_QUANT_MODE == 6:
             Q_sum = tl.sum(Q_even, axis=1) + tl.sum(Q_odd, axis=1)
 
     if KV_QUANT_MODE == 5:
@@ -469,8 +469,10 @@ def kernel_unified_attention_2d(
             )
             vs_raw = tl.load(v_scale_cache_ptr + vs_idx, mask=tile_mask, other=0)
 
-            if KV_QUANT_MODE == 4:
+            if KV_QUANT_MODE == 4 or KV_QUANT_MODE == 6:
                 # Asymmetric: extract zp via steganography.
+                # Mode 6 uses same quantizer as mode 4 but in RHT domain
+                # (softmax_scale compensates the d amplification).
                 K_lo = K_lo_raw.to(Q_even.dtype)
                 K_hi = K_hi_raw.to(Q_odd.dtype)
                 V_lo = V_lo_raw.to(Q_even.dtype)
@@ -481,14 +483,6 @@ def kernel_unified_attention_2d(
                 vs_bits = vs_raw.to(tl.int32, bitcast=True)
                 v_zp = (vs_bits & 0xF).to(tl.float32)
                 v_token_head_scales = (vs_bits & -16).to(tl.float32, bitcast=True)
-            if KV_QUANT_MODE == 6:
-                # TurboQuant INT4: centroid lookup, simple scale (norm/d^1.5)
-                K_lo = _lloyd_max_dequant_16(K_lo_raw).to(Q_even.dtype)
-                K_hi = _lloyd_max_dequant_16(K_hi_raw).to(Q_odd.dtype)
-                V_lo = _lloyd_max_dequant_16(V_lo_raw).to(Q_even.dtype)
-                V_hi = _lloyd_max_dequant_16(V_hi_raw).to(Q_odd.dtype)
-                k_token_head_scales = ks_raw
-                v_token_head_scales = vs_raw
 
         # ---- INT2 TurboQuant: 4-way split, centroid lookup
         if KV_QUANT_MODE == 5:
@@ -633,14 +627,11 @@ def kernel_unified_attention_2d(
 
         # Per-token-head quant: fuse softmax_scale with per-head k_scale
         # to avoid a separate BLOCK_M × TILE_SIZE multiply on S.
-        if KV_QUANT_MODE == 4:
+        if KV_QUANT_MODE == 4 or KV_QUANT_MODE == 6:
             raw_dot = tl.dot(Q_even, K_lo) + tl.dot(Q_odd, K_hi)
             S += (raw_dot - Q_sum[:, None] * k_zp[None, :]) * (
                 scale * k_token_head_scales[None, :]
             )
-        elif KV_QUANT_MODE == 6:
-            raw_dot = tl.dot(Q_even, K_lo) + tl.dot(Q_odd, K_hi)
-            S += raw_dot * (scale * k_token_head_scales[None, :])
         elif KV_QUANT_MODE == 5:
             # TurboQuant INT2: 4-way split-dot with centroids
             raw_dot = (
@@ -717,7 +708,7 @@ def kernel_unified_attention_2d(
         L = L * alpha + l_j
         M = m_j
 
-        if KV_QUANT_MODE == 4:
+        if KV_QUANT_MODE == 4 or KV_QUANT_MODE == 6:
             if SLIDING_WINDOW:
                 qpos_lo = q_block_local_idx * BLOCK_Q
                 sw_mask = (context_len + qpos_lo - seq_offset) < SLIDING_WINDOW
@@ -727,15 +718,6 @@ def kernel_unified_attention_2d(
             Pv_zp_sum = tl.sum(P_v * v_zp[None, :], axis=1)
             acc_even += tl.dot(P_v, V_lo) - Pv_zp_sum[:, None]
             acc_odd += tl.dot(P_v, V_hi) - Pv_zp_sum[:, None]
-        if KV_QUANT_MODE == 6:
-            if SLIDING_WINDOW:
-                qpos_lo = q_block_local_idx * BLOCK_Q
-                sw_mask = (context_len + qpos_lo - seq_offset) < SLIDING_WINDOW
-                V_lo = tl.where(sw_mask[:, None], V_lo, 0.0)
-                V_hi = tl.where(sw_mask[:, None], V_hi, 0.0)
-            P_v = (P * v_token_head_scales[None, :]).to(V_lo.dtype)
-            acc_even += tl.dot(P_v, V_lo)
-            acc_odd += tl.dot(P_v, V_hi)
         if KV_QUANT_MODE == 5:
             if SLIDING_WINDOW:
                 qpos_lo = q_block_local_idx * BLOCK_Q
@@ -978,7 +960,7 @@ def kernel_unified_attention_3d(
             mask=odd_head_mask[None, :] & q_mask,
             other=0.0,
         ).to(tl.float32)
-        if KV_QUANT_MODE == 4:
+        if KV_QUANT_MODE == 4 or KV_QUANT_MODE == 6:
             Q_sum = tl.sum(Q_even, axis=1) + tl.sum(Q_odd, axis=1)
 
     if KV_QUANT_MODE == 5:
@@ -1149,8 +1131,10 @@ def kernel_unified_attention_3d(
             )
             vs_raw = tl.load(v_scale_cache_ptr + vs_idx, mask=tile_mask, other=0)
 
-            if KV_QUANT_MODE == 4:
+            if KV_QUANT_MODE == 4 or KV_QUANT_MODE == 6:
                 # Asymmetric: extract zp via steganography.
+                # Mode 6 uses same quantizer as mode 4 but in RHT domain
+                # (softmax_scale compensates the d amplification).
                 K_lo = K_lo_raw.to(Q_even.dtype)
                 K_hi = K_hi_raw.to(Q_odd.dtype)
                 V_lo = V_lo_raw.to(Q_even.dtype)
@@ -1161,14 +1145,6 @@ def kernel_unified_attention_3d(
                 vs_bits = vs_raw.to(tl.int32, bitcast=True)
                 v_zp = (vs_bits & 0xF).to(tl.float32)
                 v_token_head_scales = (vs_bits & -16).to(tl.float32, bitcast=True)
-            if KV_QUANT_MODE == 6:
-                # TurboQuant INT4: centroid lookup, simple scale (norm/d^1.5)
-                K_lo = _lloyd_max_dequant_16(K_lo_raw).to(Q_even.dtype)
-                K_hi = _lloyd_max_dequant_16(K_hi_raw).to(Q_odd.dtype)
-                V_lo = _lloyd_max_dequant_16(V_lo_raw).to(Q_even.dtype)
-                V_hi = _lloyd_max_dequant_16(V_hi_raw).to(Q_odd.dtype)
-                k_token_head_scales = ks_raw
-                v_token_head_scales = vs_raw
 
         # ---- INT2 TurboQuant: 4-way split, centroid lookup
         if KV_QUANT_MODE == 5:
@@ -1313,14 +1289,11 @@ def kernel_unified_attention_3d(
 
         # Per-token-head quant: fuse softmax_scale with per-head k_scale
         # to avoid a separate BLOCK_M × TILE_SIZE multiply on S.
-        if KV_QUANT_MODE == 4:
+        if KV_QUANT_MODE == 4 or KV_QUANT_MODE == 6:
             raw_dot = tl.dot(Q_even, K_lo) + tl.dot(Q_odd, K_hi)
             S += (raw_dot - Q_sum[:, None] * k_zp[None, :]) * (
                 scale * k_token_head_scales[None, :]
             )
-        elif KV_QUANT_MODE == 6:
-            raw_dot = tl.dot(Q_even, K_lo) + tl.dot(Q_odd, K_hi)
-            S += raw_dot * (scale * k_token_head_scales[None, :])
         elif KV_QUANT_MODE == 5:
             # TurboQuant INT2: 4-way split-dot with centroids
             raw_dot = (
@@ -1397,7 +1370,7 @@ def kernel_unified_attention_3d(
         L = L * alpha + l_j
         M = m_j
 
-        if KV_QUANT_MODE == 4:
+        if KV_QUANT_MODE == 4 or KV_QUANT_MODE == 6:
             if SLIDING_WINDOW:
                 qpos_lo = q_block_local_idx * BLOCK_Q
                 sw_mask = (context_len + qpos_lo - seq_offset) < SLIDING_WINDOW
@@ -1407,15 +1380,6 @@ def kernel_unified_attention_3d(
             Pv_zp_sum = tl.sum(P_v * v_zp[None, :], axis=1)
             acc_even += tl.dot(P_v, V_lo) - Pv_zp_sum[:, None]
             acc_odd += tl.dot(P_v, V_hi) - Pv_zp_sum[:, None]
-        if KV_QUANT_MODE == 6:
-            if SLIDING_WINDOW:
-                qpos_lo = q_block_local_idx * BLOCK_Q
-                sw_mask = (context_len + qpos_lo - seq_offset) < SLIDING_WINDOW
-                V_lo = tl.where(sw_mask[:, None], V_lo, 0.0)
-                V_hi = tl.where(sw_mask[:, None], V_hi, 0.0)
-            P_v = (P * v_token_head_scales[None, :]).to(V_lo.dtype)
-            acc_even += tl.dot(P_v, V_lo)
-            acc_odd += tl.dot(P_v, V_hi)
         if KV_QUANT_MODE == 5:
             if SLIDING_WINDOW:
                 qpos_lo = q_block_local_idx * BLOCK_Q
@@ -1684,9 +1648,14 @@ def unified_attention(
             q = fast_hadamard_transform(q.float()).to(q_orig_dtype)
         else:
             from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
-                randomized_hadamard_transform,
+                _single_rht,
             )
-            q = randomized_hadamard_transform(q.float()).to(q_orig_dtype)
+            q = _single_rht(q.float()).to(q_orig_dtype)
+            # RHT amplifies dot(Q,K) by d. Compensate via softmax_scale.
+            # Values are also in RHT domain, so IRHT(acc) amplifies by d.
+            # We divide softmax_scale by d (absorbs K amplification) and
+            # will multiply output by 1 (d from IRHT cancels with /d here).
+            softmax_scale = softmax_scale / q.shape[2]
 
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
@@ -1909,13 +1878,12 @@ def unified_attention(
             USE_FP8=output_scale is not None,
         )
 
-    # TurboQuant: apply inverse RHT to output.
-    # Inverse RHT: x = D × WHT(y) where D = diag(±1 signs).
-    # The stored scale already absorbs 1/d (scale = norm/d^1.5 = σ/d),
-    # so no extra /d needed.
+    # TurboQuant: apply inverse transform to output.
     if is_turboquant:
         if kv_quant_mode == KVQuantMode.INT2_PER_TOKEN_HEAD:
+            # INT2 Lloyd-Max: scale norm/d^1.5 absorbs 1/d, no extra division.
             out_f = fast_hadamard_transform(out.float())
         else:
-            out_f = randomized_hadamard_transform(out.float(), inverse=True)
+            # INT4 asym in RHT domain: IRHT(acc) = d × original, divide by d.
+            out_f = _single_rht(out.float(), inverse=True) / head_size
         out.copy_(out_f.to(q_orig_dtype))
