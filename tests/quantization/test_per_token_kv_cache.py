@@ -321,8 +321,10 @@ def test_reshape_and_cache_per_token_head(
                     full[:, 2::4] = _LM4[b2]
                     full[:, 3::4] = _LM4[b3]
 
-                # stored_scale = σ = norm/sqrt(d).
-                # Dequant: x_hat = IRHT(c × σ) = σ × D × WHT(c)
+                # stored_scale = norm/d^1.5.
+                # Our IRHT = D × WHT (no /d), so:
+                # D × WHT(c × norm/d^1.5) = (norm/d^1.5) × D × WHT(c)
+                # = correct reconstruction of original x
                 deq = randomized_hadamard_transform(
                     full * stored_scale[:, None], inverse=True
                 )

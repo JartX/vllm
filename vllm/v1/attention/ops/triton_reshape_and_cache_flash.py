@@ -822,10 +822,10 @@ def _reshape_cache_turboquant_int2(
         mask=qtr_offs < qtr_k,
     )
 
-    # Store σ = norm/sqrt(d) as scale. In attention:
-    # score = dot(Q_rht, c_K) × softmax_scale × σ_K
-    # output = IRHT(Σ P × σ_V × c_V)
-    k_scale = k_norm / float(head_size ** 0.5)
+    # Store norm/d^1.5 as scale. This absorbs the 1/d factor from
+    # dot(Q_rht, K_rht) = d × dot(Q, K), and our IRHT implementation
+    # already multiplies by d (D × WHT without /d), so these cancel.
+    k_scale = k_norm / float(head_size ** 1.5)
     tl.store(
         k_scale_cache_ptr
         + blk * stride_ks_blk
@@ -878,7 +878,7 @@ def _reshape_cache_turboquant_int2(
         mask=qtr_offs < qtr_v,
     )
 
-    v_scale = v_norm / float(head_size_v ** 0.5)
+    v_scale = v_norm / float(head_size_v ** 1.5)
     tl.store(
         v_scale_cache_ptr
         + blk * stride_vs_blk
