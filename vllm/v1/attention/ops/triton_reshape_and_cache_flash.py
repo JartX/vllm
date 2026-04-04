@@ -950,7 +950,7 @@ def triton_reshape_and_cache_flash_per_token_head_quant(
     head_size_v = value.shape[2]
     block_size = key_cache.shape[1]
 
-    # TurboQuant modes: apply RHT first, then dispatch to dedicated kernel.
+    # TurboQuant modes: apply transform, then dispatch to dedicated kernel.
     if kv_quant_mode in (
         KVQuantMode.INT2_PER_TOKEN_HEAD,
         KVQuantMode.INT4_TURBO_PER_TOKEN_HEAD,

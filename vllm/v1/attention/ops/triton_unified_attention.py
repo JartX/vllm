@@ -1651,7 +1651,10 @@ def unified_attention(
             from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
                 _single_rht,
             )
-            q = _single_rht(q.float()).to(q_orig_dtype)
+            # Divide by sqrt(d) to compensate: dot(RHT(Q), RHT(K)) = d × dot(Q, K).
+            # The asymmetric scale doesn't absorb this factor, so we normalize Q.
+            head_size = q.shape[2]
+            q = (_single_rht(q.float()) / (head_size ** 0.5)).to(q_orig_dtype)
 
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
@@ -1882,5 +1885,6 @@ def unified_attention(
         if kv_quant_mode == KVQuantMode.INT2_PER_TOKEN_HEAD:
             out_f = fast_hadamard_transform(out.float())
         else:
-            out_f = _single_rht(out.float(), inverse=True)
+            # IRHT(acc) = d × original, so divide by d.
+            out_f = _single_rht(out.float(), inverse=True) / head_size
         out.copy_(out_f.to(q_orig_dtype))
