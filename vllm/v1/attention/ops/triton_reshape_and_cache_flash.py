@@ -1160,51 +1160,14 @@ def triton_reshape_and_cache_flash_per_token_head_quant(
             )
             return
         else:
-            # INT4 TurboQuant: single RHT + symmetric INT4 quantizer.
-            # Post-RHT data is ~centered at 0 (Gaussian), so symmetric
-            # quantization [-7..+7] is optimal — no wasted bits on zp.
-            # Uses absmax/7 as scale, stored as plain float32 (no steg).
+            # INT4 TurboQuant: single RHT + asymmetric INT4 quantizer.
+            # Falls through to INT4_PER_TOKEN_HEAD path with RHT'd data.
+            # softmax_scale/d compensates the d amplification from RHT.
             key_wht = _single_rht(key.float()).to(key.dtype)
             value_wht = _single_rht(value.float()).to(value.dtype)
-            assert head_size % 2 == 0 and head_size_v % 2 == 0
-            half_head_padded = triton.next_power_of_2(
-                max(head_size, head_size_v) // 2
-            )
-            if current_platform.is_rocm() or current_platform.is_xpu():
-                num_warps = 4
-            else:
-                num_warps = min(16, max(1, half_head_padded // 32))
-            _reshape_cache_int4_symmetric[(num_tokens, num_kv_heads)](
-                key_ptr=key_wht,
-                value_ptr=value_wht,
-                key_cache_ptr=key_cache,
-                value_cache_ptr=value_cache,
-                k_scale_cache_ptr=k_scale_cache,
-                v_scale_cache_ptr=v_scale_cache,
-                slot_mapping_ptr=slot_mapping,
-                stride_key_tok=key_wht.stride(0),
-                stride_key_head=key_wht.stride(1),
-                stride_val_tok=value_wht.stride(0),
-                stride_val_head=value_wht.stride(1),
-                stride_kc_blk=key_cache.stride(0),
-                stride_kc_slot=key_cache.stride(1),
-                stride_kc_head=key_cache.stride(2),
-                stride_vc_blk=value_cache.stride(0),
-                stride_vc_slot=value_cache.stride(1),
-                stride_vc_head=value_cache.stride(2),
-                stride_ks_blk=k_scale_cache.stride(0),
-                stride_ks_slot=k_scale_cache.stride(1),
-                stride_ks_head=k_scale_cache.stride(2),
-                stride_vs_blk=v_scale_cache.stride(0),
-                stride_vs_slot=v_scale_cache.stride(1),
-                stride_vs_head=v_scale_cache.stride(2),
-                block_size=block_size,
-                head_size=head_size,
-                head_size_v=head_size_v,
-                HALF_HEAD_PADDED=half_head_padded,
-                num_warps=num_warps,
-            )
-            return
+            key = key_wht
+            value = value_wht
+            kv_quant_mode = KVQuantMode.INT4_PER_TOKEN_HEAD
 
     # INT4 packed: dispatch to the dedicated packing kernel.
     if kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD:
