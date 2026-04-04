@@ -981,6 +981,7 @@ def triton_reshape_and_cache_flash_per_token_head_quant(
                 QUARTER_HEAD_PADDED=qtr_head_padded,
                 num_warps=num_warps,
             )
+            return
         else:
             # INT4 TurboQuant: use the same asymmetric quantizer as mode 4
             # but in the WHT domain.  RHT gaussianizes, then adaptive
