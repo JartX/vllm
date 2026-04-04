@@ -275,7 +275,7 @@ def test_reshape_and_cache_per_token_head(
 
     # Lloyd-Max centroids for dequant reference
     _LM4 = torch.tensor(
-        [-1.5104, -0.4528, 0.4528, 1.5104], device="cuda", dtype=torch.float32
+        [-1.60, -0.46, 0.46, 1.60], device="cuda", dtype=torch.float32
     )
     _LM16 = torch.tensor(
         [-2.7326, -2.0690, -1.6180, -1.2562, -0.9424, -0.6568, -0.3882, -0.1284,
@@ -463,7 +463,7 @@ def test_per_token_head_round_trip_accuracy(
             fast_hadamard_transform,
         )
         _LM4 = torch.tensor(
-            [-1.5104, -0.4528, 0.4528, 1.5104], device="cuda", dtype=torch.float32
+            [-1.60, -0.46, 0.46, 1.60], device="cuda", dtype=torch.float32
         )
         _LM16 = torch.tensor(
             [-2.7326, -2.0690, -1.6180, -1.2562, -0.9424, -0.6568, -0.3882, -0.1284,

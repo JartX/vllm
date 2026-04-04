@@ -476,9 +476,12 @@ _LLOYD_MAX_16_POS = [0.1284, 0.3882, 0.6568, 0.9424, 1.2562, 1.6180, 2.0690, 2.7
 # Decision boundaries (midpoints between consecutive centroids)
 _LLOYD_MAX_16_BOUNDS = [0.2583, 0.5225, 0.7996, 1.0993, 1.4371, 1.8435, 2.4008]
 
-# Lloyd-Max centroids for N(0,1) — 4 levels (INT2 TurboQuant)
-_LLOYD_MAX_4_CENTROIDS = [-1.5104, -0.4528, 0.4528, 1.5104]
-_LLOYD_MAX_4_BOUNDS = [-0.9816, 0.0, 0.9816]
+# Lloyd-Max centroids for 4 levels (INT2 TurboQuant).
+# Slightly wider than pure N(0,1) optimal [-1.51, -0.45, +0.45, +1.51]
+# to better capture the heavier tails of post-RHT attention activations
+# (empirically closer to a generalized Gaussian with β≈1.7).
+_LLOYD_MAX_4_CENTROIDS = [-1.60, -0.46, 0.46, 1.60]
+_LLOYD_MAX_4_BOUNDS = [-0.96, 0.0, 0.96]
 
 
 def fast_hadamard_transform(x: torch.Tensor) -> torch.Tensor:
@@ -544,8 +547,8 @@ def _lloyd_max_quantize_4(z):
     """
     return tl.where(
         z < 0.0,
-        tl.where(z < -0.9816, 0, 1).to(tl.uint8),
-        tl.where(z < 0.9816, 2, 3).to(tl.uint8),
+        tl.where(z < -0.96, 0, 1).to(tl.uint8),
+        tl.where(z < 0.96, 2, 3).to(tl.uint8),
     )
 
 
@@ -976,46 +979,14 @@ def triton_reshape_and_cache_flash_per_token_head_quant(
                 num_warps=num_warps,
             )
         else:
-            # INT4 TurboQuant — same packing as asymmetric INT4
-            assert head_size % 2 == 0 and head_size_v % 2 == 0
-            half_head_padded = triton.next_power_of_2(
-                max(head_size, head_size_v) // 2
-            )
-            if current_platform.is_rocm() or current_platform.is_xpu():
-                num_warps = 4
-            else:
-                num_warps = min(16, max(1, half_head_padded // 32))
-            _reshape_cache_turboquant_int4[(num_tokens, num_kv_heads)](
-                key_ptr=key_wht,
-                value_ptr=value_wht,
-                key_cache_ptr=key_cache,
-                value_cache_ptr=value_cache,
-                k_scale_cache_ptr=k_scale_cache,
-                v_scale_cache_ptr=v_scale_cache,
-                slot_mapping_ptr=slot_mapping,
-                stride_key_tok=key_wht.stride(0),
-                stride_key_head=key_wht.stride(1),
-                stride_val_tok=value_wht.stride(0),
-                stride_val_head=value_wht.stride(1),
-                stride_kc_blk=key_cache.stride(0),
-                stride_kc_slot=key_cache.stride(1),
-                stride_kc_head=key_cache.stride(2),
-                stride_vc_blk=value_cache.stride(0),
-                stride_vc_slot=value_cache.stride(1),
-                stride_vc_head=value_cache.stride(2),
-                stride_ks_blk=k_scale_cache.stride(0),
-                stride_ks_slot=k_scale_cache.stride(1),
-                stride_ks_head=k_scale_cache.stride(2),
-                stride_vs_blk=v_scale_cache.stride(0),
-                stride_vs_slot=v_scale_cache.stride(1),
-                stride_vs_head=v_scale_cache.stride(2),
-                block_size=block_size,
-                head_size=head_size,
-                head_size_v=head_size_v,
-                HALF_HEAD_PADDED=half_head_padded,
-                num_warps=num_warps,
-            )
-        return
+            # INT4 TurboQuant: use the same asymmetric quantizer as mode 4
+            # but in the WHT domain.  RHT gaussianizes, then adaptive
+            # min/max quantization adapts to the actual per-token range.
+            # This falls through to the INT4_PER_TOKEN_HEAD path below
+            # with the WHT-transformed data.
+            key = key_wht
+            value = value_wht
+            kv_quant_mode = KVQuantMode.INT4_PER_TOKEN_HEAD
 
     # INT4 packed: dispatch to the dedicated packing kernel.
     if kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD:
