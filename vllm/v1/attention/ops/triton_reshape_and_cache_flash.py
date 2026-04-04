@@ -252,6 +252,168 @@ def _reshape_cache_per_token_head(
 
 
 @triton.jit
+def _reshape_cache_int4_symmetric(
+    key_ptr,  # [num_tokens, num_kv_heads, head_size]
+    value_ptr,  # [num_tokens, num_kv_heads, head_size_v]
+    key_cache_ptr,  # [num_blocks, block_size, num_kv_heads, head_size//2] uint8
+    value_cache_ptr,
+    k_scale_cache_ptr,  # [num_blocks, block_size, num_kv_heads] float32
+    v_scale_cache_ptr,
+    slot_mapping_ptr,
+    stride_key_tok: tl.int64,
+    stride_key_head: tl.int64,
+    stride_val_tok: tl.int64,
+    stride_val_head: tl.int64,
+    stride_kc_blk: tl.int64,
+    stride_kc_slot: tl.int64,
+    stride_kc_head: tl.int64,
+    stride_vc_blk: tl.int64,
+    stride_vc_slot: tl.int64,
+    stride_vc_head: tl.int64,
+    stride_ks_blk: tl.int64,
+    stride_ks_slot: tl.int64,
+    stride_ks_head: tl.int64,
+    stride_vs_blk: tl.int64,
+    stride_vs_slot: tl.int64,
+    stride_vs_head: tl.int64,
+    block_size: tl.constexpr,
+    head_size: tl.constexpr,
+    head_size_v: tl.constexpr,
+    HALF_HEAD_PADDED: tl.constexpr,
+):
+    """Symmetric INT4 quantization for RHT-rotated data.
+
+    Maps [-absmax, +absmax] to signed [-7, +7] stored as unsigned [0, 14].
+    Level 15 is unused (sacrifice 1 level for perfect symmetry around 0).
+    Scale = absmax / 7.0, stored as plain float32.
+    Dequant: x = (q - 7) * scale.
+    """
+    tok = tl.program_id(0)
+    head = tl.program_id(1)
+
+    slot = tl.load(slot_mapping_ptr + tok).to(tl.int64)
+    if slot < 0:
+        return
+
+    blk = slot // block_size
+    slot_in_blk = slot % block_size
+
+    half_offs = tl.arange(0, HALF_HEAD_PADDED)
+    even_offs = half_offs * 2
+    odd_offs = half_offs * 2 + 1
+
+    # ---- Key ----------------------------------------------------------------
+    half_k = head_size // 2
+    even_k_mask = even_offs < head_size
+    odd_k_mask = odd_offs < head_size
+    key_base = key_ptr + tok * stride_key_tok + head * stride_key_head
+
+    k_even = tl.load(key_base + even_offs, mask=even_k_mask, other=0.0).to(tl.float32)
+    k_odd = tl.load(key_base + odd_offs, mask=odd_k_mask, other=0.0).to(tl.float32)
+
+    # Symmetric: scale = absmax / 7
+    k_absmax = tl.maximum(
+        tl.max(tl.where(even_k_mask, tl.abs(k_even), 0.0)),
+        tl.max(tl.where(odd_k_mask, tl.abs(k_odd), 0.0)),
+    )
+    k_scale = tl.maximum(k_absmax / 7.0, 1e-6)
+
+    # Quantize to signed [-7, +7], store as unsigned [0, 14] (offset by +7)
+    inv_k = 1.0 / k_scale
+    k_even_q = tl.clamp(
+        tl.where(
+            k_even * inv_k >= 0,
+            (k_even * inv_k + 0.5).to(tl.int32),
+            (k_even * inv_k - 0.5).to(tl.int32),
+        ).to(tl.float32) + 7.0,
+        0.0,
+        14.0,
+    )
+    k_odd_q = tl.clamp(
+        tl.where(
+            k_odd * inv_k >= 0,
+            (k_odd * inv_k + 0.5).to(tl.int32),
+            (k_odd * inv_k - 0.5).to(tl.int32),
+        ).to(tl.float32) + 7.0,
+        0.0,
+        14.0,
+    )
+
+    k_packed = (k_even_q.to(tl.uint8) & 0xF) | ((k_odd_q.to(tl.uint8) & 0xF) << 4)
+    tl.store(
+        key_cache_ptr
+        + blk * stride_kc_blk
+        + slot_in_blk * stride_kc_slot
+        + head * stride_kc_head
+        + half_offs,
+        k_packed,
+        mask=half_offs < half_k,
+    )
+
+    tl.store(
+        k_scale_cache_ptr
+        + blk * stride_ks_blk
+        + slot_in_blk * stride_ks_slot
+        + head * stride_ks_head,
+        k_scale,
+    )
+
+    # ---- Value (same symmetric scheme) -------------------------------------
+    half_v = head_size_v // 2
+    even_v_mask = even_offs < head_size_v
+    odd_v_mask = odd_offs < head_size_v
+    val_base = value_ptr + tok * stride_val_tok + head * stride_val_head
+
+    v_even = tl.load(val_base + even_offs, mask=even_v_mask, other=0.0).to(tl.float32)
+    v_odd = tl.load(val_base + odd_offs, mask=odd_v_mask, other=0.0).to(tl.float32)
+
+    v_absmax = tl.maximum(
+        tl.max(tl.where(even_v_mask, tl.abs(v_even), 0.0)),
+        tl.max(tl.where(odd_v_mask, tl.abs(v_odd), 0.0)),
+    )
+    v_scale = tl.maximum(v_absmax / 7.0, 1e-6)
+
+    inv_v = 1.0 / v_scale
+    v_even_q = tl.clamp(
+        tl.where(
+            v_even * inv_v >= 0,
+            (v_even * inv_v + 0.5).to(tl.int32),
+            (v_even * inv_v - 0.5).to(tl.int32),
+        ).to(tl.float32) + 7.0,
+        0.0,
+        14.0,
+    )
+    v_odd_q = tl.clamp(
+        tl.where(
+            v_odd * inv_v >= 0,
+            (v_odd * inv_v + 0.5).to(tl.int32),
+            (v_odd * inv_v - 0.5).to(tl.int32),
+        ).to(tl.float32) + 7.0,
+        0.0,
+        14.0,
+    )
+
+    v_packed = (v_even_q.to(tl.uint8) & 0xF) | ((v_odd_q.to(tl.uint8) & 0xF) << 4)
+    tl.store(
+        value_cache_ptr
+        + blk * stride_vc_blk
+        + slot_in_blk * stride_vc_slot
+        + head * stride_vc_head
+        + half_offs,
+        v_packed,
+        mask=half_offs < half_v,
+    )
+
+    tl.store(
+        v_scale_cache_ptr
+        + blk * stride_vs_blk
+        + slot_in_blk * stride_vs_slot
+        + head * stride_vs_head,
+        v_scale,
+    )
+
+
+@triton.jit
 def _reshape_cache_int4_packed(
     key_ptr,  # [num_tokens, num_kv_heads, head_size]
     value_ptr,  # [num_tokens, num_kv_heads, head_size_v]
@@ -998,15 +1160,51 @@ def triton_reshape_and_cache_flash_per_token_head_quant(
             )
             return
         else:
-            # INT4 TurboQuant: single RHT + asymmetric INT4 quantizer.
-            # RHT gaussianizes, then adaptive min/max quantization per-head.
-            # Falls through to INT4_PER_TOKEN_HEAD path with RHT'd data.
-            # The d amplification from RHT is compensated in softmax_scale.
+            # INT4 TurboQuant: single RHT + symmetric INT4 quantizer.
+            # Post-RHT data is ~centered at 0 (Gaussian), so symmetric
+            # quantization [-7..+7] is optimal — no wasted bits on zp.
+            # Uses absmax/7 as scale, stored as plain float32 (no steg).
             key_wht = _single_rht(key.float()).to(key.dtype)
             value_wht = _single_rht(value.float()).to(value.dtype)
-            key = key_wht
-            value = value_wht
-            kv_quant_mode = KVQuantMode.INT4_PER_TOKEN_HEAD
+            assert head_size % 2 == 0 and head_size_v % 2 == 0
+            half_head_padded = triton.next_power_of_2(
+                max(head_size, head_size_v) // 2
+            )
+            if current_platform.is_rocm() or current_platform.is_xpu():
+                num_warps = 4
+            else:
+                num_warps = min(16, max(1, half_head_padded // 32))
+            _reshape_cache_int4_symmetric[(num_tokens, num_kv_heads)](
+                key_ptr=key_wht,
+                value_ptr=value_wht,
+                key_cache_ptr=key_cache,
+                value_cache_ptr=value_cache,
+                k_scale_cache_ptr=k_scale_cache,
+                v_scale_cache_ptr=v_scale_cache,
+                slot_mapping_ptr=slot_mapping,
+                stride_key_tok=key_wht.stride(0),
+                stride_key_head=key_wht.stride(1),
+                stride_val_tok=value_wht.stride(0),
+                stride_val_head=value_wht.stride(1),
+                stride_kc_blk=key_cache.stride(0),
+                stride_kc_slot=key_cache.stride(1),
+                stride_kc_head=key_cache.stride(2),
+                stride_vc_blk=value_cache.stride(0),
+                stride_vc_slot=value_cache.stride(1),
+                stride_vc_head=value_cache.stride(2),
+                stride_ks_blk=k_scale_cache.stride(0),
+                stride_ks_slot=k_scale_cache.stride(1),
+                stride_ks_head=k_scale_cache.stride(2),
+                stride_vs_blk=v_scale_cache.stride(0),
+                stride_vs_slot=v_scale_cache.stride(1),
+                stride_vs_head=v_scale_cache.stride(2),
+                block_size=block_size,
+                head_size=head_size,
+                head_size_v=head_size_v,
+                HALF_HEAD_PADDED=half_head_padded,
+                num_warps=num_warps,
+            )
+            return
 
     # INT4 packed: dispatch to the dedicated packing kernel.
     if kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD:
