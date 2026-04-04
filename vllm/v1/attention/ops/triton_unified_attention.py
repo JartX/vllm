@@ -1903,8 +1903,9 @@ def unified_attention(
             USE_FP8=output_scale is not None,
         )
 
-    # TurboQuant: apply inverse WHT to output
-    # IWHT(x) = WHT(x) / d  (since H × H = d × I)
+    # TurboQuant: apply inverse WHT to output.
+    # The stored scale already absorbs 1/d (scale = norm/d^1.5 = σ/d),
+    # so we only need the unnormalized WHT here (no extra /d).
     if is_turboquant:
         out_f = fast_hadamard_transform(out.float())
-        out.copy_((out_f / head_size).to(q_orig_dtype))
+        out.copy_(out_f.to(q_orig_dtype))

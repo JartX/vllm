@@ -327,15 +327,10 @@ def test_reshape_and_cache_per_token_head(
                 #        = WHT(centroids × stored_scale)  (since WHT(ax) = a*WHT(x) and d/d = 1... no)
                 # Actually: stored_scale = norm/d. Dequant in attention does:
                 #   acc = sum P_t * stored_scale_t * centroids_t  (in WHT domain)
-                #   out = WHT(acc) / d ... wait, let me just do the full reference.
-                # Forward: x_wht = WHT(x), norm = ||x_wht||, z = x_wht * sqrt(d)/norm
-                # Stored: indices(z), stored_scale = norm/d
-                # Reverse: z_hat = centroids[indices]
-                #          x_wht_hat = z_hat * norm / sqrt(d) = z_hat * stored_scale * d / sqrt(d)
-                #                    = z_hat * stored_scale * sqrt(d)
-                #          x_hat = IWHT(x_wht_hat) = WHT(x_wht_hat) / d
-                deq_wht = full * stored_scale[:, None] * (head_size ** 0.5)
-                deq = fast_hadamard_transform(deq_wht) / head_size
+                # stored_scale = norm / d^1.5 = σ/d where σ = norm/sqrt(d)
+                # V_hat = σ/d × WHT(c) = stored_scale × WHT(c)
+                # = WHT(stored_scale × c)  (scalar per head)
+                deq = fast_hadamard_transform(full * stored_scale[:, None])
                 ref_deq = data[i].float()
                 torch.testing.assert_close(deq, ref_deq, atol=deq_atol, rtol=deq_rtol)
 
@@ -498,8 +493,7 @@ def test_per_token_head_round_trip_accuracy(
                     full[:, 1::4] = _LM4[b1]
                     full[:, 2::4] = _LM4[b2]
                     full[:, 3::4] = _LM4[b3]
-                deq_wht = full * stored_scale[:, None] * (head_size ** 0.5)
-                deq = fast_hadamard_transform(deq_wht) / head_size
+                deq = fast_hadamard_transform(full * stored_scale[:, None])
                 ref = data[i].float()
                 torch.testing.assert_close(deq, ref, atol=rt_atol, rtol=rt_atol)
     else:

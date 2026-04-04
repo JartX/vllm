@@ -636,7 +636,7 @@ def _reshape_cache_turboquant_int4(
     )
 
     # Store norm/head_size as scale (attention multiplies directly)
-    k_scale = k_norm / float(head_size)
+    k_scale = k_norm / float(head_size ** 1.5)
     tl.store(
         k_scale_cache_ptr
         + blk * stride_ks_blk
@@ -676,7 +676,7 @@ def _reshape_cache_turboquant_int4(
         mask=half_offs < half_v,
     )
 
-    v_scale = v_norm / float(head_size_v)
+    v_scale = v_norm / float(head_size_v ** 1.5)
     tl.store(
         v_scale_cache_ptr
         + blk * stride_vs_blk
@@ -783,7 +783,7 @@ def _reshape_cache_turboquant_int2(
         mask=qtr_offs < qtr_k,
     )
 
-    k_scale = k_norm / float(head_size)
+    k_scale = k_norm / float(head_size ** 1.5)
     tl.store(
         k_scale_cache_ptr
         + blk * stride_ks_blk
@@ -836,7 +836,7 @@ def _reshape_cache_turboquant_int2(
         mask=qtr_offs < qtr_v,
     )
 
-    v_scale = v_norm / float(head_size_v)
+    v_scale = v_norm / float(head_size_v ** 1.5)
     tl.store(
         v_scale_cache_ptr
         + blk * stride_vs_blk
