@@ -802,12 +802,12 @@ class AiterFlashAttentionBackend(AttentionBackend):
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
-        from vllm.platforms.rocm import on_mi3xx
+        from vllm.platforms.rocm import on_gfx1x, on_mi3xx
 
         # DeviceCapability is currently created using torch.cuda.get_device_capability()
         # which is known to be buggy on rocm systems. on_mi3xx uses amd-smi which is
         # more reliable.
-        return on_mi3xx()
+        return on_mi3xx() or on_gfx1x()
 
 
 class AiterFlashAttentionImpl(AttentionImpl):
@@ -1209,8 +1209,13 @@ class AiterFlashAttentionImpl(AttentionImpl):
                 # For smaller head sizes or sliding window attention,
                 # fall back to the unified_attention triton kernel which
                 # handles both correctly.
+                # On RDNA3/RDNA4 (gfx1x), always use the Triton
+                # unified_attention kernel since ll4mi and
+                # paged_attention are CDNA3 assembly kernels.
+                from vllm.platforms.rocm import on_gfx1x
                 _MIN_HEAD_SIZE_FOR_LL4MI = 64
-                use_unified_attention = self.head_size < _MIN_HEAD_SIZE_FOR_LL4MI
+                use_unified_attention = (self.head_size < _MIN_HEAD_SIZE_FOR_LL4MI
+                                         or on_gfx1x())
 
                 if use_unified_attention:
                     assert not rocm_aiter_ops.is_shuffle_kv_cache_enabled(), (
