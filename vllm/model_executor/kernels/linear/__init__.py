@@ -44,11 +44,11 @@ from vllm.model_executor.kernels.linear.mixed_precision.exllama import (
 from vllm.model_executor.kernels.linear.mixed_precision.machete import (
     MacheteLinearKernel,
 )
-from vllm.model_executor.kernels.linear.mixed_precision.triton_wna16_rdna3 import (
-    TritonWNA16RDNA3LinearKernel,
-)
 from vllm.model_executor.kernels.linear.mixed_precision.marlin import (
     MarlinLinearKernel,
+)
+from vllm.model_executor.kernels.linear.mixed_precision.triton_wna16_rdna3 import (
+    TritonWNA16RDNA3LinearKernel,
 )
 from vllm.model_executor.kernels.linear.mixed_precision.xpu import (
     XPUW4A8IntLinearKernel,

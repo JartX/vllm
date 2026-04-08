@@ -71,7 +71,7 @@ def _fused_moe_wna16_rdna3_kernel(
     """RDNA3-tuned fused MoE WNA16 GEMM (symmetric, no zero-points).
 
     Constraints (asserted at the launch site):
-      - ``BLOCK_SIZE_K`` must be a multiple of ``group_size``.
+      - ``BLOCK_SIZE_K == group_size`` (one scale vector per K iter).
       - ``K`` must be a multiple of ``BLOCK_SIZE_K`` (no K-tail mask).
       - Symmetric quantization (no zero-points).
     """
@@ -149,16 +149,11 @@ def _fused_moe_wna16_rdna3_kernel(
         else:
             b_int = b_packed
 
-        # Load the per-group scale once for the whole tile (vector of N).
-        # BLOCK_SIZE_K is a multiple of group_size by construction, so each
-        # K iteration crosses a fixed number of groups; the kernel covers
-        # the common case of BLOCK_SIZE_K == group_size by hoisting the
-        # scale load out of the inner BLOCK_SIZE_K dot.
-        scale_group_idx = (k * BLOCK_SIZE_K) // group_size
+        # BLOCK_SIZE_K == group_size: exactly one scale per K iter.
         b_scale = tl.load(
             b_scale_ptr
             + off_experts * stride_bse
-            + scale_group_idx * stride_bsk
+            + k * stride_bsk
             + offs_bn * stride_bsn
         ).to(tl.float32)
 
@@ -254,10 +249,16 @@ def try_invoke_fused_moe_wna16_rdna3_kernel(
         )
     )
 
-    block_k = config.get("BLOCK_SIZE_K")
-    if block_k is None or block_k % block_shape[1] != 0:
-        return False
+    # The dedicated kernel loads exactly one scale vector per K iteration,
+    # so it requires BLOCK_SIZE_K == group_size. Override the resolved
+    # tile size; a smaller K tile is fine because we win on scale traffic.
+    config["BLOCK_SIZE_K"] = block_shape[1]
+    block_k = config["BLOCK_SIZE_K"]
     if A.size(1) % block_k != 0:
+        return False
+    # Triton's WMMA lowering on gfx11xx needs at least 16 elements per
+    # K step; sub-16 group sizes are not supported by this kernel.
+    if block_k < 16:
         return False
 
     grid = lambda META: (  # noqa: E731

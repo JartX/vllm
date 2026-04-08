@@ -120,16 +120,16 @@ def _wna16_rdna3_gemm_kernel(
         else:
             b_int = b_packed
 
-        scale_group_idx = (k * BLOCK_SIZE_K) // group_size
+        # BLOCK_SIZE_K == group_size: exactly one scale (and zp) per K iter.
         b_scale = tl.load(
-            s_ptr + scale_group_idx * stride_sk + offs_bn * stride_sn,
+            s_ptr + k * stride_sk + offs_bn * stride_sn,
             mask=n_mask,
             other=0.0,
         ).to(tl.float32)
 
         if HAS_ZP:
             b_zp = tl.load(
-                zp_ptr + scale_group_idx * stride_zk + offs_bn * stride_zn,
+                zp_ptr + k * stride_zk + offs_bn * stride_zn,
                 mask=n_mask,
                 other=0,
             ).to(tl.float32)
@@ -156,19 +156,12 @@ def _select_block_sizes(
 ) -> dict[str, int]:
     """Tile selector for the RDNA3 WNA16 dense kernel.
 
-    Tile geometry mirrors the MoE helper: BLOCK_SIZE_K is rounded up to a
-    multiple of group_size and at least 64 (one int4 WMMA fragment), and
-    BLOCK_SIZE_N defaults to 64/128 depending on M.
+    BLOCK_SIZE_K is locked to ``group_size`` so a single scale vector
+    feeds the whole K iteration; BLOCK_SIZE_N scales with M.
     """
-    block_k = max(64, group_size)
-    if block_k % group_size != 0:
-        block_k = ((block_k + group_size - 1) // group_size) * group_size
-    while block_k > group_size and K % block_k != 0:
-        block_k -= group_size
-    if K % block_k != 0:
-        block_k = group_size
+    block_k = group_size
 
-    if M <= 1 or M <= 16:
+    if M <= 16:
         block_m = 16
         block_n = 64
         group_m = 1
