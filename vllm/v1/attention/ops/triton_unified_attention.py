@@ -264,14 +264,18 @@ def kernel_unified_attention_2d(
             query_ptr + q_base + even_head_offs[None, :],
             mask=even_head_mask[None, :] & q_mask,
             other=0.0,
-        ).to(tl.float32)
+        )
         Q_odd = tl.load(
             query_ptr + q_base + odd_head_offs[None, :],
             mask=odd_head_mask[None, :] & q_mask,
             other=0.0,
-        ).to(tl.float32)
+        )
         if KV_QUANT_MODE == 4:
-            Q_sum = tl.sum(Q_even, axis=1) + tl.sum(Q_odd, axis=1)
+            # Q_sum is used in the asymmetric zero-point correction; reduce in
+            # fp32 for accuracy regardless of Q's storage dtype.
+            Q_sum = tl.sum(Q_even.to(tl.float32), axis=1) + tl.sum(
+                Q_odd.to(tl.float32), axis=1
+            )
 
     if KV_QUANT_MODE == 5:
         qtr_offs = tl.arange(0, QUARTER_HEAD_PADDED)
@@ -293,22 +297,22 @@ def kernel_unified_attention_2d(
             query_ptr + q_base + offs_q0[None, :],
             mask=mask_q0[None, :] & q_mask,
             other=0.0,
-        ).to(tl.float32)
+        )
         Q_s1 = tl.load(
             query_ptr + q_base + offs_q1[None, :],
             mask=mask_q1[None, :] & q_mask,
             other=0.0,
-        ).to(tl.float32)
+        )
         Q_s2 = tl.load(
             query_ptr + q_base + offs_q2[None, :],
             mask=mask_q2[None, :] & q_mask,
             other=0.0,
-        ).to(tl.float32)
+        )
         Q_s3 = tl.load(
             query_ptr + q_base + offs_q3[None, :],
             mask=mask_q3[None, :] & q_mask,
             other=0.0,
-        ).to(tl.float32)
+        )
 
     block_table_offset = seq_idx * block_table_stride
 
@@ -474,10 +478,10 @@ def kernel_unified_attention_2d(
                 mask=qtr_dim_mask[:, None] & tile_mask[None, :],
                 other=0,
             )
-            KC0 = _lloyd_max_dequant_4(K_pk & 0x3).to(tl.float32)
-            KC1 = _lloyd_max_dequant_4((K_pk >> 2) & 0x3).to(tl.float32)
-            KC2 = _lloyd_max_dequant_4((K_pk >> 4) & 0x3).to(tl.float32)
-            KC3 = _lloyd_max_dequant_4((K_pk >> 6) & 0x3).to(tl.float32)
+            KC0 = _lloyd_max_dequant_4(K_pk & 0x3).to(Q.dtype)
+            KC1 = _lloyd_max_dequant_4((K_pk >> 2) & 0x3).to(Q.dtype)
+            KC2 = _lloyd_max_dequant_4((K_pk >> 4) & 0x3).to(Q.dtype)
+            KC3 = _lloyd_max_dequant_4((K_pk >> 6) & 0x3).to(Q.dtype)
             v_off_i2 = (
                 physical_block_idx[:, None] * stride_v_cache_0
                 + kv_head_idx * stride_v_cache_2
@@ -489,10 +493,10 @@ def kernel_unified_attention_2d(
                 mask=qtr_dim_mask[None, :] & tile_mask[:, None],
                 other=0,
             )
-            VC0 = _lloyd_max_dequant_4(V_pk & 0x3).to(tl.float32)
-            VC1 = _lloyd_max_dequant_4((V_pk >> 2) & 0x3).to(tl.float32)
-            VC2 = _lloyd_max_dequant_4((V_pk >> 4) & 0x3).to(tl.float32)
-            VC3 = _lloyd_max_dequant_4((V_pk >> 6) & 0x3).to(tl.float32)
+            VC0 = _lloyd_max_dequant_4(V_pk & 0x3).to(Q.dtype)
+            VC1 = _lloyd_max_dequant_4((V_pk >> 2) & 0x3).to(Q.dtype)
+            VC2 = _lloyd_max_dequant_4((V_pk >> 4) & 0x3).to(Q.dtype)
+            VC3 = _lloyd_max_dequant_4((V_pk >> 6) & 0x3).to(Q.dtype)
             ks_idx = (
                 physical_block_idx * stride_ks_blk
                 + slot_in_blk * stride_ks_slot
@@ -693,7 +697,9 @@ def kernel_unified_attention_2d(
                 V_lo = tl.where(sw_mask[:, None], V_lo, 0.0)
                 V_hi = tl.where(sw_mask[:, None], V_hi, 0.0)
             P_v = (P * v_token_head_scales[None, :]).to(V_lo.dtype)
-            Pv_zp_sum = tl.sum(P_v * v_zp[None, :], axis=1)
+            # P_v is now in V_lo.dtype (bf16/fp16) so it matches the WMMA path;
+            # upcast for the zp correction since v_zp is fp32.
+            Pv_zp_sum = tl.sum(P_v.to(tl.float32) * v_zp[None, :], axis=1)
             acc_even += tl.dot(P_v, V_lo) - Pv_zp_sum[:, None]
             acc_odd += tl.dot(P_v, V_hi) - Pv_zp_sum[:, None]
         if KV_QUANT_MODE == 5:
@@ -704,7 +710,7 @@ def kernel_unified_attention_2d(
                 VC1 = tl.where(sw_mask[:, None], VC1, 0.0)
                 VC2 = tl.where(sw_mask[:, None], VC2, 0.0)
                 VC3 = tl.where(sw_mask[:, None], VC3, 0.0)
-            P_v = (P * v_token_head_scales[None, :]).to(tl.float32)
+            P_v = (P * v_token_head_scales[None, :]).to(Q.dtype)
             acc_s0 += tl.dot(P_v, VC0)
             acc_s1 += tl.dot(P_v, VC1)
             acc_s2 += tl.dot(P_v, VC2)
@@ -936,14 +942,18 @@ def kernel_unified_attention_3d(
             query_ptr + q_base + even_head_offs[None, :],
             mask=even_head_mask[None, :] & q_mask,
             other=0.0,
-        ).to(tl.float32)
+        )
         Q_odd = tl.load(
             query_ptr + q_base + odd_head_offs[None, :],
             mask=odd_head_mask[None, :] & q_mask,
             other=0.0,
-        ).to(tl.float32)
+        )
         if KV_QUANT_MODE == 4:
-            Q_sum = tl.sum(Q_even, axis=1) + tl.sum(Q_odd, axis=1)
+            # Q_sum is used in the asymmetric zero-point correction; reduce in
+            # fp32 for accuracy regardless of Q's storage dtype.
+            Q_sum = tl.sum(Q_even.to(tl.float32), axis=1) + tl.sum(
+                Q_odd.to(tl.float32), axis=1
+            )
 
     if KV_QUANT_MODE == 5:
         qtr_offs = tl.arange(0, QUARTER_HEAD_PADDED)
@@ -965,22 +975,22 @@ def kernel_unified_attention_3d(
             query_ptr + q_base + offs_q0[None, :],
             mask=mask_q0[None, :] & q_mask,
             other=0.0,
-        ).to(tl.float32)
+        )
         Q_s1 = tl.load(
             query_ptr + q_base + offs_q1[None, :],
             mask=mask_q1[None, :] & q_mask,
             other=0.0,
-        ).to(tl.float32)
+        )
         Q_s2 = tl.load(
             query_ptr + q_base + offs_q2[None, :],
             mask=mask_q2[None, :] & q_mask,
             other=0.0,
-        ).to(tl.float32)
+        )
         Q_s3 = tl.load(
             query_ptr + q_base + offs_q3[None, :],
             mask=mask_q3[None, :] & q_mask,
             other=0.0,
-        ).to(tl.float32)
+        )
 
     block_table_offset = seq_idx * block_table_stride
 
@@ -1144,10 +1154,10 @@ def kernel_unified_attention_3d(
                 mask=qtr_dim_mask[:, None] & tile_mask[None, :],
                 other=0,
             )
-            KC0 = _lloyd_max_dequant_4(K_pk & 0x3).to(tl.float32)
-            KC1 = _lloyd_max_dequant_4((K_pk >> 2) & 0x3).to(tl.float32)
-            KC2 = _lloyd_max_dequant_4((K_pk >> 4) & 0x3).to(tl.float32)
-            KC3 = _lloyd_max_dequant_4((K_pk >> 6) & 0x3).to(tl.float32)
+            KC0 = _lloyd_max_dequant_4(K_pk & 0x3).to(Q.dtype)
+            KC1 = _lloyd_max_dequant_4((K_pk >> 2) & 0x3).to(Q.dtype)
+            KC2 = _lloyd_max_dequant_4((K_pk >> 4) & 0x3).to(Q.dtype)
+            KC3 = _lloyd_max_dequant_4((K_pk >> 6) & 0x3).to(Q.dtype)
             v_off_i2 = (
                 physical_block_idx[:, None] * stride_v_cache_0
                 + kv_head_idx * stride_v_cache_2
@@ -1159,10 +1169,10 @@ def kernel_unified_attention_3d(
                 mask=qtr_dim_mask[None, :] & tile_mask[:, None],
                 other=0,
             )
-            VC0 = _lloyd_max_dequant_4(V_pk & 0x3).to(tl.float32)
-            VC1 = _lloyd_max_dequant_4((V_pk >> 2) & 0x3).to(tl.float32)
-            VC2 = _lloyd_max_dequant_4((V_pk >> 4) & 0x3).to(tl.float32)
-            VC3 = _lloyd_max_dequant_4((V_pk >> 6) & 0x3).to(tl.float32)
+            VC0 = _lloyd_max_dequant_4(V_pk & 0x3).to(Q.dtype)
+            VC1 = _lloyd_max_dequant_4((V_pk >> 2) & 0x3).to(Q.dtype)
+            VC2 = _lloyd_max_dequant_4((V_pk >> 4) & 0x3).to(Q.dtype)
+            VC3 = _lloyd_max_dequant_4((V_pk >> 6) & 0x3).to(Q.dtype)
             ks_idx = (
                 physical_block_idx * stride_ks_blk
                 + slot_in_blk * stride_ks_slot
@@ -1363,7 +1373,9 @@ def kernel_unified_attention_3d(
                 V_lo = tl.where(sw_mask[:, None], V_lo, 0.0)
                 V_hi = tl.where(sw_mask[:, None], V_hi, 0.0)
             P_v = (P * v_token_head_scales[None, :]).to(V_lo.dtype)
-            Pv_zp_sum = tl.sum(P_v * v_zp[None, :], axis=1)
+            # P_v is now in V_lo.dtype (bf16/fp16) so it matches the WMMA path;
+            # upcast for the zp correction since v_zp is fp32.
+            Pv_zp_sum = tl.sum(P_v.to(tl.float32) * v_zp[None, :], axis=1)
             acc_even += tl.dot(P_v, V_lo) - Pv_zp_sum[:, None]
             acc_odd += tl.dot(P_v, V_hi) - Pv_zp_sum[:, None]
         if KV_QUANT_MODE == 5:
@@ -1374,7 +1386,7 @@ def kernel_unified_attention_3d(
                 VC1 = tl.where(sw_mask[:, None], VC1, 0.0)
                 VC2 = tl.where(sw_mask[:, None], VC2, 0.0)
                 VC3 = tl.where(sw_mask[:, None], VC3, 0.0)
-            P_v = (P * v_token_head_scales[None, :]).to(tl.float32)
+            P_v = (P * v_token_head_scales[None, :]).to(Q.dtype)
             acc_s0 += tl.dot(P_v, VC0)
             acc_s1 += tl.dot(P_v, VC1)
             acc_s2 += tl.dot(P_v, VC2)
