@@ -892,6 +892,39 @@ def dispatch_fused_moe_kernel(
                 block_shape,
             )
             return
+
+        # Opt-in dedicated RDNA3 (gfx11xx) WNA16 MoE kernel.
+        if (
+            envs.VLLM_USE_TRITON_WNA16_RDNA3_MOE
+            and current_platform.is_rocm()
+        ):
+            from vllm.model_executor.layers.fused_moe.rocm_wna16_rdna3 import (
+                can_use_fused_moe_wna16_rdna3,
+                invoke_fused_moe_wna16_rdna3_kernel,
+            )
+            from vllm.platforms.rocm import on_gfx1x
+
+            if on_gfx1x() and can_use_fused_moe_wna16_rdna3(
+                A, B_zp, config, block_shape
+            ):
+                invoke_fused_moe_wna16_rdna3_kernel(
+                    A,
+                    B,
+                    C,
+                    B_scale,
+                    topk_weights,
+                    sorted_token_ids,
+                    expert_ids,
+                    num_tokens_post_padded,
+                    mul_routed_weight,
+                    top_k,
+                    config,
+                    compute_type,
+                    use_int4_w4a16,
+                    block_shape,
+                )
+                return
+
         invoke_fused_moe_wna16_triton_kernel(
             A,
             B,
@@ -1138,6 +1171,45 @@ def _ensure_block_size_k_divisible(
     return size_k
 
 
+def _get_rdna3_wna16_block_config(
+    num_valid_tokens: int,
+    real_top_k: int,
+    group_size: int,
+    size_k: int,
+) -> dict[str, int]:
+    """Tile selection for the WNA16 Triton MoE kernel on RDNA3 (gfx11xx).
+
+    The CDNA defaults (32x64 / 64x32) leave RDNA3 WMMA fragments idle:
+      - fp16/bf16 WMMA is 16x16x16
+      - int8       WMMA is 16x16x32
+      - int4       WMMA is 16x16x64
+    so BLOCK_SIZE_K must be a multiple of 64 (and of group_size) to feed
+    one full int4 WMMA per K step. BLOCK_SIZE_N=64 gives 4 WMMA tiles
+    per program at num_warps=4 (wave32) which fits the 64KB LDS budget
+    and keeps occupancy high on the 96 CU 7900 XTX.
+    """
+    bs_per_expert = num_valid_tokens // max(real_top_k, 1)
+
+    block_k = max(64, group_size)
+    if block_k % group_size != 0:
+        block_k = ((block_k + group_size - 1) // group_size) * group_size
+    # Shrink block_k if it does not divide size_k, but keep it group-aligned
+    while block_k > group_size and size_k % block_k != 0:
+        block_k -= group_size
+    if size_k % block_k != 0:
+        block_k = group_size
+
+    if bs_per_expert <= 1:
+        # Decode-shape: small N tile keeps more programs in flight per CU.
+        block_n = 64
+    elif bs_per_expert <= 32:
+        block_n = 64
+    else:
+        block_n = 128
+
+    return {"BLOCK_SIZE_N": block_n, "BLOCK_SIZE_K": block_k}
+
+
 def get_moe_wna16_block_config(
     config: dict[str, int],
     use_moe_wna16_cuda: bool,
@@ -1154,6 +1226,16 @@ def get_moe_wna16_block_config(
         return {}
     if not use_moe_wna16_cuda:
         # triton moe wna16 kernel
+        if current_platform.is_rocm():
+            from vllm.platforms.rocm import on_gfx1x
+
+            if on_gfx1x():
+                return _get_rdna3_wna16_block_config(
+                    num_valid_tokens=num_valid_tokens,
+                    real_top_k=real_top_k,
+                    group_size=group_size,
+                    size_k=size_k,
+                )
         if num_valid_tokens // real_top_k == 1:
             # if bs=1, use a smaller BLOCK_SIZE_N
             return {"BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 64}
@@ -1270,6 +1352,27 @@ def get_default_config(
             config = {"BLOCK_SIZE_M": 32, "GROUP_SIZE_M": 1, "SPLIT_K": 1}
         else:
             config = {"BLOCK_SIZE_M": 64, "GROUP_SIZE_M": 1, "SPLIT_K": 1}
+
+        # On RDNA3 (gfx11xx) the Triton MoE WNA16 kernel benefits from
+        # explicit wave32-friendly warp/occupancy hints. waves_per_eu is
+        # an AMD-only attribute; passing it via **config is safe because
+        # Triton's AMD backend consumes it and other backends ignore it.
+        if not use_moe_wna16_cuda and current_platform.is_rocm():
+            from vllm.platforms.rocm import on_gfx1x
+
+            if on_gfx1x():
+                # 4 wave32 warps == 128 lanes, the sweet spot for the
+                # WMMA fragment shapes used by int4/int8 weights.
+                config["num_warps"] = 4
+                config["num_stages"] = num_stages_rocm
+                # Smaller M tiles fit more programs per CU; larger ones
+                # need lower occupancy to free registers for the K loop.
+                config["waves_per_eu"] = 2 if M <= 64 else 1
+                # GROUP_SIZE_M=8 gives a few rows of L2 reuse for the
+                # weight tile when there are enough M-blocks per expert
+                # to actually share weights.
+                if M > 64 and (M // max(E, 1)) >= 4:
+                    config["GROUP_SIZE_M"] = 8
     else:
         # General defaults for bf16/fp16 and fp8 per-tensor.
         # Tile sizes scale with batch: small batches are memory-bound

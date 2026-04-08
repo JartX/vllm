@@ -44,6 +44,9 @@ from vllm.model_executor.kernels.linear.mixed_precision.exllama import (
 from vllm.model_executor.kernels.linear.mixed_precision.machete import (
     MacheteLinearKernel,
 )
+from vllm.model_executor.kernels.linear.mixed_precision.triton_wna16_rdna3 import (
+    TritonWNA16RDNA3LinearKernel,
+)
 from vllm.model_executor.kernels.linear.mixed_precision.marlin import (
     MarlinLinearKernel,
 )
@@ -139,6 +142,9 @@ _POSSIBLE_KERNELS: dict[PlatformEnum, list[type[MPLinearKernel]]] = {
         ExllamaLinearKernel,
     ],
     PlatformEnum.ROCM: [
+        # RDNA3-only Triton kernel; can_implement gates non-RDNA3 GPUs
+        # so MI3xx and friends still fall through to Conch/Exllama.
+        TritonWNA16RDNA3LinearKernel,
         ConchLinearKernel,
         ExllamaLinearKernel,
     ],
@@ -431,6 +437,7 @@ __all__ = [
     "ExllamaLinearKernel",
     "MacheteLinearKernel",
     "MarlinLinearKernel",
+    "TritonWNA16RDNA3LinearKernel",
     "XPUW4A8IntLinearKernel",
     "XPUwNa16LinearKernel",
 ]
