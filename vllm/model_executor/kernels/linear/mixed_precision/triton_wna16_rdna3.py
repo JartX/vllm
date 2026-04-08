@@ -100,17 +100,11 @@ def _wna16_rdna3_gemm_kernel(
 
     if USE_INT4:
         b_ptrs = (
-            b_ptr
-            + (offs_k[:, None] // 2) * stride_bk
-            + offs_bn[None, :] * stride_bn
+            b_ptr + (offs_k[:, None] // 2) * stride_bk + offs_bn[None, :] * stride_bn
         )
         b_shifter = (offs_k[:, None] % 2) * 4
     else:
-        b_ptrs = (
-            b_ptr
-            + offs_k[:, None] * stride_bk
-            + offs_bn[None, :] * stride_bn
-        )
+        b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn
         b_shifter = tl.zeros((BLOCK_SIZE_K, BLOCK_SIZE_N), dtype=tl.int32)
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
@@ -119,7 +113,9 @@ def _wna16_rdna3_gemm_kernel(
     for k in range(0, num_k_iters):
         a = tl.load(a_ptrs, mask=a_mask, other=0.0)
         b_packed = tl.load(b_ptrs, mask=n_mask[None, :], other=0)
-        if USE_INT4:
+        # constexpr branch: int4 path produces int32, int8 path keeps uint8;
+        # a ternary would force a common dtype that Triton cannot infer.
+        if USE_INT4:  # noqa: SIM108
             b_int = (b_packed >> b_shifter) & 0xF
         else:
             b_int = b_packed
@@ -172,11 +168,7 @@ def _select_block_sizes(
     if K % block_k != 0:
         block_k = group_size
 
-    if M <= 1:
-        block_m = 16
-        block_n = 64
-        group_m = 1
-    elif M <= 16:
+    if M <= 1 or M <= 16:
         block_m = 16
         block_n = 64
         group_m = 1
@@ -217,9 +209,7 @@ def _wna16_rdna3_gemm(
     M, K = x.shape
     if size_bits == 4:
         K_packed, N = w_q.shape
-        assert K_packed * 2 == K, (
-            f"int4 weight K mismatch: w_q[{K_packed}] vs x[{K}]"
-        )
+        assert K_packed * 2 == K, f"int4 weight K mismatch: w_q[{K_packed}] vs x[{K}]"
     else:
         K_w, N = w_q.shape
         assert K_w == K, f"int8 weight K mismatch: w_q[{K_w}] vs x[{K}]"
@@ -336,12 +326,10 @@ class TritonWNA16RDNA3LinearKernel(MPLinearKernel):
         K = c.partition_weight_shape[0]
         # We need at least one full WMMA fragment along K.
         min_k = max(64 if c.weight_type.size_bits == 4 else 32, c.group_size)
-        if K < min_k:
+        if min_k > K:
             return False, f"K ({K}) too small for RDNA3 WMMA fragment"
         if K % min_k != 0:
-            return False, (
-                f"K ({K}) not divisible by minimum block size ({min_k})"
-            )
+            return False, (f"K ({K}) not divisible by minimum block size ({min_k})")
 
         if envs.VLLM_DISABLED_KERNELS and cls.__name__ in envs.VLLM_DISABLED_KERNELS:
             return False, "Disabled by VLLM_DISABLED_KERNELS"

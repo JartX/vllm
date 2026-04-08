@@ -895,33 +895,32 @@ def dispatch_fused_moe_kernel(
 
         # Opt-in dedicated RDNA3 (gfx11xx) WNA16 MoE kernel. Falls through
         # to the generic Triton kernel if any precondition fails.
-        if (
-            envs.VLLM_USE_TRITON_WNA16_RDNA3_MOE
-            and current_platform.is_rocm()
-        ):
+        if envs.VLLM_USE_TRITON_WNA16_RDNA3_MOE and current_platform.is_rocm():
             from vllm.model_executor.layers.fused_moe.rocm_wna16_rdna3 import (
                 can_use_fused_moe_wna16_rdna3,
                 try_invoke_fused_moe_wna16_rdna3_kernel,
             )
             from vllm.platforms.rocm import on_gfx1x
 
-            if on_gfx1x() and can_use_fused_moe_wna16_rdna3(
-                A, B_zp, block_shape
-            ) and try_invoke_fused_moe_wna16_rdna3_kernel(
-                A,
-                B,
-                C,
-                B_scale,
-                topk_weights,
-                sorted_token_ids,
-                expert_ids,
-                num_tokens_post_padded,
-                mul_routed_weight,
-                top_k,
-                config,
-                compute_type,
-                use_int4_w4a16,
-                block_shape,
+            if (
+                on_gfx1x()
+                and can_use_fused_moe_wna16_rdna3(A, B_zp, block_shape)
+                and try_invoke_fused_moe_wna16_rdna3_kernel(
+                    A,
+                    B,
+                    C,
+                    B_scale,
+                    topk_weights,
+                    sorted_token_ids,
+                    expert_ids,
+                    num_tokens_post_padded,
+                    mul_routed_weight,
+                    top_k,
+                    config,
+                    compute_type,
+                    use_int4_w4a16,
+                    block_shape,
+                )
             ):
                 return
 

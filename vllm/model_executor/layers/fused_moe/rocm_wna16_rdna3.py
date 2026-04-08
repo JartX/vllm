@@ -142,7 +142,9 @@ def _fused_moe_wna16_rdna3_kernel(
         )
 
         b_packed = tl.load(b_ptrs)
-        if use_int4_w4a16:
+        # constexpr branch: int4 path produces int32, int8 path keeps uint8;
+        # a ternary would force a common dtype that Triton cannot infer.
+        if use_int4_w4a16:  # noqa: SIM108
             b_int = (b_packed >> b_shifter) & 0xF
         else:
             b_int = b_packed
@@ -184,10 +186,14 @@ def _fused_moe_wna16_rdna3_kernel(
 def can_use_fused_moe_wna16_rdna3(
     A: torch.Tensor,
     B_zp: torch.Tensor | None,
-    config: dict[str, Any],
     block_shape: list[int] | None,
 ) -> bool:
-    """Cheap precondition check for the dedicated RDNA3 kernel."""
+    """Cheap structural precondition check for the dedicated RDNA3 kernel.
+
+    Block-size constraints (``BLOCK_SIZE_K`` divisible by group_size and
+    by K) are validated inside the launcher itself, after the block
+    config has been resolved.
+    """
     if B_zp is not None:
         return False
     if block_shape is None or len(block_shape) < 2:
@@ -195,15 +201,10 @@ def can_use_fused_moe_wna16_rdna3(
     group_size = block_shape[1]
     if group_size <= 0:
         return False
-    block_k = config.get("BLOCK_SIZE_K")
-    if block_k is None or block_k % group_size != 0:
-        return False
-    if A.size(1) % block_k != 0:
-        return False
-    return True
+    return A.size(1) % group_size == 0
 
 
-def invoke_fused_moe_wna16_rdna3_kernel(
+def try_invoke_fused_moe_wna16_rdna3_kernel(
     A: torch.Tensor,
     B: torch.Tensor,
     C: torch.Tensor,
@@ -218,26 +219,46 @@ def invoke_fused_moe_wna16_rdna3_kernel(
     compute_type: tl.dtype,
     use_int4_w4a16: bool,
     block_shape: list[int],
-) -> None:
+) -> bool:
     """Launcher for the RDNA3-specific WNA16 fused MoE kernel.
 
-    Mirrors the contract of ``invoke_fused_moe_wna16_triton_kernel`` so the
-    dispatcher can swap them transparently.
+    Returns ``True`` when the kernel was launched and ``False`` when the
+    block-size constraints could not be satisfied (the caller should then
+    fall back to the generic ``invoke_fused_moe_wna16_triton_kernel``).
     """
+    from vllm.model_executor.layers.fused_moe.fused_moe import (
+        get_moe_wna16_block_config,
+    )
+
     assert B_scale is not None and B_scale.ndim == 3
     assert block_shape is not None and block_shape[0] == 0
-    assert config["BLOCK_SIZE_K"] % block_shape[1] == 0, (
-        "RDNA3 wna16 kernel requires BLOCK_SIZE_K to be a multiple of group_size"
-    )
-    assert A.size(1) % config["BLOCK_SIZE_K"] == 0, (
-        "RDNA3 wna16 kernel requires K to be a multiple of BLOCK_SIZE_K"
-    )
 
     M = A.size(0)
     num_tokens = M * top_k
     EM = sorted_token_ids.size(0)
     if A.size(0) < config["BLOCK_SIZE_M"]:
         EM = min(sorted_token_ids.size(0), A.size(0) * top_k * config["BLOCK_SIZE_M"])
+
+    config = config.copy()
+    config.update(
+        get_moe_wna16_block_config(
+            config=config,
+            use_moe_wna16_cuda=False,
+            num_valid_tokens=num_tokens,
+            size_k=A.size(1),
+            size_n=B.size(1),
+            num_experts=B.size(1),
+            group_size=block_shape[1],
+            real_top_k=top_k,
+            block_size_m=config["BLOCK_SIZE_M"],
+        )
+    )
+
+    block_k = config.get("BLOCK_SIZE_K")
+    if block_k is None or block_k % block_shape[1] != 0:
+        return False
+    if A.size(1) % block_k != 0:
+        return False
 
     grid = lambda META: (  # noqa: E731
         triton.cdiv(EM, META["BLOCK_SIZE_M"])
@@ -286,3 +307,4 @@ def invoke_fused_moe_wna16_rdna3_kernel(
         use_int4_w4a16=use_int4_w4a16,
         **launch_config,
     )
+    return True
