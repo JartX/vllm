@@ -316,13 +316,12 @@ class TritonWNA16RDNA3LinearKernel(MPLinearKernel):
                 f"input features ({c.partition_weight_shape[0]})"
             )
 
-        K = c.partition_weight_shape[0]
-        # We need at least one full WMMA fragment along K.
-        min_k = max(64 if c.weight_type.size_bits == 4 else 32, c.group_size)
-        if min_k > K:
-            return False, f"K ({K}) too small for RDNA3 WMMA fragment"
-        if K % min_k != 0:
-            return False, (f"K ({K}) not divisible by minimum block size ({min_k})")
+        # BLOCK_SIZE_K is locked to group_size; Triton's WMMA lowering
+        # needs at least 16 elements per K step.
+        if c.group_size < 16:
+            return False, (
+                f"Group size ({c.group_size}) is below the WMMA minimum (16)"
+            )
 
         if envs.VLLM_DISABLED_KERNELS and cls.__name__ in envs.VLLM_DISABLED_KERNELS:
             return False, "Disabled by VLLM_DISABLED_KERNELS"
