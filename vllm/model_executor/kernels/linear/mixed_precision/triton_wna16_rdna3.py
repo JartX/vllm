@@ -334,11 +334,23 @@ class TritonWNA16RDNA3LinearKernel(MPLinearKernel):
         pack_factor = 32 // size_bits
 
         def transform_w_q(x):
+            # Repack [K // pack_factor_i32, N] int32 -> [K // pack_factor_u8, N]
+            # uint8 where each byte holds pack_factor_u8 values along K (2 for
+            # int4, 1 for int8). torch.Tensor.view(torch.uint8) only expands
+            # the trailing dimension, so we transpose first to put K at the
+            # end, view, then transpose back.
+            #
+            # Layout note: GPTQ packs the lowest size_bits of an int32 word as
+            # the first K nibble, so within each int32 the bytes are already
+            # ordered "K-low first" (little-endian). Viewing as uint8 along
+            # the trailing K dim is therefore an in-place reinterpretation.
             assert isinstance(x, BasevLLMParameter)
             permute_param_layout_(x, input_dim=0, output_dim=1, packed_dim=0)
-            x_cont = x.data.contiguous()
-            # int32 nibble-packed -> uint8 byte-packed (low nibble = even K)
-            x.data = x_cont.view(torch.uint8).contiguous()
+            x_int32 = x.data.contiguous()  # [K // pack_factor_i32, N] int32
+            # K becomes the trailing dim so view(uint8) expands it x4.
+            x_kn = x_int32.t().contiguous()  # [N, K // pack_factor_i32] int32
+            x_bytes = x_kn.view(torch.uint8)  # [N, (K // pack_factor_i32) * 4]
+            x.data = x_bytes.t().contiguous()  # [K * size_bits / 8, N] uint8
             return x
 
         def transform_w_s(x):
