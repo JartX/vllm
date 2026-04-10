@@ -22,6 +22,16 @@ https://github.com/qwopqwop200/GPTQ-for-LLaMa
 namespace vllm {
 namespace gptq {
 
+// RDNA3/4 (gfx11xx/gfx12xx) have v_dot2_f32_f16 and v_dot2_f32_bf16
+// instructions (VOP3-P, dot2-insts) that compute a 2-element dot product
+// accumulating directly in f32, replacing __hfma2 (fp16 accum) + conversion.
+#if defined(USE_ROCM) &&                                                     \
+    (defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1150__) ||  \
+     defined(__gfx1151__) || defined(__gfx1152__) || defined(__gfx1153__) ||  \
+     defined(__gfx1200__) || defined(__gfx1201__))
+  #define GPTQ_DOT2_F32_F16
+#endif
+
 #define BLOCK_KN_SIZE 128
 #define BLOCK_M_SIZE_MAX 8
 #define MAX_GROUPS_IN_BLOCK (BLOCK_KN_SIZE / 32)
@@ -63,11 +73,24 @@ __forceinline__ __device__ half2 dot22_8(half2 (&dq)[4], const half* a_ptr,
 }
 
 __forceinline__ __device__ float dot22_8_f(half2 (&dq)[4], const half* a_ptr) {
+#ifdef GPTQ_DOT2_F32_F16
+  // RDNA3/4: v_dot2_f32_f16 accumulates directly in f32 (1 instr per pair),
+  // replacing __hfma2 (fp16 accum) + 2x __half2float + fadd (~7 instr).
+  float result = 0.0f;
+  const float* dq_f = reinterpret_cast<const float*>(dq);
+  const float* a_f = reinterpret_cast<const float*>(a_ptr);
+#pragma unroll
+  for (int i = 0; i < 4; i++)
+    asm("v_dot2_f32_f16 %0, %1, %2, %0"
+        : "+v"(result) : "v"(dq_f[i]), "v"(a_f[i]));
+  return result;
+#else
   half2 result = {};
   const half2* a2_ptr = (const half2*)a_ptr;
 #pragma unroll
   for (int i = 0; i < 4; i++) result = __hfma2(dq[i], *a2_ptr++, result);
   return __half2float(__low2half(result)) + __half2float(__high2half(result));
+#endif
 }
 
 __forceinline__ __device__ half2 dot22_8(half2 (&dq)[4], const half* a_ptr,
@@ -103,6 +126,16 @@ __forceinline__ __device__ half2 dot22_32(half2 (&dq)[16], const half* a_ptr,
 __forceinline__ __device__ float dot22_8_f(half2 (&dq)[4], const half* a_ptr,
                                            const float g_result,
                                            const float qs_f) {
+#ifdef GPTQ_DOT2_F32_F16
+  float result = 0.0f;
+  const float* dq_f = reinterpret_cast<const float*>(dq);
+  const float* a_f = reinterpret_cast<const float*>(a_ptr);
+#pragma unroll
+  for (int i = 0; i < 4; i++)
+    asm("v_dot2_f32_f16 %0, %1, %2, %0"
+        : "+v"(result) : "v"(dq_f[i]), "v"(a_f[i]));
+  return fma(result, qs_f, g_result);
+#else
   half2 result = {};
   const half2* a2_ptr = (const half2*)a_ptr;
 #pragma unroll
@@ -110,11 +143,22 @@ __forceinline__ __device__ float dot22_8_f(half2 (&dq)[4], const half* a_ptr,
   float result_f =
       __half2float(__low2half(result)) + __half2float(__high2half(result));
   return fma(result_f, qs_f, g_result);
+#endif
 }
 
 __forceinline__ __device__ float dot22_16_f(half2 (&dq)[8], const half* a_ptr,
                                             const float g_result,
                                             const float qs_f) {
+#ifdef GPTQ_DOT2_F32_F16
+  float result = 0.0f;
+  const float* dq_f = reinterpret_cast<const float*>(dq);
+  const float* a_f = reinterpret_cast<const float*>(a_ptr);
+#pragma unroll
+  for (int i = 0; i < 8; i++)
+    asm("v_dot2_f32_f16 %0, %1, %2, %0"
+        : "+v"(result) : "v"(dq_f[i]), "v"(a_f[i]));
+  return fma(result, qs_f, g_result);
+#else
   half2 result = {};
   const half2* a2_ptr = (const half2*)a_ptr;
 #pragma unroll
@@ -122,11 +166,22 @@ __forceinline__ __device__ float dot22_16_f(half2 (&dq)[8], const half* a_ptr,
   float result_f =
       __half2float(__low2half(result)) + __half2float(__high2half(result));
   return fma(result_f, qs_f, g_result);
+#endif
 }
 
 __forceinline__ __device__ float dot22_32_f(half2 (&dq)[16], const half* a_ptr,
                                             const float g_result,
                                             const float qs_f) {
+#ifdef GPTQ_DOT2_F32_F16
+  float result = 0.0f;
+  const float* dq_f = reinterpret_cast<const float*>(dq);
+  const float* a_f = reinterpret_cast<const float*>(a_ptr);
+#pragma unroll
+  for (int i = 0; i < 16; i++)
+    asm("v_dot2_f32_f16 %0, %1, %2, %0"
+        : "+v"(result) : "v"(dq_f[i]), "v"(a_f[i]));
+  return fma(result, qs_f, g_result);
+#else
   half2 result = {};
   const half2* a2_ptr = (const half2*)a_ptr;
 #pragma unroll
@@ -134,6 +189,7 @@ __forceinline__ __device__ float dot22_32_f(half2 (&dq)[16], const half* a_ptr,
   float result_f =
       __half2float(__low2half(result)) + __half2float(__high2half(result));
   return fma(result_f, qs_f, g_result);
+#endif
 }
 
 __forceinline__ __device__ half dot22_8_h(half2 (&dq)[4], const half* a_ptr,
