@@ -307,6 +307,13 @@ def awq_gemm_triton(
     assert group_size <= K
     assert group_size in AWQ_TRITON_SUPPORTED_GROUP_SIZES or group_size == K
 
+    # The kernel loads scales/zeros from a single g_idx per BLOCK_SIZE_K tile.
+    # If BLOCK_SIZE_K > group_size, the tile spans multiple scale groups but
+    # only the first group's scales are applied to all rows in the tile,
+    # silently corrupting the dequantization. Clamp BLOCK_SIZE_K to group_size.
+    if block_size_k > group_size:
+        block_size_k = group_size
+
     grid = lambda META: (
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
         split_k_iters,
