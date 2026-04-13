@@ -247,6 +247,13 @@ def awq_dequantize_triton(
     assert group_size <= K
     assert group_size in AWQ_TRITON_SUPPORTED_GROUP_SIZES or group_size == K
 
+    # The kernel loads scales/zeros from a single g_idx per BLOCK_SIZE_Y tile
+    # (the K dimension here). If BLOCK_SIZE_Y > group_size, the tile spans
+    # multiple groups but only the first group's scales are applied,
+    # silently corrupting the dequantization. Clamp to group_size.
+    if block_size_y > group_size:
+        block_size_y = group_size
+
     # Result tensor:
     # number of rows = same as input tensor
     # number of cols = 8 x input tensor num cols
