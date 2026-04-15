@@ -589,7 +589,7 @@ class TritonAttentionImpl(AttentionImpl):
             and attn_metadata.mm_prefix_range_tensor is None
             and output_scale is None
         ):
-            flash_attn_varlen_func(
+            fa_out = flash_attn_varlen_func(
                 q=query[:num_actual_tokens],
                 k=key[:num_actual_tokens],
                 v=value[:num_actual_tokens],
@@ -599,8 +599,10 @@ class TritonAttentionImpl(AttentionImpl):
                 max_seqlen_k=attn_metadata.max_query_len,
                 softmax_scale=self.scale,
                 causal=True,
-                out=output[:num_actual_tokens],
             )
+            if isinstance(fa_out, tuple):
+                fa_out = fa_out[0]
+            output[:num_actual_tokens].copy_(fa_out)
             return output
 
         # Per-token-head quantized KV cache: use separate scale caches.
