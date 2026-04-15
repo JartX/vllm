@@ -29,7 +29,14 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
 )
+from vllm.v1.attention.backends.fa_utils import (
+    is_flash_attn_varlen_func_available,
+)
 from vllm.v1.attention.backends.utils import get_kv_cache_layout
+
+_HAS_FLASH_ATTN = is_flash_attn_varlen_func_available()
+if _HAS_FLASH_ATTN:
+    from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
 from vllm.v1.attention.ops.triton_prefill_attention import context_attention_fwd
 from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash,
@@ -562,6 +569,39 @@ class TritonAttentionImpl(AttentionImpl):
                 attn_metadata,
                 layer,
             )
+
+        # Per-token-head prefill fast-path: on first-chunk pure prefills
+        # (no prior cached KV), skip the quantized cache read entirely and
+        # run FlashAttention on the raw K/V tensors.  The quantized cache
+        # was already written by do_kv_cache_update, so subsequent decode
+        # steps still see the stored KV.  Mirrors turboquant's strategy
+        # (turboquant_attn.py:509-523) — avoids per-tile scale lookups and
+        # dequant inside the kernel loop.
+        if (
+            self._is_per_token_head_quant
+            and _HAS_FLASH_ATTN
+            and attn_metadata.max_query_len == attn_metadata.max_seq_len
+            and self.alibi_slopes is None
+            and not self.use_alibi_sqrt
+            and self.sinks is None
+            and self.logits_soft_cap == 0
+            and self.sliding_window == (-1, -1)
+            and attn_metadata.mm_prefix_range_tensor is None
+            and output_scale is None
+        ):
+            flash_attn_varlen_func(
+                q=query[:num_actual_tokens],
+                k=key[:num_actual_tokens],
+                v=value[:num_actual_tokens],
+                cu_seqlens_q=attn_metadata.query_start_loc,
+                cu_seqlens_k=attn_metadata.query_start_loc,
+                max_seqlen_q=attn_metadata.max_query_len,
+                max_seqlen_k=attn_metadata.max_query_len,
+                softmax_scale=self.scale,
+                causal=True,
+                out=output[:num_actual_tokens],
+            )
+            return output
 
         # Per-token-head quantized KV cache: use separate scale caches.
         if self._is_per_token_head_quant:
