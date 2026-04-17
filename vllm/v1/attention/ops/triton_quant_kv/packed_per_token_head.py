@@ -441,9 +441,11 @@ def _reshape_cache_int2_kernel(
     )
 
 
-# Optimal MMSE centroid for sign-quantized N(0, 1):  E[|z|] = √(2/π).
-# Stored in the scale so the kernel can emit plain ±1 on dequant.
-_INT1_SIGN_CENTROID = 0.7978845608028654  # √(2/π)
+# Optimal MMSE centroid amplitude for sign-quantized N(0, 1) is
+# E[|z|] = √(2/π) ≈ 0.7978845608028654.  Baked into the per-(token,
+# head) scale at write time so the attention kernel can emit plain ±1
+# on dequant.  Inlined in the reshape kernel below — Triton only
+# accepts module globals when they are wrapped in ``tl.constexpr``.
 
 
 @triton.jit
@@ -558,7 +560,7 @@ def _reshape_cache_int1_kernel(
 
     # Store √(2/π) · norm / d^1.5 so the read side just multiplies by
     # ``scale * k_scale`` and emits plain ±1 from the bit.
-    k_scale = k_norm * _INT1_SIGN_CENTROID / float(head_size**1.5)
+    k_scale = k_norm * 0.7978845608028654 / float(head_size**1.5)
     tl.store(
         k_scale_cache_ptr
         + blk * stride_ks_blk
@@ -619,7 +621,7 @@ def _reshape_cache_int1_kernel(
         mask=oct_offs < oct_v,
     )
 
-    v_scale = v_norm * _INT1_SIGN_CENTROID / float(head_size_v**1.5)
+    v_scale = v_norm * 0.7978845608028654 / float(head_size_v**1.5)
     tl.store(
         v_scale_cache_ptr
         + blk * stride_vs_blk
