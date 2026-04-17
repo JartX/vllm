@@ -55,6 +55,9 @@ _MODULES: dict[KVQuantMode, str] = {
     KVQuantMode.INT2_PER_TOKEN_HEAD: (
         "vllm.v1.attention.ops.triton_quant_kv.packed_per_token_head"
     ),
+    KVQuantMode.INT1_PER_TOKEN_HEAD: (
+        "vllm.v1.attention.ops.triton_quant_kv.packed_per_token_head"
+    ),
 }
 
 

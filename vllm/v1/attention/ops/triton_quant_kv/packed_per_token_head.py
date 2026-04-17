@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Sub-byte per-token-head KV cache quantization backends (INT4 + INT2).
+"""Sub-byte per-token-head KV cache quantization backends (INT4/INT2/INT1).
 
-Both modes share the same skeleton — per-(token, head) dynamic scale +
-Hadamard pre-rotation on the inputs and inverse Hadamard on the output
-— but differ in their quantization math and packing factor:
+All three modes share the same skeleton — per-(token, head) dynamic
+scale + Hadamard pre-rotation on the inputs and inverse Hadamard on
+the output — but differ in their quantization math and packing factor:
 
 +----------+------------+---------------------+----------------------+
 | Mode     | Packing    | Pre-rotation        | Scale encodes        |
@@ -15,21 +15,24 @@ Hadamard pre-rotation on the inputs and inverse Hadamard on the output
 | INT2     | 4 / byte   | Full Hadamard       | ``norm / d^1.5``     |
 |          |            | (no random sign)    | (centroid lookup)    |
 +----------+------------+---------------------+----------------------+
+| INT1     | 8 / byte   | Full Hadamard       | ``c · norm/d^1.5``   |
+|          |            | (no random sign)    | (sign-quant, c=√2/π) |
++----------+------------+---------------------+----------------------+
 
 Attention kernel
 ----------------
-A single :func:`_attn_packed` kernel handles both modes via the
-``PACKING_FACTOR: tl.constexpr`` branch (2 → INT4, 4 → INT2).  The
-mode-specific parts — how many Q/KV streams are split, how KV is
-dequantized (nibble unpack vs Lloyd-Max centroid lookup), how the
-score is corrected (asymmetric zero-point subtraction vs plain) — are
-gated by constexpr ``if`` on ``PACKING_FACTOR``.  Everything else
-(prologue, masking, online softmax, tile loop, 2D/3D epilogue) is
-shared.
+A single :func:`_attn_packed` kernel handles all three modes via the
+``PACKING_FACTOR: tl.constexpr`` branch (2 → INT4, 4 → INT2, 8 →
+INT1).  The mode-specific parts — how many Q/KV streams are split,
+how KV is dequantized (nibble unpack vs Lloyd-Max centroid lookup vs
+sign expansion), how the score is corrected (asymmetric zero-point
+subtraction vs plain) — are gated by constexpr ``if`` on
+``PACKING_FACTOR``.  Everything else (prologue, masking, online
+softmax, tile loop, 2D/3D epilogue) is shared.
 
-Both backends register on module import; the attention and reshape
-kernels are Triton-compiled lazily with the ``PACKING_FACTOR`` /
-quant-specific constexprs of each mode.
+All three backends register on module import; the attention and
+reshape kernels are Triton-compiled lazily with the
+``PACKING_FACTOR`` / quant-specific constexprs of each mode.
 """
 
 from __future__ import annotations
@@ -58,8 +61,10 @@ from vllm.v1.attention.ops.triton_quant_kv._hadamard import (
     single_rht,
 )
 from vllm.v1.attention.ops.triton_quant_kv._pack_unpack import (
+    pack_int1_octet,
     pack_int2_quartet,
     pack_int4_nibbles,
+    unpack_int1_octet,
     unpack_int2_quartet,
     unpack_int4_nibbles,
 )
@@ -436,11 +441,200 @@ def _reshape_cache_int2_kernel(
     )
 
 
+# Optimal MMSE centroid for sign-quantized N(0, 1):  E[|z|] = √(2/π).
+# Stored in the scale so the kernel can emit plain ±1 on dequant.
+_INT1_SIGN_CENTROID = 0.7978845608028654  # √(2/π)
+
+
+@triton.jit
+def _reshape_cache_int1_kernel(
+    key_ptr,
+    value_ptr,
+    key_cache_ptr,
+    value_cache_ptr,
+    k_scale_cache_ptr,
+    v_scale_cache_ptr,
+    slot_mapping_ptr,
+    stride_key_tok: tl.int64,
+    stride_key_head: tl.int64,
+    stride_val_tok: tl.int64,
+    stride_val_head: tl.int64,
+    stride_kc_blk: tl.int64,
+    stride_kc_slot: tl.int64,
+    stride_kc_head: tl.int64,
+    stride_vc_blk: tl.int64,
+    stride_vc_slot: tl.int64,
+    stride_vc_head: tl.int64,
+    stride_ks_blk: tl.int64,
+    stride_ks_slot: tl.int64,
+    stride_ks_head: tl.int64,
+    stride_vs_blk: tl.int64,
+    stride_vs_slot: tl.int64,
+    stride_vs_head: tl.int64,
+    block_size: tl.constexpr,
+    head_size: tl.constexpr,
+    head_size_v: tl.constexpr,
+    PACKED_HEAD_PADDED: tl.constexpr,
+):
+    """INT1 Hadamard + sign-quant {-1, +1}.
+
+    Packs 8 × 1-bit sign codes per byte → head_size/8 bytes per head.
+    Bit ``b_i = (x_i > 0)``; the reconstructed value is encoded on the
+    read side as ``2·b_i - 1`` and scaled by
+    ``√(2/π) · norm / d^1.5`` (bakes the MMSE centroid + the
+    unnormalized-Hadamard 1/d factor into a single multiply).
+    """
+    tok = tl.program_id(0)
+    head = tl.program_id(1)
+
+    slot = tl.load(slot_mapping_ptr + tok).to(tl.int64)
+    if slot < 0:
+        return
+
+    blk = slot // block_size
+    slot_in_blk = slot % block_size
+
+    oct_offs = tl.arange(0, PACKED_HEAD_PADDED)
+    offs_0 = oct_offs * 8
+    offs_1 = oct_offs * 8 + 1
+    offs_2 = oct_offs * 8 + 2
+    offs_3 = oct_offs * 8 + 3
+    offs_4 = oct_offs * 8 + 4
+    offs_5 = oct_offs * 8 + 5
+    offs_6 = oct_offs * 8 + 6
+    offs_7 = oct_offs * 8 + 7
+
+    oct_k = head_size // 8
+    mask_0k = offs_0 < head_size
+    mask_1k = offs_1 < head_size
+    mask_2k = offs_2 < head_size
+    mask_3k = offs_3 < head_size
+    mask_4k = offs_4 < head_size
+    mask_5k = offs_5 < head_size
+    mask_6k = offs_6 < head_size
+    mask_7k = offs_7 < head_size
+    key_base = key_ptr + tok * stride_key_tok + head * stride_key_head
+
+    k0 = tl.load(key_base + offs_0, mask=mask_0k, other=0.0).to(tl.float32)
+    k1 = tl.load(key_base + offs_1, mask=mask_1k, other=0.0).to(tl.float32)
+    k2 = tl.load(key_base + offs_2, mask=mask_2k, other=0.0).to(tl.float32)
+    k3 = tl.load(key_base + offs_3, mask=mask_3k, other=0.0).to(tl.float32)
+    k4 = tl.load(key_base + offs_4, mask=mask_4k, other=0.0).to(tl.float32)
+    k5 = tl.load(key_base + offs_5, mask=mask_5k, other=0.0).to(tl.float32)
+    k6 = tl.load(key_base + offs_6, mask=mask_6k, other=0.0).to(tl.float32)
+    k7 = tl.load(key_base + offs_7, mask=mask_7k, other=0.0).to(tl.float32)
+
+    k_sq = (
+        tl.sum(tl.where(mask_0k, k0 * k0, 0.0))
+        + tl.sum(tl.where(mask_1k, k1 * k1, 0.0))
+        + tl.sum(tl.where(mask_2k, k2 * k2, 0.0))
+        + tl.sum(tl.where(mask_3k, k3 * k3, 0.0))
+        + tl.sum(tl.where(mask_4k, k4 * k4, 0.0))
+        + tl.sum(tl.where(mask_5k, k5 * k5, 0.0))
+        + tl.sum(tl.where(mask_6k, k6 * k6, 0.0))
+        + tl.sum(tl.where(mask_7k, k7 * k7, 0.0))
+    )
+    k_norm = tl.sqrt(k_sq + 1e-12)
+
+    kb0 = (k0 > 0.0).to(tl.uint8)
+    kb1 = (k1 > 0.0).to(tl.uint8)
+    kb2 = (k2 > 0.0).to(tl.uint8)
+    kb3 = (k3 > 0.0).to(tl.uint8)
+    kb4 = (k4 > 0.0).to(tl.uint8)
+    kb5 = (k5 > 0.0).to(tl.uint8)
+    kb6 = (k6 > 0.0).to(tl.uint8)
+    kb7 = (k7 > 0.0).to(tl.uint8)
+
+    k_packed = pack_int1_octet(kb0, kb1, kb2, kb3, kb4, kb5, kb6, kb7)
+    tl.store(
+        key_cache_ptr
+        + blk * stride_kc_blk
+        + slot_in_blk * stride_kc_slot
+        + head * stride_kc_head
+        + oct_offs,
+        k_packed,
+        mask=oct_offs < oct_k,
+    )
+
+    # Store √(2/π) · norm / d^1.5 so the read side just multiplies by
+    # ``scale * k_scale`` and emits plain ±1 from the bit.
+    k_scale = k_norm * _INT1_SIGN_CENTROID / float(head_size**1.5)
+    tl.store(
+        k_scale_cache_ptr
+        + blk * stride_ks_blk
+        + slot_in_blk * stride_ks_slot
+        + head * stride_ks_head,
+        k_scale,
+    )
+
+    oct_v = head_size_v // 8
+    mask_0v = offs_0 < head_size_v
+    mask_1v = offs_1 < head_size_v
+    mask_2v = offs_2 < head_size_v
+    mask_3v = offs_3 < head_size_v
+    mask_4v = offs_4 < head_size_v
+    mask_5v = offs_5 < head_size_v
+    mask_6v = offs_6 < head_size_v
+    mask_7v = offs_7 < head_size_v
+    val_base = value_ptr + tok * stride_val_tok + head * stride_val_head
+
+    v0 = tl.load(val_base + offs_0, mask=mask_0v, other=0.0).to(tl.float32)
+    v1 = tl.load(val_base + offs_1, mask=mask_1v, other=0.0).to(tl.float32)
+    v2 = tl.load(val_base + offs_2, mask=mask_2v, other=0.0).to(tl.float32)
+    v3 = tl.load(val_base + offs_3, mask=mask_3v, other=0.0).to(tl.float32)
+    v4 = tl.load(val_base + offs_4, mask=mask_4v, other=0.0).to(tl.float32)
+    v5 = tl.load(val_base + offs_5, mask=mask_5v, other=0.0).to(tl.float32)
+    v6 = tl.load(val_base + offs_6, mask=mask_6v, other=0.0).to(tl.float32)
+    v7 = tl.load(val_base + offs_7, mask=mask_7v, other=0.0).to(tl.float32)
+
+    v_sq = (
+        tl.sum(tl.where(mask_0v, v0 * v0, 0.0))
+        + tl.sum(tl.where(mask_1v, v1 * v1, 0.0))
+        + tl.sum(tl.where(mask_2v, v2 * v2, 0.0))
+        + tl.sum(tl.where(mask_3v, v3 * v3, 0.0))
+        + tl.sum(tl.where(mask_4v, v4 * v4, 0.0))
+        + tl.sum(tl.where(mask_5v, v5 * v5, 0.0))
+        + tl.sum(tl.where(mask_6v, v6 * v6, 0.0))
+        + tl.sum(tl.where(mask_7v, v7 * v7, 0.0))
+    )
+    v_norm = tl.sqrt(v_sq + 1e-12)
+
+    vb0 = (v0 > 0.0).to(tl.uint8)
+    vb1 = (v1 > 0.0).to(tl.uint8)
+    vb2 = (v2 > 0.0).to(tl.uint8)
+    vb3 = (v3 > 0.0).to(tl.uint8)
+    vb4 = (v4 > 0.0).to(tl.uint8)
+    vb5 = (v5 > 0.0).to(tl.uint8)
+    vb6 = (v6 > 0.0).to(tl.uint8)
+    vb7 = (v7 > 0.0).to(tl.uint8)
+
+    v_packed = pack_int1_octet(vb0, vb1, vb2, vb3, vb4, vb5, vb6, vb7)
+    tl.store(
+        value_cache_ptr
+        + blk * stride_vc_blk
+        + slot_in_blk * stride_vc_slot
+        + head * stride_vc_head
+        + oct_offs,
+        v_packed,
+        mask=oct_offs < oct_v,
+    )
+
+    v_scale = v_norm * _INT1_SIGN_CENTROID / float(head_size_v**1.5)
+    tl.store(
+        v_scale_cache_ptr
+        + blk * stride_vs_blk
+        + slot_in_blk * stride_vs_slot
+        + head * stride_vs_head,
+        v_scale,
+    )
+
+
 # ===========================================================================
-# Attention kernel (read path) — shared by INT4 (PACKING_FACTOR=2) and
-# INT2 (PACKING_FACTOR=4).  The constexpr gates all mode-specific parts
-# and Triton only traces the taken branch, so each concrete launch
-# compiles to the same code a bespoke per-mode kernel would.
+# Attention kernel (read path) — shared by INT4 (PACKING_FACTOR=2),
+# INT2 (PACKING_FACTOR=4), and INT1 (PACKING_FACTOR=8).  The constexpr
+# gates all mode-specific parts and Triton only traces the taken
+# branch, so each concrete launch compiles to the same code a bespoke
+# per-mode kernel would.
 # ===========================================================================
 
 
@@ -510,8 +704,8 @@ def _attn_packed(
     USE_FP8: tl.constexpr,
     IS_3D: tl.constexpr,
     # 2 → INT4 nibble pair (asymmetric + zp); 4 → INT2 quartet
-    # (Lloyd-Max centroids).  All mode-specific branches below gate on
-    # this value.
+    # (Lloyd-Max centroids); 8 → INT1 octet (sign expansion).  All
+    # mode-specific branches below gate on this value.
     PACKING_FACTOR: tl.constexpr,
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
@@ -582,9 +776,9 @@ def _attn_packed(
         mask=mask_s1[None, :] & q_mask,
         other=0.0,
     ).to(tl.float32)
-    if PACKING_FACTOR == 4:
-        offs_s2 = packed_offs * 4 + 2
-        offs_s3 = packed_offs * 4 + 3
+    if PACKING_FACTOR == 4 or PACKING_FACTOR == 8:
+        offs_s2 = packed_offs * PACKING_FACTOR + 2
+        offs_s3 = packed_offs * PACKING_FACTOR + 3
         mask_s2 = tl.where(offs_s2 < HEAD_SIZE, 1, 0).to(tl.int1)
         mask_s3 = tl.where(offs_s3 < HEAD_SIZE, 1, 0).to(tl.int1)
         Q_s2 = tl.load(
@@ -595,6 +789,35 @@ def _attn_packed(
         Q_s3 = tl.load(
             query_ptr + q_base + offs_s3[None, :],
             mask=mask_s3[None, :] & q_mask,
+            other=0.0,
+        ).to(tl.float32)
+    if PACKING_FACTOR == 8:
+        offs_s4 = packed_offs * 8 + 4
+        offs_s5 = packed_offs * 8 + 5
+        offs_s6 = packed_offs * 8 + 6
+        offs_s7 = packed_offs * 8 + 7
+        mask_s4 = tl.where(offs_s4 < HEAD_SIZE, 1, 0).to(tl.int1)
+        mask_s5 = tl.where(offs_s5 < HEAD_SIZE, 1, 0).to(tl.int1)
+        mask_s6 = tl.where(offs_s6 < HEAD_SIZE, 1, 0).to(tl.int1)
+        mask_s7 = tl.where(offs_s7 < HEAD_SIZE, 1, 0).to(tl.int1)
+        Q_s4 = tl.load(
+            query_ptr + q_base + offs_s4[None, :],
+            mask=mask_s4[None, :] & q_mask,
+            other=0.0,
+        ).to(tl.float32)
+        Q_s5 = tl.load(
+            query_ptr + q_base + offs_s5[None, :],
+            mask=mask_s5[None, :] & q_mask,
+            other=0.0,
+        ).to(tl.float32)
+        Q_s6 = tl.load(
+            query_ptr + q_base + offs_s6[None, :],
+            mask=mask_s6[None, :] & q_mask,
+            other=0.0,
+        ).to(tl.float32)
+        Q_s7 = tl.load(
+            query_ptr + q_base + offs_s7[None, :],
+            mask=mask_s7[None, :] & q_mask,
             other=0.0,
         ).to(tl.float32)
 
@@ -613,9 +836,14 @@ def _attn_packed(
     L = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
     acc_s0 = tl.zeros([BLOCK_M, PACKED_HEAD_PADDED], dtype=tl.float32)
     acc_s1 = tl.zeros([BLOCK_M, PACKED_HEAD_PADDED], dtype=tl.float32)
-    if PACKING_FACTOR == 4:
+    if PACKING_FACTOR == 4 or PACKING_FACTOR == 8:
         acc_s2 = tl.zeros([BLOCK_M, PACKED_HEAD_PADDED], dtype=tl.float32)
         acc_s3 = tl.zeros([BLOCK_M, PACKED_HEAD_PADDED], dtype=tl.float32)
+    if PACKING_FACTOR == 8:
+        acc_s4 = tl.zeros([BLOCK_M, PACKED_HEAD_PADDED], dtype=tl.float32)
+        acc_s5 = tl.zeros([BLOCK_M, PACKED_HEAD_PADDED], dtype=tl.float32)
+        acc_s6 = tl.zeros([BLOCK_M, PACKED_HEAD_PADDED], dtype=tl.float32)
+        acc_s7 = tl.zeros([BLOCK_M, PACKED_HEAD_PADDED], dtype=tl.float32)
 
     context_len = seq_len - cur_batch_query_len
 
@@ -682,6 +910,8 @@ def _attn_packed(
         # Dequantize KV.  INT4 unpacks nibbles as plain uint [0..15];
         # the zero-point is applied on the score side.  INT2 unpacks
         # quartet indices and looks up Lloyd-Max centroids (N(0, 1)).
+        # INT1 unpacks 8 sign bits and expands each to ±1 — the MMSE
+        # centroid amplitude is baked into the per-(token, head) scale.
         if PACKING_FACTOR == 2:
             K_s0_u, K_s1_u = unpack_int4_nibbles(K_packed)
             K_s0 = K_s0_u.to(tl.float32)
@@ -689,7 +919,7 @@ def _attn_packed(
             V_s0_u, V_s1_u = unpack_int4_nibbles(V_packed)
             V_s0 = V_s0_u.to(tl.float32)
             V_s1 = V_s1_u.to(tl.float32)
-        else:
+        elif PACKING_FACTOR == 4:
             kc0_u, kc1_u, kc2_u, kc3_u = unpack_int2_quartet(K_packed)
             K_s0 = _lloyd_max_dequant_4(kc0_u).to(tl.float32)
             K_s1 = _lloyd_max_dequant_4(kc1_u).to(tl.float32)
@@ -700,6 +930,25 @@ def _attn_packed(
             V_s1 = _lloyd_max_dequant_4(vc1_u).to(tl.float32)
             V_s2 = _lloyd_max_dequant_4(vc2_u).to(tl.float32)
             V_s3 = _lloyd_max_dequant_4(vc3_u).to(tl.float32)
+        else:
+            kb0, kb1, kb2, kb3, kb4, kb5, kb6, kb7 = unpack_int1_octet(K_packed)
+            K_s0 = kb0.to(tl.float32) * 2.0 - 1.0
+            K_s1 = kb1.to(tl.float32) * 2.0 - 1.0
+            K_s2 = kb2.to(tl.float32) * 2.0 - 1.0
+            K_s3 = kb3.to(tl.float32) * 2.0 - 1.0
+            K_s4 = kb4.to(tl.float32) * 2.0 - 1.0
+            K_s5 = kb5.to(tl.float32) * 2.0 - 1.0
+            K_s6 = kb6.to(tl.float32) * 2.0 - 1.0
+            K_s7 = kb7.to(tl.float32) * 2.0 - 1.0
+            vb0, vb1, vb2, vb3, vb4, vb5, vb6, vb7 = unpack_int1_octet(V_packed)
+            V_s0 = vb0.to(tl.float32) * 2.0 - 1.0
+            V_s1 = vb1.to(tl.float32) * 2.0 - 1.0
+            V_s2 = vb2.to(tl.float32) * 2.0 - 1.0
+            V_s3 = vb3.to(tl.float32) * 2.0 - 1.0
+            V_s4 = vb4.to(tl.float32) * 2.0 - 1.0
+            V_s5 = vb5.to(tl.float32) * 2.0 - 1.0
+            V_s6 = vb6.to(tl.float32) * 2.0 - 1.0
+            V_s7 = vb7.to(tl.float32) * 2.0 - 1.0
 
         ks_idx = (
             physical_block_idx * stride_ks_blk
@@ -715,7 +964,8 @@ def _attn_packed(
         vs_raw = tl.load(v_scale_cache_ptr + vs_idx, mask=tile_mask, other=0)
 
         # INT4 steganographs the 4-bit zero-point in the low 4 bits of
-        # the float32 scale's mantissa.  INT2 stores a plain scale.
+        # the float32 scale's mantissa.  INT2 / INT1 store a plain
+        # scale (INT1 bakes the √(2/π) MMSE amplitude into it).
         if PACKING_FACTOR == 2:
             ks_bits = ks_raw.to(tl.int32, bitcast=True)
             k_zp = (ks_bits & 0xF).to(tl.float32)
@@ -740,19 +990,32 @@ def _attn_packed(
 
         # Score: split-dot across PACKING_FACTOR streams; fused
         # softmax_scale * per-(token, head) k_scale in one mul.  INT4
-        # subtracts the ``zp * sum(Q)`` correction term; INT2 doesn't.
+        # subtracts the ``zp * sum(Q)`` correction term; INT2 / INT1
+        # don't (symmetric around zero after Hadamard).
         S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
         if PACKING_FACTOR == 2:
             raw_dot = tl.dot(Q_s0, K_s0) + tl.dot(Q_s1, K_s1)
             S += (raw_dot - Q_sum[:, None] * k_zp[None, :]) * (
                 scale * k_token_head_scales[None, :]
             )
+        elif PACKING_FACTOR == 4:
+            raw_dot = (
+                tl.dot(Q_s0, K_s0)
+                + tl.dot(Q_s1, K_s1)
+                + tl.dot(Q_s2, K_s2)
+                + tl.dot(Q_s3, K_s3)
+            )
+            S += raw_dot * (scale * k_token_head_scales[None, :])
         else:
             raw_dot = (
                 tl.dot(Q_s0, K_s0)
                 + tl.dot(Q_s1, K_s1)
                 + tl.dot(Q_s2, K_s2)
                 + tl.dot(Q_s3, K_s3)
+                + tl.dot(Q_s4, K_s4)
+                + tl.dot(Q_s5, K_s5)
+                + tl.dot(Q_s6, K_s6)
+                + tl.dot(Q_s7, K_s7)
             )
             S += raw_dot * (scale * k_token_head_scales[None, :])
 
@@ -776,18 +1039,28 @@ def _attn_packed(
         M, L, P, alpha = softmax_step(S, M, L)
         acc_s0 = acc_s0 * alpha[:, None]
         acc_s1 = acc_s1 * alpha[:, None]
-        if PACKING_FACTOR == 4:
+        if PACKING_FACTOR == 4 or PACKING_FACTOR == 8:
             acc_s2 = acc_s2 * alpha[:, None]
             acc_s3 = acc_s3 * alpha[:, None]
+        if PACKING_FACTOR == 8:
+            acc_s4 = acc_s4 * alpha[:, None]
+            acc_s5 = acc_s5 * alpha[:, None]
+            acc_s6 = acc_s6 * alpha[:, None]
+            acc_s7 = acc_s7 * alpha[:, None]
 
         if SLIDING_WINDOW:
             qpos_lo = q_block_local_idx * BLOCK_Q
             sw_mask = (context_len + qpos_lo - seq_offset) < SLIDING_WINDOW
             V_s0 = tl.where(sw_mask[:, None], V_s0, 0.0)
             V_s1 = tl.where(sw_mask[:, None], V_s1, 0.0)
-            if PACKING_FACTOR == 4:
+            if PACKING_FACTOR == 4 or PACKING_FACTOR == 8:
                 V_s2 = tl.where(sw_mask[:, None], V_s2, 0.0)
                 V_s3 = tl.where(sw_mask[:, None], V_s3, 0.0)
+            if PACKING_FACTOR == 8:
+                V_s4 = tl.where(sw_mask[:, None], V_s4, 0.0)
+                V_s5 = tl.where(sw_mask[:, None], V_s5, 0.0)
+                V_s6 = tl.where(sw_mask[:, None], V_s6, 0.0)
+                V_s7 = tl.where(sw_mask[:, None], V_s7, 0.0)
 
         # Fuse v per-(token, head) scale into P.  INT4 also subtracts
         # the v-zero-point contribution from each stream once.
@@ -796,11 +1069,20 @@ def _attn_packed(
             Pv_zp_sum = tl.sum(P_v * v_zp[None, :], axis=1)
             acc_s0 += tl.dot(P_v, V_s0) - Pv_zp_sum[:, None]
             acc_s1 += tl.dot(P_v, V_s1) - Pv_zp_sum[:, None]
+        elif PACKING_FACTOR == 4:
+            acc_s0 += tl.dot(P_v, V_s0)
+            acc_s1 += tl.dot(P_v, V_s1)
+            acc_s2 += tl.dot(P_v, V_s2)
+            acc_s3 += tl.dot(P_v, V_s3)
         else:
             acc_s0 += tl.dot(P_v, V_s0)
             acc_s1 += tl.dot(P_v, V_s1)
             acc_s2 += tl.dot(P_v, V_s2)
             acc_s3 += tl.dot(P_v, V_s3)
+            acc_s4 += tl.dot(P_v, V_s4)
+            acc_s5 += tl.dot(P_v, V_s5)
+            acc_s6 += tl.dot(P_v, V_s6)
+            acc_s7 += tl.dot(P_v, V_s7)
 
     # -----------------------------------------------------------------
     # Epilogue.  2D writes the final output with optional FP8 clamp;
@@ -826,7 +1108,7 @@ def _attn_packed(
             acc_s1,
             mask=mask_s1[None, :] & out_mask,
         )
-        if PACKING_FACTOR == 4:
+        if PACKING_FACTOR == 4 or PACKING_FACTOR == 8:
             tl.store(
                 segm_output_ptr + segm_base + offs_s2[None, :],
                 acc_s2,
@@ -836,6 +1118,27 @@ def _attn_packed(
                 segm_output_ptr + segm_base + offs_s3[None, :],
                 acc_s3,
                 mask=mask_s3[None, :] & out_mask,
+            )
+        if PACKING_FACTOR == 8:
+            tl.store(
+                segm_output_ptr + segm_base + offs_s4[None, :],
+                acc_s4,
+                mask=mask_s4[None, :] & out_mask,
+            )
+            tl.store(
+                segm_output_ptr + segm_base + offs_s5[None, :],
+                acc_s5,
+                mask=mask_s5[None, :] & out_mask,
+            )
+            tl.store(
+                segm_output_ptr + segm_base + offs_s6[None, :],
+                acc_s6,
+                mask=mask_s6[None, :] & out_mask,
+            )
+            tl.store(
+                segm_output_ptr + segm_base + offs_s7[None, :],
+                acc_s7,
+                mask=mask_s7[None, :] & out_mask,
             )
         store_segm_reduce_scalars(
             segm_max_ptr,
@@ -853,16 +1156,26 @@ def _attn_packed(
     else:
         acc_s0 = acc_s0 / L[:, None]
         acc_s1 = acc_s1 / L[:, None]
-        if PACKING_FACTOR == 4:
+        if PACKING_FACTOR == 4 or PACKING_FACTOR == 8:
             acc_s2 = acc_s2 / L[:, None]
             acc_s3 = acc_s3 / L[:, None]
+        if PACKING_FACTOR == 8:
+            acc_s4 = acc_s4 / L[:, None]
+            acc_s5 = acc_s5 / L[:, None]
+            acc_s6 = acc_s6 / L[:, None]
+            acc_s7 = acc_s7 / L[:, None]
         if USE_FP8:
             out_s = tl.load(out_scale)
             acc_s0 = tl.clamp(acc_s0 * out_s, FP8_MIN, FP8_MAX)
             acc_s1 = tl.clamp(acc_s1 * out_s, FP8_MIN, FP8_MAX)
-            if PACKING_FACTOR == 4:
+            if PACKING_FACTOR == 4 or PACKING_FACTOR == 8:
                 acc_s2 = tl.clamp(acc_s2 * out_s, FP8_MIN, FP8_MAX)
                 acc_s3 = tl.clamp(acc_s3 * out_s, FP8_MIN, FP8_MAX)
+            if PACKING_FACTOR == 8:
+                acc_s4 = tl.clamp(acc_s4 * out_s, FP8_MIN, FP8_MAX)
+                acc_s5 = tl.clamp(acc_s5 * out_s, FP8_MIN, FP8_MAX)
+                acc_s6 = tl.clamp(acc_s6 * out_s, FP8_MIN, FP8_MAX)
+                acc_s7 = tl.clamp(acc_s7 * out_s, FP8_MIN, FP8_MAX)
         out_base = (
             query_offset_0[:, None] * output_stride_0
             + query_offset_1[:, None] * output_stride_1
@@ -877,7 +1190,7 @@ def _attn_packed(
             acc_s1,
             mask=mask_s1[None, :] & out_mask,
         )
-        if PACKING_FACTOR == 4:
+        if PACKING_FACTOR == 4 or PACKING_FACTOR == 8:
             tl.store(
                 output_ptr + out_base + offs_s2[None, :],
                 acc_s2,
@@ -887,6 +1200,27 @@ def _attn_packed(
                 output_ptr + out_base + offs_s3[None, :],
                 acc_s3,
                 mask=mask_s3[None, :] & out_mask,
+            )
+        if PACKING_FACTOR == 8:
+            tl.store(
+                output_ptr + out_base + offs_s4[None, :],
+                acc_s4,
+                mask=mask_s4[None, :] & out_mask,
+            )
+            tl.store(
+                output_ptr + out_base + offs_s5[None, :],
+                acc_s5,
+                mask=mask_s5[None, :] & out_mask,
+            )
+            tl.store(
+                output_ptr + out_base + offs_s6[None, :],
+                acc_s6,
+                mask=mask_s6[None, :] & out_mask,
+            )
+            tl.store(
+                output_ptr + out_base + offs_s7[None, :],
+                acc_s7,
+                mask=mask_s7[None, :] & out_mask,
             )
 
 
@@ -1326,5 +1660,31 @@ class Int2PerTokenHeadBackend(_PackedBackend):
         return fast_hadamard_transform(out.float())
 
 
+class Int1PerTokenHeadBackend(_PackedBackend):
+    """KV cache backend for ``KVQuantMode.INT1_PER_TOKEN_HEAD``."""
+
+    mode = KVQuantMode.INT1_PER_TOKEN_HEAD
+    packing_factor = 8  # 8 × int1 per byte
+    _reshape_kernel = _reshape_cache_int1_kernel
+
+    # Full Hadamard, same convention as INT2 (self-inverse, unnormalized
+    # Hadamard leaves a factor of ``d`` on the output side which the
+    # ``norm/d^1.5`` scale absorbs).  The MMSE sign-quant amplitude
+    # ``√(2/π)`` is baked into the stored scale so the kernel only
+    # needs ``±1`` dequant.
+    @staticmethod
+    def _rotate_kv(x: torch.Tensor) -> torch.Tensor:
+        return fast_hadamard_transform(x)
+
+    @staticmethod
+    def _rotate_q(q: torch.Tensor) -> torch.Tensor:
+        return fast_hadamard_transform(q)
+
+    @staticmethod
+    def _unrotate_out(out: torch.Tensor, head_size: int) -> torch.Tensor:
+        return fast_hadamard_transform(out.float())
+
+
 register(Int4PerTokenHeadBackend())
 register(Int2PerTokenHeadBackend())
+register(Int1PerTokenHeadBackend())

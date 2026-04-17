@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Sub-byte packing helpers shared by the INT4 and INT2 KV cache backends.
+"""Sub-byte packing helpers shared by the INT4/INT2/INT1 KV cache backends.
 
-Two helpers per layout (pack / unpack) for the INT4-nibble and INT2-quartet
-formats.  Shared by the reshape (write) and attention (read) kernels to
-prevent drift between the two sides of the cache.
+Two helpers per layout (pack / unpack) for the INT4-nibble, INT2-quartet,
+and INT1-octet formats.  Shared by the reshape (write) and attention
+(read) kernels to prevent drift between the two sides of the cache.
 
 Layouts:
 
@@ -12,6 +12,9 @@ Layouts:
   nibble = odd index.
 * **INT2**: four 2-bit values per uint8 in little-endian quartet order
   (q0 in bits ``[0:2]``, q3 in ``[6:8]``).
+* **INT1**: eight 1-bit values per uint8 in little-endian octet order
+  (b0 in bit ``0``, b7 in bit ``7``).  Each bit is a *sign code*:
+  ``0`` → ``-1``, ``1`` → ``+1``.
 """
 
 from __future__ import annotations
@@ -45,4 +48,34 @@ def unpack_int2_quartet(packed):
         (packed >> 2) & 0x3,
         (packed >> 4) & 0x3,
         (packed >> 6) & 0x3,
+    )
+
+
+@triton.jit
+def pack_int1_octet(b0, b1, b2, b3, b4, b5, b6, b7):
+    """Pack eight uint8 values (each in [0, 1]) into one byte."""
+    return (
+        (b0 & 0x1)
+        | ((b1 & 0x1) << 1)
+        | ((b2 & 0x1) << 2)
+        | ((b3 & 0x1) << 3)
+        | ((b4 & 0x1) << 4)
+        | ((b5 & 0x1) << 5)
+        | ((b6 & 0x1) << 6)
+        | ((b7 & 0x1) << 7)
+    )
+
+
+@triton.jit
+def unpack_int1_octet(packed):
+    """Split one packed byte into the (b0..b7) octet as uint8 bits."""
+    return (
+        packed & 0x1,
+        (packed >> 1) & 0x1,
+        (packed >> 2) & 0x1,
+        (packed >> 3) & 0x1,
+        (packed >> 4) & 0x1,
+        (packed >> 5) & 0x1,
+        (packed >> 6) & 0x1,
+        (packed >> 7) & 0x1,
     )

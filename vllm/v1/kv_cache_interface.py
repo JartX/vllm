@@ -40,6 +40,7 @@ class KVQuantMode(IntEnum):
     FP8_PER_TOKEN_HEAD = 3  # per-token-head dynamic scales for fp8
     INT4_PER_TOKEN_HEAD = 4  # packed 2×int4/byte, RHT + asymmetric zp
     INT2_PER_TOKEN_HEAD = 5  # Hadamard + Lloyd-Max 4 centroids, 4×int2/byte
+    INT1_PER_TOKEN_HEAD = 6  # Hadamard + sign-quant {-1,+1}, 8×int1/byte
 
     @property
     def is_per_token_head(self) -> bool:
@@ -49,6 +50,8 @@ class KVQuantMode(IntEnum):
     @property
     def packing_factor(self) -> int:
         """Number of quantized values stored per cache byte (1 unless packed)."""
+        if self == KVQuantMode.INT1_PER_TOKEN_HEAD:
+            return 8
         if self == KVQuantMode.INT2_PER_TOKEN_HEAD:
             return 4
         if self == KVQuantMode.INT4_PER_TOKEN_HEAD:
@@ -67,6 +70,8 @@ class KVQuantMode(IntEnum):
 
 def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
     """Map a ``kv_cache_dtype`` string to a :class:`KVQuantMode`."""
+    if kv_cache_dtype == "int1_per_token_head":
+        return KVQuantMode.INT1_PER_TOKEN_HEAD
     if kv_cache_dtype == "int2_per_token_head":
         return KVQuantMode.INT2_PER_TOKEN_HEAD
     if kv_cache_dtype == "int4_per_token_head":

@@ -525,15 +525,16 @@ def unified_attention(
     assert causal, "Only causal attention is supported"
     assert q_descale is None, "Q scales not supported"
 
-    # Sub-byte packed modes (INT4 / INT2) need bespoke kernels — they
-    # split the dot, look up centroids / dequantize from packed bytes,
-    # and live in their own backend modules under
+    # Sub-byte packed modes (INT4 / INT2 / INT1) need bespoke kernels —
+    # they split the dot, look up centroids / dequantize from packed
+    # bytes, and live in their own backend modules under
     # ``vllm.v1.attention.ops.triton_quant_kv``.  Everything else
     # (NONE, FP8 per-tensor, INT8 / FP8 per-token-head) goes through the
     # core kernel below via constexpr branches.
     if kv_quant_mode in (
         KVQuantMode.INT4_PER_TOKEN_HEAD,
         KVQuantMode.INT2_PER_TOKEN_HEAD,
+        KVQuantMode.INT1_PER_TOKEN_HEAD,
     ):
         from vllm.v1.attention.ops.triton_quant_kv import get_backend
 

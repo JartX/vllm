@@ -277,6 +277,7 @@ class TritonAttentionBackend(AttentionBackend):
         "fp8",
         "fp8_e4m3",
         "fp8_e5m2",
+        "int1_per_token_head",
         "int2_per_token_head",
         "int4_per_token_head",
         "int8_per_token_head",
