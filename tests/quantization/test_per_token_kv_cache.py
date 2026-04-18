@@ -761,25 +761,51 @@ def test_triton_unified_attention_per_token_head_scale(
         )
         _LM16 = torch.tensor(
             [
-                -2.7456, -2.0788, -1.6258, -1.2622,
-                -0.9469, -0.6599, -0.3899, -0.1290,
-                0.1290, 0.3899, 0.6599, 0.9469,
-                1.2622, 1.6258, 2.0788, 2.7456,
+                -2.7456,
+                -2.0788,
+                -1.6258,
+                -1.2622,
+                -0.9469,
+                -0.6599,
+                -0.3899,
+                -0.1290,
+                0.1290,
+                0.3899,
+                0.6599,
+                0.9469,
+                1.2622,
+                1.6258,
+                2.0788,
+                2.7456,
             ],
             device=device,
             dtype=torch.float32,
         )
         _LM16_BOUNDS = torch.tensor(
             [
-                -2.4008, -1.8435, -1.4371, -1.0993, -0.7996, -0.5224, -0.2582,
-                0.0, 0.2582, 0.5224, 0.7996, 1.0993, 1.4371, 1.8435, 2.4008,
+                -2.4008,
+                -1.8435,
+                -1.4371,
+                -1.0993,
+                -0.7996,
+                -0.5224,
+                -0.2582,
+                0.0,
+                0.2582,
+                0.5224,
+                0.7996,
+                1.0993,
+                1.4371,
+                1.8435,
+                2.4008,
             ],
             device=device,
             dtype=torch.float32,
         )
 
         def _packed_quantize_cache(data_bf16, *, packing_factor, lm_table, lm_bounds):
-            """Double-RHT → normalize → Lloyd-Max → pack; return (packed, scale, deq)."""
+            # Double-RHT → normalize → Lloyd-Max → pack; returns
+            # (packed, scale, dequantized-bf16-reference).
             shape = data_bf16.shape  # (B, S, H, D)
             flat = data_bf16.float().reshape(-1, shape[-1])
             rotated = _double_rht(flat).reshape(shape)
