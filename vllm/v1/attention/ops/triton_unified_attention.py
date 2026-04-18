@@ -534,6 +534,7 @@ def unified_attention(
     if kv_quant_mode in (
         KVQuantMode.INT4_PER_TOKEN_HEAD,
         KVQuantMode.INT2_PER_TOKEN_HEAD,
+        KVQuantMode.INT2_QJL_PER_TOKEN_HEAD,
     ):
         from vllm.v1.attention.ops.triton_quant_kv import get_backend
 
