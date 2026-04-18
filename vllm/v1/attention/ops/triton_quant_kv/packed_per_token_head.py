@@ -54,8 +54,7 @@ from vllm.v1.attention.ops.triton_attention_helpers import (
 )
 from vllm.v1.attention.ops.triton_quant_kv import register
 from vllm.v1.attention.ops.triton_quant_kv._hadamard import (
-    fast_hadamard_transform,
-    single_rht,
+    double_rht,
 )
 from vllm.v1.attention.ops.triton_quant_kv._pack_unpack import (
     pack_int2_quartet,
@@ -241,10 +240,11 @@ def _reshape_cache_int4_kernel(
         mask=half_offs < half_k,
     )
 
-    # See INT2 docstring: ``norm / d^1.5`` absorbs the H'H = d·I factor so
-    # the kernel can fuse softmax_scale * stored_scale in one mul without
-    # any explicit ``/d`` in unrotation.
-    k_scale = k_norm / float(head_size**1.5)
+    # ``norm_rotated / d^2.5`` absorbs the (H D₂ H D₁)⁻¹ ∘ (H D₂ H D₁) = d²·I
+    # factor of the double RHT so the kernel can fuse
+    # ``softmax_scale * stored_scale`` in one mul, with no explicit ``/d²``
+    # in unrotation.
+    k_scale = k_norm / float(head_size**2.5)
     tl.store(
         k_scale_cache_ptr
         + blk * stride_ks_blk
@@ -281,7 +281,7 @@ def _reshape_cache_int4_kernel(
         mask=half_offs < half_v,
     )
 
-    v_scale = v_norm / float(head_size_v**1.5)
+    v_scale = v_norm / float(head_size_v**2.5)
     tl.store(
         v_scale_cache_ptr
         + blk * stride_vs_blk
@@ -401,8 +401,9 @@ def _reshape_cache_int2_kernel(
         mask=qtr_offs < qtr_k,
     )
 
-    # Store norm/d^1.5 as scale; see module docstring for the math.
-    k_scale = k_norm / float(head_size**1.5)
+    # See INT4 reshape kernel: ``norm_rotated / d^2.5`` absorbs the
+    # double-RHT (H D₂ H D₁)⁻¹ ∘ (H D₂ H D₁) = d²·I factor.
+    k_scale = k_norm / float(head_size**2.5)
     tl.store(
         k_scale_cache_ptr
         + blk * stride_ks_blk
@@ -447,7 +448,7 @@ def _reshape_cache_int2_kernel(
         mask=qtr_offs < qtr_v,
     )
 
-    v_scale = v_norm / float(head_size_v**1.5)
+    v_scale = v_norm / float(head_size_v**2.5)
     tl.store(
         v_scale_cache_ptr
         + blk * stride_vs_blk
@@ -1278,21 +1279,21 @@ class Int4PerTokenHeadBackend(_PackedBackend):
     packing_factor = 2  # 2 × int4 per byte
     _reshape_kernel = _reshape_cache_int4_kernel
 
-    # RHT pre-rotation gaussianizes data → better quantization.  Same
-    # bookkeeping as INT2: the H'H = d·I factor is absorbed into the
-    # stored scale (``norm / d^1.5``), so ``softmax_scale`` is unchanged
-    # and ``_unrotate_out`` does not divide by ``head_size``.
+    # Double RHT (H D₂ H D₁) for stronger gaussianization than a single
+    # round.  Each rotation contributes ``sqrt(d)`` to the rotated norm,
+    # so the kernel stores ``norm_rotated / d^2.5`` (= ``||x|| / d^1.5``);
+    # see the reshape kernel for the algebra.
     @staticmethod
     def _rotate_kv(x: torch.Tensor) -> torch.Tensor:
-        return single_rht(x)
+        return double_rht(x)
 
     @staticmethod
     def _rotate_q(q: torch.Tensor) -> torch.Tensor:
-        return single_rht(q)
+        return double_rht(q)
 
     @staticmethod
     def _unrotate_out(out: torch.Tensor, head_size: int) -> torch.Tensor:
-        return single_rht(out.float(), inverse=True)
+        return double_rht(out.float(), inverse=True)
 
 
 class Int2PerTokenHeadBackend(_PackedBackend):
@@ -1302,20 +1303,21 @@ class Int2PerTokenHeadBackend(_PackedBackend):
     packing_factor = 4  # 4 × int2 per byte
     _reshape_kernel = _reshape_cache_int2_kernel
 
-    # Full Hadamard (no random sign).  Its own inverse — so the output
-    # rotation is identical.  No softmax_scale adjustment: the ``d^1.5``
-    # factor is absorbed into the stored scale at write time.
+    # Double RHT (H D₂ H D₁) — replaces the previous deterministic
+    # Hadamard.  With only 4 bins, residual non-Gaussianity hurts
+    # disproportionately (centroid saturation on outliers), so the extra
+    # randomization round is the highest-ROI quality lever.
     @staticmethod
     def _rotate_kv(x: torch.Tensor) -> torch.Tensor:
-        return fast_hadamard_transform(x)
+        return double_rht(x)
 
     @staticmethod
     def _rotate_q(q: torch.Tensor) -> torch.Tensor:
-        return fast_hadamard_transform(q)
+        return double_rht(q)
 
     @staticmethod
     def _unrotate_out(out: torch.Tensor, head_size: int) -> torch.Tensor:
-        return fast_hadamard_transform(out.float())
+        return double_rht(out.float(), inverse=True)
 
 
 register(Int4PerTokenHeadBackend())

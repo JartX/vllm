@@ -28,7 +28,9 @@ from vllm.utils.torch_utils import is_quantized_kv_cache
 # The implementations live in ``quant_kv._hadamard``; we re-export here so
 # the public surface stays stable.
 from vllm.v1.attention.ops.triton_quant_kv._hadamard import (  # noqa: E402, F401
+    _double_rht,
     _single_rht,
+    double_rht,
     fast_hadamard_transform,
     single_rht,
 )

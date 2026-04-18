@@ -316,53 +316,37 @@ def test_reshape_and_cache_per_token_head(
         blk = slot // block_size
         off = slot % block_size
 
-        if is_int2:
+        if is_int2 or is_int4:
             from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
-                fast_hadamard_transform,
+                _double_rht,
             )
 
             for label, data, cache, sc in [
                 ("key", key, key_cache, k_scale_cache),
                 ("val", value, value_cache, v_scale_cache),
             ]:
-                stored_scale = sc[blk, off]  # [num_heads] = norm/d^1.5
+                stored_scale = sc[blk, off]  # [num_heads] = norm/d^2.5
                 packed = cache[blk, off]  # [num_heads, cache_head_size] uint8
-                b0 = (packed & 0x3).long()
-                b1 = ((packed >> 2) & 0x3).long()
-                b2 = ((packed >> 4) & 0x3).long()
-                b3 = ((packed >> 6) & 0x3).long()
-                full = torch.zeros(
-                    num_heads, head_size, dtype=torch.float32, device="cuda"
-                )
-                full[:, 0::4] = _LM4[b0]
-                full[:, 1::4] = _LM4[b1]
-                full[:, 2::4] = _LM4[b2]
-                full[:, 3::4] = _LM4[b3]
-                # inverse_hadamard(centroids × scale) ≈ original
-                deq = fast_hadamard_transform(full * stored_scale[:, None])
-                ref_deq = data[i].float()
-                torch.testing.assert_close(deq, ref_deq, atol=deq_atol, rtol=deq_rtol)
-
-        elif is_int4:
-            from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
-                _single_rht,
-            )
-
-            for label, data, cache, sc in [
-                ("key", key, key_cache, k_scale_cache),
-                ("val", value, value_cache, v_scale_cache),
-            ]:
-                stored_scale = sc[blk, off]  # [num_heads] = norm/d^1.5
-                packed = cache[blk, off]  # [num_heads, cache_head_size] uint8
-                lo = (packed & 0xF).long()
-                hi = ((packed >> 4) & 0xF).long()
                 full = torch.zeros(
                     num_heads, head_size, dtype=torch.float32, device=packed.device
                 )
-                full[:, 0::2] = _LM16[lo]
-                full[:, 1::2] = _LM16[hi]
-                # inverse_RHT(centroids × scale) ≈ original (scale absorbs d).
-                deq = _single_rht(full * stored_scale[:, None], inverse=True)
+                if is_int2:
+                    b0 = (packed & 0x3).long()
+                    b1 = ((packed >> 2) & 0x3).long()
+                    b2 = ((packed >> 4) & 0x3).long()
+                    b3 = ((packed >> 6) & 0x3).long()
+                    full[:, 0::4] = _LM4[b0]
+                    full[:, 1::4] = _LM4[b1]
+                    full[:, 2::4] = _LM4[b2]
+                    full[:, 3::4] = _LM4[b3]
+                else:
+                    lo = (packed & 0xF).long()
+                    hi = ((packed >> 4) & 0xF).long()
+                    full[:, 0::2] = _LM16[lo]
+                    full[:, 1::2] = _LM16[hi]
+                # inverse_double_RHT(centroids × scale) ≈ original
+                # (scale absorbs the d² factor of the double rotation).
+                deq = _double_rht(full * stored_scale[:, None], inverse=True)
                 ref_deq = data[i].float()
                 torch.testing.assert_close(deq, ref_deq, atol=deq_atol, rtol=deq_rtol)
         else:
@@ -487,10 +471,10 @@ def test_per_token_head_round_trip_accuracy(
     else:
         rt_atol = 0.1
 
-    # INT2 round-trip: inverse_hadamard(centroids × scale) ≈ original
+    # INT2 round-trip: inverse_double_RHT(centroids × scale) ≈ original
     if is_int2:
         from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
-            fast_hadamard_transform,
+            _double_rht,
         )
 
         _LM4 = torch.tensor(
@@ -514,7 +498,7 @@ def test_per_token_head_round_trip_accuracy(
                 full[:, 1::4] = _LM4[b1]
                 full[:, 2::4] = _LM4[b2]
                 full[:, 3::4] = _LM4[b3]
-                deq = fast_hadamard_transform(full * stored_scale[:, None])
+                deq = _double_rht(full * stored_scale[:, None], inverse=True)
                 ref = data[i].float()
                 torch.testing.assert_close(deq, ref, atol=rt_atol, rtol=rt_atol)
     else:
@@ -530,7 +514,7 @@ def test_per_token_head_round_trip_accuracy(
                     actual_sc = sc[blk, off, h]
                     if is_int4:
                         from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (  # noqa: E501
-                            _single_rht,
+                            _double_rht,
                         )
 
                         _LM16 = torch.tensor(
@@ -563,7 +547,7 @@ def test_per_token_head_round_trip_accuracy(
                         )
                         full[0::2] = _LM16[lo]
                         full[1::2] = _LM16[hi]
-                        actual_deq = _single_rht(
+                        actual_deq = _double_rht(
                             (full * actual_sc).unsqueeze(0), inverse=True
                         ).squeeze(0)
                     else:
@@ -761,145 +745,84 @@ def test_triton_unified_attention_per_token_head_scale(
     )
     value_cache_bf16 = torch.randn_like(key_cache_bf16)
 
-    if is_int2:
-        # INT2 Hadamard + Lloyd-Max quantization reference.
+    if is_int2 or is_int4:
+        # INT2/INT4 share the same skeleton: double-RHT → norm-normalize →
+        # Lloyd-Max scalar quantize → pack.  Only the bin count and packing
+        # factor differ.
         from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
-            fast_hadamard_transform,
+            _double_rht,
         )
 
         _LM4 = torch.tensor(
             [-1.5104, -0.4528, 0.4528, 1.5104], device=device, dtype=torch.float32
         )
-
-        # Lloyd-Max quantize boundaries: [-0.9816, 0, 0.9816]
-        def _lloyd_max_quantize(z):
-            return torch.where(
-                z < 0.0,
-                torch.where(z < -0.9816, 0, 1),
-                torch.where(z < 0.9816, 2, 3),
-            ).to(torch.uint8)
-
-        def _int2_quantize_cache(data_bf16):
-            """Hadamard → normalize → Lloyd-Max → pack, return (packed, scale, deq)."""
-            # data_bf16: [num_blocks, block_size, num_kv_heads, head_size]
-            # Hadamard transform each head vector
-            shape = data_bf16.shape  # (B, S, H, D)
-            flat = data_bf16.float().reshape(-1, shape[-1])
-            had = fast_hadamard_transform(flat).reshape(shape)
-
-            # Norm and normalize to N(0,1)
-            norm = had.float().norm(dim=-1, keepdim=True).clamp(min=1e-6)
-            inv_sigma = (head_size**0.5) / norm
-            z = had.float() * inv_sigma
-
-            # Lloyd-Max quantize
-            indices = _lloyd_max_quantize(z)  # [B, S, H, D] uint8 in [0,3]
-
-            # Pack 4 × 2-bit per byte
-            i0 = indices[..., 0::4]
-            i1 = indices[..., 1::4]
-            i2 = indices[..., 2::4]
-            i3 = indices[..., 3::4]
-            packed = (
-                (i0 & 0x3) | ((i1 & 0x3) << 2) | ((i2 & 0x3) << 4) | ((i3 & 0x3) << 6)
-            )
-
-            # Scale = norm / d^1.5
-            sc = norm.squeeze(-1) / (head_size**1.5)
-
-            # Dequantized in Hadamard domain: centroids × scale
-            centroids = _LM4[indices.long()]  # [B, S, H, D] float
-            deq_had = centroids * sc[..., None]
-
-            # Inverse Hadamard to get bf16 reference
-            flat_deq = deq_had.reshape(-1, shape[-1])
-            deq = fast_hadamard_transform(flat_deq).reshape(shape)
-
-            return packed, sc.to(torch.float32), deq.to(torch.bfloat16)
-
-        key_cache_q, k_scale_cache, key_cache_deq = _int2_quantize_cache(key_cache_bf16)
-        value_cache_q, v_scale_cache, value_cache_deq = _int2_quantize_cache(
-            value_cache_bf16
+        _LM4_BOUNDS = torch.tensor(
+            [-0.9816, 0.0, 0.9816], device=device, dtype=torch.float32
         )
-
-    elif is_int4:
-        # INT4 RHT + Lloyd-Max 16-centroid quantization reference.
-        from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
-            _single_rht,
-        )
-
         _LM16 = torch.tensor(
             [
-                -2.7456,
-                -2.0788,
-                -1.6258,
-                -1.2622,
-                -0.9469,
-                -0.6599,
-                -0.3899,
-                -0.1290,
-                0.1290,
-                0.3899,
-                0.6599,
-                0.9469,
-                1.2622,
-                1.6258,
-                2.0788,
-                2.7456,
+                -2.7456, -2.0788, -1.6258, -1.2622,
+                -0.9469, -0.6599, -0.3899, -0.1290,
+                0.1290, 0.3899, 0.6599, 0.9469,
+                1.2622, 1.6258, 2.0788, 2.7456,
             ],
             device=device,
             dtype=torch.float32,
         )
-        # Lloyd-Max 16 boundaries on N(0,1); must match the kernel binary tree.
         _LM16_BOUNDS = torch.tensor(
             [
-                -2.4008,
-                -1.8435,
-                -1.4371,
-                -1.0993,
-                -0.7996,
-                -0.5224,
-                -0.2582,
-                0.0,
-                0.2582,
-                0.5224,
-                0.7996,
-                1.0993,
-                1.4371,
-                1.8435,
-                2.4008,
+                -2.4008, -1.8435, -1.4371, -1.0993, -0.7996, -0.5224, -0.2582,
+                0.0, 0.2582, 0.5224, 0.7996, 1.0993, 1.4371, 1.8435, 2.4008,
             ],
             device=device,
             dtype=torch.float32,
         )
 
-        def _int4_quantize_cache(data_bf16):
-            """RHT → normalize → Lloyd-Max 16 → pack; return (packed, scale, deq)."""
+        def _packed_quantize_cache(data_bf16, *, packing_factor, lm_table, lm_bounds):
+            """Double-RHT → normalize → Lloyd-Max → pack; return (packed, scale, deq)."""
             shape = data_bf16.shape  # (B, S, H, D)
             flat = data_bf16.float().reshape(-1, shape[-1])
-            rotated = _single_rht(flat).reshape(shape)
+            rotated = _double_rht(flat).reshape(shape)
 
             norm = rotated.float().norm(dim=-1, keepdim=True).clamp(min=1e-6)
             inv_sigma = (head_size**0.5) / norm
             z = rotated.float() * inv_sigma
 
-            indices = torch.bucketize(z, _LM16_BOUNDS).to(torch.uint8)
+            indices = torch.bucketize(z, lm_bounds).to(torch.uint8)
 
-            i0 = indices[..., 0::2]
-            i1 = indices[..., 1::2]
-            packed = (i0 & 0xF) | ((i1 & 0xF) << 4)
+            if packing_factor == 4:
+                i0 = indices[..., 0::4]
+                i1 = indices[..., 1::4]
+                i2 = indices[..., 2::4]
+                i3 = indices[..., 3::4]
+                packed = (
+                    (i0 & 0x3)
+                    | ((i1 & 0x3) << 2)
+                    | ((i2 & 0x3) << 4)
+                    | ((i3 & 0x3) << 6)
+                )
+            else:  # packing_factor == 2
+                i0 = indices[..., 0::2]
+                i1 = indices[..., 1::2]
+                packed = (i0 & 0xF) | ((i1 & 0xF) << 4)
 
-            sc = norm.squeeze(-1) / (head_size**1.5)
-
-            centroids = _LM16[indices.long()]
+            sc = norm.squeeze(-1) / (head_size**2.5)
+            centroids = lm_table[indices.long()]
             deq_rht = centroids * sc[..., None]
             flat_deq = deq_rht.reshape(-1, shape[-1])
-            deq = _single_rht(flat_deq, inverse=True).reshape(shape)
+            deq = _double_rht(flat_deq, inverse=True).reshape(shape)
             return packed, sc.to(torch.float32), deq.to(torch.bfloat16)
 
-        key_cache_q, k_scale_cache, key_cache_deq = _int4_quantize_cache(key_cache_bf16)
-        value_cache_q, v_scale_cache, value_cache_deq = _int4_quantize_cache(
-            value_cache_bf16
+        if is_int2:
+            kwargs = dict(packing_factor=4, lm_table=_LM4, lm_bounds=_LM4_BOUNDS)
+        else:
+            kwargs = dict(packing_factor=2, lm_table=_LM16, lm_bounds=_LM16_BOUNDS)
+
+        key_cache_q, k_scale_cache, key_cache_deq = _packed_quantize_cache(
+            key_cache_bf16, **kwargs
+        )
+        value_cache_q, v_scale_cache, value_cache_deq = _packed_quantize_cache(
+            value_cache_bf16, **kwargs
         )
     else:
         # Symmetric quantization for int8/fp8.
