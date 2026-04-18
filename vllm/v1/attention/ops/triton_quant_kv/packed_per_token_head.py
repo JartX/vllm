@@ -535,6 +535,20 @@ def _attn_packed(
     # (Lloyd-Max centroids).  All mode-specific branches below gate on
     # this value.
     PACKING_FACTOR: tl.constexpr,
+    # INT2_QJL residual-correction branch (see qjl_packed_per_token_head.py
+    # for the math).  When ``USE_QJL`` is true the kernel also loads
+    # ``head_size/8`` bytes of 1-bit QJL signs from the cache at offset
+    # ``QJL_BYTE_OFFSET`` of each (block, slot, head) slab, and adds
+    # ``qjl_correction_const · <Q_jl, signs>`` to the raw score dot —
+    # the bias-free residual-corrector derived from the 1-bit JL estimator
+    # E[sign(JL(r)) · JL(q)] ≈ sqrt(2/π) · ||r||·||q||/sqrt(d).
+    USE_QJL: tl.constexpr,
+    q_jl_ptr,
+    q_jl_stride_0: tl.int64,
+    q_jl_stride_1: tl.int64,
+    qjl_correction_const,
+    QJL_BYTE_OFFSET: tl.constexpr,
+    QJL_BYTE_PADDED: tl.constexpr,
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
 ):
@@ -617,6 +631,60 @@ def _attn_packed(
         Q_s3 = tl.load(
             query_ptr + q_base + offs_s3[None, :],
             mask=mask_s3[None, :] & q_mask,
+            other=0.0,
+        ).to(tl.float32)
+
+    # ``Q_jl`` loads: one stream per bit position inside the QJL sign
+    # bytes.  ``qjl_bit_offs_i = qjl_byte_offs * 8 + i`` gives the
+    # input-space coord whose QJL sign lives in bit ``i`` of byte
+    # ``qjl_byte_offs`` of the cache.  Loading as 8 parallel streams
+    # lets the tile-loop reconstruct ``<Q_jl, signs_K>`` as 8 ``tl.dot``
+    # calls of size [BLOCK_M, QJL_BYTE_PADDED] × [QJL_BYTE_PADDED, TILE_SIZE].
+    if USE_QJL:
+        qjl_byte_offs = tl.arange(0, QJL_BYTE_PADDED)
+        qjl_byte_mask = tl.where(qjl_byte_offs < HEAD_SIZE // 8, 1, 0).to(tl.int1)
+        qjl_base = (
+            query_offset_0[:, None] * q_jl_stride_0
+            + query_offset_1[:, None] * q_jl_stride_1
+        )
+        Q_jl_b0 = tl.load(
+            q_jl_ptr + qjl_base + (qjl_byte_offs * 8 + 0)[None, :],
+            mask=qjl_byte_mask[None, :] & q_mask,
+            other=0.0,
+        ).to(tl.float32)
+        Q_jl_b1 = tl.load(
+            q_jl_ptr + qjl_base + (qjl_byte_offs * 8 + 1)[None, :],
+            mask=qjl_byte_mask[None, :] & q_mask,
+            other=0.0,
+        ).to(tl.float32)
+        Q_jl_b2 = tl.load(
+            q_jl_ptr + qjl_base + (qjl_byte_offs * 8 + 2)[None, :],
+            mask=qjl_byte_mask[None, :] & q_mask,
+            other=0.0,
+        ).to(tl.float32)
+        Q_jl_b3 = tl.load(
+            q_jl_ptr + qjl_base + (qjl_byte_offs * 8 + 3)[None, :],
+            mask=qjl_byte_mask[None, :] & q_mask,
+            other=0.0,
+        ).to(tl.float32)
+        Q_jl_b4 = tl.load(
+            q_jl_ptr + qjl_base + (qjl_byte_offs * 8 + 4)[None, :],
+            mask=qjl_byte_mask[None, :] & q_mask,
+            other=0.0,
+        ).to(tl.float32)
+        Q_jl_b5 = tl.load(
+            q_jl_ptr + qjl_base + (qjl_byte_offs * 8 + 5)[None, :],
+            mask=qjl_byte_mask[None, :] & q_mask,
+            other=0.0,
+        ).to(tl.float32)
+        Q_jl_b6 = tl.load(
+            q_jl_ptr + qjl_base + (qjl_byte_offs * 8 + 6)[None, :],
+            mask=qjl_byte_mask[None, :] & q_mask,
+            other=0.0,
+        ).to(tl.float32)
+        Q_jl_b7 = tl.load(
+            q_jl_ptr + qjl_base + (qjl_byte_offs * 8 + 7)[None, :],
+            mask=qjl_byte_mask[None, :] & q_mask,
             other=0.0,
         ).to(tl.float32)
 
@@ -755,6 +823,46 @@ def _attn_packed(
         raw_dot = tl.dot(Q_s0, K_s0) + tl.dot(Q_s1, K_s1)
         if PACKING_FACTOR == 4:
             raw_dot += tl.dot(Q_s2, K_s2) + tl.dot(Q_s3, K_s3)
+
+        # INT2_QJL residual correction: load the per-(token, head) QJL
+        # sign bytes from offset ``QJL_BYTE_OFFSET`` of the head slab,
+        # unpack 8 ±1 signs per byte, dot against the 8 Q_jl streams.
+        # ``<Q_jl, b_K>`` estimates ``sqrt(d/(2/π)) · <Q_rot, r_K>``
+        # where ``r_K`` is the Lloyd-Max residual (see
+        # _qjl_correction_const for the derivation).
+        if USE_QJL:
+            qjl_k_off = (
+                physical_block_idx[None, :] * stride_k_cache_0
+                + kv_head_idx * stride_k_cache_2
+                + (QJL_BYTE_OFFSET + qjl_byte_offs)[:, None] * stride_k_cache_3
+                + slot_in_blk[None, :] * stride_k_cache_1
+            )
+            qjl_k_bytes = tl.load(
+                key_cache_ptr + qjl_k_off,
+                mask=qjl_byte_mask[:, None] & tile_mask[None, :],
+                other=0,
+            )
+            # Extract 8 sign streams from the byte, map {0, 1} → {-1, +1}.
+            s_b0 = (2.0 * ((qjl_k_bytes >> 0) & 1).to(tl.float32) - 1.0)
+            s_b1 = (2.0 * ((qjl_k_bytes >> 1) & 1).to(tl.float32) - 1.0)
+            s_b2 = (2.0 * ((qjl_k_bytes >> 2) & 1).to(tl.float32) - 1.0)
+            s_b3 = (2.0 * ((qjl_k_bytes >> 3) & 1).to(tl.float32) - 1.0)
+            s_b4 = (2.0 * ((qjl_k_bytes >> 4) & 1).to(tl.float32) - 1.0)
+            s_b5 = (2.0 * ((qjl_k_bytes >> 5) & 1).to(tl.float32) - 1.0)
+            s_b6 = (2.0 * ((qjl_k_bytes >> 6) & 1).to(tl.float32) - 1.0)
+            s_b7 = (2.0 * ((qjl_k_bytes >> 7) & 1).to(tl.float32) - 1.0)
+            qjl_dot = (
+                tl.dot(Q_jl_b0, s_b0)
+                + tl.dot(Q_jl_b1, s_b1)
+                + tl.dot(Q_jl_b2, s_b2)
+                + tl.dot(Q_jl_b3, s_b3)
+                + tl.dot(Q_jl_b4, s_b4)
+                + tl.dot(Q_jl_b5, s_b5)
+                + tl.dot(Q_jl_b6, s_b6)
+                + tl.dot(Q_jl_b7, s_b7)
+            )
+            raw_dot += qjl_dot * qjl_correction_const
+
         S += raw_dot * (scale * k_token_head_scales[None, :])
 
         if USE_SOFTCAP:
@@ -919,6 +1027,11 @@ def _launch_packed_attn(
     softmax_segm_max,
     softmax_segm_expsum,
     packing_factor: int,
+    # QJL residual correction (INT2_QJL only).  When ``q_jl`` is None the
+    # kernel skips the QJL branch and these args act as placeholders.
+    q_jl: torch.Tensor | None = None,
+    qjl_correction_const: float = 0.0,
+    qjl_byte_offset: int = 0,
 ):
     """Launch ``_attn_packed`` for one of the sub-byte modes.
 
@@ -987,6 +1100,17 @@ def _launch_packed_attn(
         grid = (total_num_q_blocks, num_kv_heads)
         tile_size = TILE_SIZE_PREFILL
 
+    use_qjl = q_jl is not None
+    # When QJL is disabled we still need a non-null pointer + valid stride
+    # for Triton.  Reuse ``q`` as the placeholder; ``USE_QJL=False`` gates
+    # every load below so nothing is actually read from it.
+    q_jl_ptr_arg = q_jl if use_qjl else q
+    q_jl_stride_0 = q_jl.stride(0) if use_qjl else q.stride(0)
+    q_jl_stride_1 = q_jl.stride(1) if use_qjl else q.stride(1)
+    qjl_byte_padded = (
+        triton.next_power_of_2(max(head_size // 8, 1)) if use_qjl else 1
+    )
+
     _attn_packed[grid](
         output_ptr=out,
         segm_output_ptr=segm_output_ptr,
@@ -1049,6 +1173,13 @@ def _launch_packed_attn(
         USE_FP8=output_scale is not None,
         IS_3D=use_3d,
         PACKING_FACTOR=packing_factor,
+        USE_QJL=use_qjl,
+        q_jl_ptr=q_jl_ptr_arg,
+        q_jl_stride_0=q_jl_stride_0,
+        q_jl_stride_1=q_jl_stride_1,
+        qjl_correction_const=qjl_correction_const,
+        QJL_BYTE_OFFSET=qjl_byte_offset,
+        QJL_BYTE_PADDED=qjl_byte_padded,
     )
 
     if use_3d:

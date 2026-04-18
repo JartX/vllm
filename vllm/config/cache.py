@@ -25,6 +25,7 @@ CacheDType = Literal[
     "fp8_inc",
     "fp8_ds_mla",
     "int2_per_token_head",
+    "int2_qjl_per_token_head",
     "int4_per_token_head",
     "turboquant_k8v4",
     "turboquant_4bit_nc",

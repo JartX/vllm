@@ -259,3 +259,22 @@ def double_rht(x: torch.Tensor, inverse: bool = False) -> torch.Tensor:
 # Backwards-compat alias (was a private name in the old location).
 _single_rht = single_rht
 _double_rht = double_rht
+
+
+# ---------------------------------------------------------------------------
+# Hadamard-JL projection (used by INT2_QJL residual estimator)
+# ---------------------------------------------------------------------------
+def qjl_project(x: torch.Tensor) -> torch.Tensor:
+    """Hadamard-JL projection: H · D_jl · x with an independent sign vector.
+
+    Seed ``round_idx=2`` so the sign vector is statistically independent
+    from the two used by :func:`double_rht` (seeds 0 and 1).  The output
+    is a JL-embedding of ``x``; we only keep ``sign(output)`` per coord
+    for the INT2_QJL 1-bit residual estimator.
+
+    Forward only — no inverse is needed.  Forward norm: ``||H D_jl x||²
+    = d · ||x||²`` (single-round RHT).
+    """
+    d = x.shape[-1]
+    d_jl = _get_rht_signs(d, 2, x.device)
+    return fast_hadamard_transform(x * d_jl)

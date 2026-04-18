@@ -41,6 +41,7 @@ class KVQuantMode(IntEnum):
     INT4_PER_TOKEN_HEAD = 4  # packed 2×int4/byte, RHT + asymmetric zp
     INT2_PER_TOKEN_HEAD = 5  # Hadamard + Lloyd-Max 4 centroids, 4×int2/byte
     NVFP4 = 6  # packed fp4 data + fp8 block scales
+    INT2_QJL_PER_TOKEN_HEAD = 7  # INT2 Lloyd-Max + 1-bit QJL residual sign
 
     @property
     def is_per_token_head(self) -> bool:
@@ -50,6 +51,7 @@ class KVQuantMode(IntEnum):
             KVQuantMode.FP8_PER_TOKEN_HEAD,
             KVQuantMode.INT4_PER_TOKEN_HEAD,
             KVQuantMode.INT2_PER_TOKEN_HEAD,
+            KVQuantMode.INT2_QJL_PER_TOKEN_HEAD,
         )
 
     @property
@@ -60,26 +62,43 @@ class KVQuantMode(IntEnum):
     @property
     def packing_factor(self) -> int:
         """Number of quantized values stored per cache byte (1 unless packed)."""
-        if self == KVQuantMode.INT2_PER_TOKEN_HEAD:
+        if self in (
+            KVQuantMode.INT2_PER_TOKEN_HEAD,
+            KVQuantMode.INT2_QJL_PER_TOKEN_HEAD,
+        ):
             return 4
         if self == KVQuantMode.INT4_PER_TOKEN_HEAD:
             return 2
         return 1
 
     def packed_head_size(self, head_size: int) -> int:
-        """Storage head size after packing: ``head_size // packing_factor``."""
+        """Storage head size after packing.
+
+        For most modes this is ``head_size // packing_factor``.  INT2_QJL
+        also stores a 1-bit QJL sign per coord, adding ``head_size // 8``
+        bytes to the per-head cache slot.
+        """
         factor = self.packing_factor
         assert head_size % factor == 0, (
             f"head_size={head_size} is not divisible by packing factor "
             f"{factor} required by {self.name}"
         )
-        return head_size // factor
+        base = head_size // factor
+        if self == KVQuantMode.INT2_QJL_PER_TOKEN_HEAD:
+            assert head_size % 8 == 0, (
+                f"head_size={head_size} must be a multiple of 8 for "
+                f"{self.name} (8 QJL sign bits per byte)"
+            )
+            return base + head_size // 8
+        return base
 
 
 def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
     """Map a ``kv_cache_dtype`` string to a :class:`KVQuantMode`."""
     if kv_cache_dtype == "int2_per_token_head":
         return KVQuantMode.INT2_PER_TOKEN_HEAD
+    if kv_cache_dtype == "int2_qjl_per_token_head":
+        return KVQuantMode.INT2_QJL_PER_TOKEN_HEAD
     if kv_cache_dtype == "int4_per_token_head":
         return KVQuantMode.INT4_PER_TOKEN_HEAD
     if kv_cache_dtype == "int8_per_token_head":

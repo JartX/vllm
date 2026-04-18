@@ -143,6 +143,9 @@ class TestIsQuantizedKvCache:
     def test_int2_per_token_head(self):
         assert is_quantized_kv_cache("int2_per_token_head")
 
+    def test_int2_qjl_per_token_head(self):
+        assert is_quantized_kv_cache("int2_qjl_per_token_head")
+
     def test_int4_per_token_head(self):
         assert is_quantized_kv_cache("int4_per_token_head")
 
@@ -163,6 +166,14 @@ class TestIsQuantizedKvCache:
 
         assert (
             get_kv_quant_mode("int2_per_token_head") == KVQuantMode.INT2_PER_TOKEN_HEAD
+        )
+
+    def test_kv_quant_mode_int2_qjl(self):
+        from vllm.v1.kv_cache_interface import get_kv_quant_mode
+
+        assert (
+            get_kv_quant_mode("int2_qjl_per_token_head")
+            == KVQuantMode.INT2_QJL_PER_TOKEN_HEAD
         )
 
     def test_kv_quant_mode_int4(self):
@@ -374,6 +385,128 @@ def test_reshape_and_cache_per_token_head(
             )
             torch.testing.assert_close(
                 v_scale_cache[blk, off], ref_v_scales[i], atol=1e-4, rtol=1e-3
+            )
+
+
+# ===========================================================================
+# 2b. INT2_QJL reshape-and-cache + round-trip
+# ===========================================================================
+# Dedicated test rather than a parametrize entry: INT2_QJL uses the plain
+# INT2 LM4 data layout plus a QJL sign-bit section, so the existing
+# INT2/INT4 test bodies would need slicing everywhere.  A single focused
+# test keeps the rest of the file unchanged while covering:
+#   * the Python+Triton store path (``Int2QJLPerTokenHeadBackend``)
+#   * the LM4 data section reads back correctly
+#   * the QJL sign byte section decodes to matching ±1 values
+
+
+@pytest.mark.parametrize("num_tokens", [1, 7, 16])
+@pytest.mark.parametrize("num_heads", [4])
+@pytest.mark.parametrize("head_size", [64, 128])
+@pytest.mark.parametrize("block_size", [16])
+@pytest.mark.parametrize("seed", [0])
+@torch.inference_mode()
+def test_reshape_and_cache_int2_qjl(
+    num_tokens: int,
+    num_heads: int,
+    head_size: int,
+    block_size: int,
+    seed: int,
+):
+    """Round-trip INT2_QJL: verify LM4 nibbles + QJL sign bits decode back."""
+    import math
+
+    from vllm.v1.attention.ops.triton_quant_kv._hadamard import (
+        double_rht,
+        qjl_project,
+    )
+    from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
+        triton_reshape_and_cache_flash_per_token_head_quant,
+    )
+
+    set_random_seed(seed)
+    torch.set_default_device(DEVICE_TYPE)
+    device = "cuda"
+
+    data_bytes = head_size // 4
+    qjl_bytes = head_size // 8
+    cache_head_size = data_bytes + qjl_bytes
+    num_blocks = (num_tokens + block_size - 1) // block_size + 4
+
+    key = torch.randn(
+        num_tokens, num_heads, head_size, dtype=torch.bfloat16, device=device
+    )
+    value = torch.randn(
+        num_tokens, num_heads, head_size, dtype=torch.bfloat16, device=device
+    )
+
+    key_cache = torch.zeros(
+        num_blocks, block_size, num_heads, cache_head_size,
+        dtype=torch.uint8, device=device,
+    )
+    value_cache = torch.zeros_like(key_cache)
+    k_scale_cache = torch.ones(
+        num_blocks, block_size, num_heads, dtype=torch.float32, device=device
+    )
+    v_scale_cache = torch.ones_like(k_scale_cache)
+
+    num_slots = block_size * num_blocks
+    slot_mapping = torch.tensor(
+        random.sample(range(num_slots), num_tokens), dtype=torch.long, device=device
+    )
+
+    triton_reshape_and_cache_flash_per_token_head_quant(
+        key, value, key_cache, value_cache, k_scale_cache, v_scale_cache,
+        slot_mapping, kv_quant_mode=KVQuantMode.INT2_QJL_PER_TOKEN_HEAD,
+    )
+
+    _LM4 = torch.tensor(
+        [-1.5104, -0.4528, 0.4528, 1.5104], device=device, dtype=torch.float32
+    )
+    _LM4_BOUNDS = torch.tensor([-0.9816, 0.0, 0.9816], device=device)
+
+    for i, slot in enumerate(slot_mapping.tolist()):
+        blk = slot // block_size
+        off = slot % block_size
+        for data, cache, sc in [
+            (key, key_cache, k_scale_cache),
+            (value, value_cache, v_scale_cache),
+        ]:
+            stored_scale = sc[blk, off]  # [num_heads]
+            packed_full = cache[blk, off]  # [num_heads, cache_head_size]
+            data_pack = packed_full[:, :data_bytes]
+            qjl_pack = packed_full[:, data_bytes:]
+
+            # LM4 centroid decode (first head_size/4 bytes, 2 bits each).
+            b0 = (data_pack & 0x3).long()
+            b1 = ((data_pack >> 2) & 0x3).long()
+            b2 = ((data_pack >> 4) & 0x3).long()
+            b3 = ((data_pack >> 6) & 0x3).long()
+            full = torch.zeros(num_heads, head_size, device=device)
+            full[:, 0::4] = _LM4[b0]
+            full[:, 1::4] = _LM4[b1]
+            full[:, 2::4] = _LM4[b2]
+            full[:, 3::4] = _LM4[b3]
+            deq = double_rht(full * stored_scale[:, None], inverse=True)
+            torch.testing.assert_close(deq, data[i].float(), atol=1.5, rtol=1.5)
+
+            # QJL sign decode: the stored bit ``b`` must equal
+            # ``sign(qjl_project(z - centroid))`` where ``z`` is the
+            # rotated unit-Gaussian K/V and ``centroid`` is the LM4 bin
+            # centroid from the data section.
+            rotated = double_rht(data[i].float())
+            norm = rotated.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+            z = rotated * (math.sqrt(head_size) / norm)
+            idx = torch.bucketize(z, _LM4_BOUNDS).long()
+            residual = z - _LM4[idx]
+            expected_signs = (qjl_project(residual) > 0).to(torch.uint8)
+
+            # Unpack stored signs (little-endian per byte).
+            stored_bits = torch.stack(
+                [(qjl_pack >> i) & 1 for i in range(8)], dim=-1
+            ).reshape(num_heads, head_size).to(torch.uint8)
+            assert torch.equal(stored_bits, expected_signs), (
+                "QJL sign bits mismatch between reference and stored cache"
             )
 
 
