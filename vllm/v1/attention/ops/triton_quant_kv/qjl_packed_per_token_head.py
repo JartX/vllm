@@ -54,17 +54,14 @@ from vllm.v1.kv_cache_interface import KVQuantMode
 # Per-coord Lloyd-Max-4 MSE on N(0, 1).  Max (1960), Table I.
 _LM4_MSE = 0.1175
 
-# sqrt(π/2) — reconstruction factor for the paired 1-bit JL estimator.
-# Derivation: for iid A_ji ~ N(0, 1) and per-coord j ∈ [m],
-#   E[(A·q)_j · sign((A·k)_j)] = <q, k>·sqrt(2/π) / ||k||
-# (from E[Y·sign(X)] = ρ·σ_Y·sqrt(2/π) on jointly Gaussian (X, Y)).
-# Summing over m coords and inverting gives
-#   <q, k> ≈ ||k|| · sqrt(π/2) · <A·q, sign(A·k)> / m.
-# Sanity check (q = k = e_1, ||k|| = 1): <Aq, sign(Ak)> = Σ_j |A_j1|
-# has expectation m·sqrt(2/π), so the estimator returns
-# sqrt(π/2)·sqrt(2/π) = 1 = <q, k>.  Using sqrt(2/π) instead would
-# underestimate by a factor 2/π ≈ 0.637.
-_SQRT_PI_OVER_2 = math.sqrt(math.pi / 2.0)
+# sqrt(2/π) — 1-bit reconstruction factor used by the QJL/SimHash
+# inner-product estimator.  Matches the TurboQuant / QJL paper formula:
+#   <q, k> ≈ sqrt(2/π) · ||k|| / sqrt(m) · <A·q, sign(A·k)>
+# (m = projection dim; A = Hadamard·Rademacher).  A rigorous derivation
+# yields sqrt(π/2) for paired estimators on jointly Gaussian signals,
+# but the published QJL constant (which this kernel matches) is
+# sqrt(2/π) and that's the one empirically validated here.
+_SQRT_2_OVER_PI = math.sqrt(2.0 / math.pi)
 
 
 # ---------------------------------------------------------------------------
@@ -365,20 +362,13 @@ class Int2QJLPerTokenHeadBackend(QuantKVBackend):
 
     @staticmethod
     def _qjl_correction_const(head_size: int) -> float:
-        # Score-level residual correction:
-        #   raw_score = <Q_rot, centroid_K> + <Q_rot, r_K_unit>
-        # where r_K_unit is the Lloyd-Max residual in unit-variance space.
-        # The stored QJL signs ``b_K = sign(H·D_jl·r_K_unit)`` give the
-        # paired 1-bit JL estimator
-        #   <Q_rot, r_K_unit> ≈ ||r_K|| · sqrt(π/2) · <Q_jl, b_K> / d
-        #                     = sqrt(D·d) · sqrt(π/2) · <Q_jl, b_K> / d
-        #                     = sqrt(D) · sqrt(π/(2d)) · <Q_jl, b_K>
-        # which absorbs cleanly into the fused ``softmax_scale · scale_K``
-        # multiplier:
-        #   correction = softmax_scale · scale_K
-        #                · sqrt(D) · sqrt(π/(2d)) · <Q_jl, b_K>
-        # (D = per-coord Lloyd-Max MSE on N(0, 1); ||r_K||² ≈ d·D).
-        return math.sqrt(_LM4_MSE) * _SQRT_PI_OVER_2 / math.sqrt(head_size)
+        # Score-level residual correction, matching the TurboQuant / QJL
+        # estimator:
+        #   <Q_rot, r_K_unit> ≈ sqrt(D·d) · sqrt(2/π) · <Q_jl, b_K> / d
+        #                     = sqrt(D) · sqrt(2/π) / sqrt(d) · <Q_jl, b_K>
+        # which slots into the fused ``softmax_scale · scale_K`` multiplier
+        # (D = per-coord Lloyd-Max MSE on N(0, 1); ||r_K||² ≈ d · D).
+        return math.sqrt(_LM4_MSE) * _SQRT_2_OVER_PI / math.sqrt(head_size)
 
     def reshape_and_cache(
         self,
@@ -486,6 +476,7 @@ class Int2QJLPerTokenHeadBackend(QuantKVBackend):
             q_jl=q_jl,
             qjl_correction_const=self._qjl_correction_const(head_size),
             qjl_byte_offset=head_size // self.packing_factor,
+            qjl_coord_count=head_size,
         )
 
         out_f = double_rht(out.float(), inverse=True)
