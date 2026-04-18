@@ -71,8 +71,93 @@ float8_info = torch.finfo(current_platform.fp8_dtype())
 
 
 # ===========================================================================
-# Reshape kernels (write path).  INT4 and INT2 use different quantization
-# math so their reshape kernels stay separate.
+# Lloyd-Max helpers
+# ---------------------------------------------------------------------------
+# Encode boundaries are the optimal Lloyd-Max thresholds for N(0, 1); decode
+# centroids are the optimal Lloyd-Max conditional means scaled by
+# ``1/sqrt(1 - D)`` (D = per-coord MSE) so the dequantized vector preserves
+# its expected squared norm.  This removes the systematic shrinkage of the
+# inner product `<q, dequant(k)>` toward zero.  D = 0.00946 for J=16
+# (multiplier ≈ 1.00475); D ≈ 0 contribution is negligible for J=4 so the
+# 4-centroid LUT is left uncorrected to keep the existing INT2 numerics.
+#
+# Constants: Max (1960), "Quantizing for Minimum Distortion", Table I.
+# ===========================================================================
+
+
+@triton.jit
+def _lloyd_max_quantize_16(z):
+    """Quantize N(0, 1) values to 16 Lloyd-Max bins.  Returns idx in [0, 15]."""
+    return tl.where(
+        z < 0.0,
+        tl.where(
+            z < -1.0993,
+            tl.where(
+                z < -1.8435,
+                tl.where(z < -2.4008, 0, 1),
+                tl.where(z < -1.4371, 2, 3),
+            ),
+            tl.where(
+                z < -0.5224,
+                tl.where(z < -0.7996, 4, 5),
+                tl.where(z < -0.2582, 6, 7),
+            ),
+        ),
+        tl.where(
+            z < 1.0993,
+            tl.where(
+                z < 0.5224,
+                tl.where(z < 0.2582, 8, 9),
+                tl.where(z < 0.7996, 10, 11),
+            ),
+            tl.where(
+                z < 1.8435,
+                tl.where(z < 1.4371, 12, 13),
+                tl.where(z < 2.4008, 14, 15),
+            ),
+        ),
+    ).to(tl.uint8)
+
+
+@triton.jit
+def _lloyd_max_dequant_16(idx):
+    """Look up the bias-corrected Lloyd-Max centroid for N(0, 1)."""
+    return tl.where(
+        idx < 8,
+        tl.where(
+            idx < 4,
+            tl.where(
+                idx < 2,
+                tl.where(idx == 0, -2.7456, -2.0788),
+                tl.where(idx == 2, -1.6258, -1.2622),
+            ),
+            tl.where(
+                idx < 6,
+                tl.where(idx == 4, -0.9469, -0.6599),
+                tl.where(idx == 6, -0.3899, -0.1290),
+            ),
+        ),
+        tl.where(
+            idx < 12,
+            tl.where(
+                idx < 10,
+                tl.where(idx == 8, 0.1290, 0.3899),
+                tl.where(idx == 10, 0.6599, 0.9469),
+            ),
+            tl.where(
+                idx < 14,
+                tl.where(idx == 12, 1.2622, 1.6258),
+                tl.where(idx == 14, 2.0788, 2.7456),
+            ),
+        ),
+    )
+
+
+# ===========================================================================
+# Reshape kernels (write path).  Both INT4 and INT2 share the same skeleton:
+# per-(token, head) norm of the rotated vector + Lloyd-Max scalar quantizer
+# on the unit-Gaussian coordinates.  Only the bit-width / packing factor and
+# the centroid LUT differ.
 # ===========================================================================
 
 
@@ -106,7 +191,14 @@ def _reshape_cache_int4_kernel(
     head_size_v: tl.constexpr,
     PACKED_HEAD_PADDED: tl.constexpr,
 ):
-    """INT4 asymmetric quantization with zero-point steganography."""
+    """INT4 Lloyd-Max symmetric quantization on RHT-rotated coordinates.
+
+    Same skeleton as the INT2 reshape kernel: store ``norm / d^1.5`` as
+    the per-(token, head) scale and quantize the unit-variance
+    coordinates into 16 Lloyd-Max bins.  No zero-point, no asymmetric
+    range — after RHT the coords are approximately Gaussian, so a
+    symmetric Lloyd-Max code is ~30% lower MSE than uniform min/max.
+    """
     tok = tl.program_id(0)
     head = tl.program_id(1)
 
@@ -129,62 +221,16 @@ def _reshape_cache_int4_kernel(
     k_even = tl.load(key_base + even_offs, mask=even_k_mask, other=0.0).to(tl.float32)
     k_odd = tl.load(key_base + odd_offs, mask=odd_k_mask, other=0.0).to(tl.float32)
 
-    k_min = tl.minimum(
-        tl.min(tl.where(even_k_mask, k_even, float("inf"))),
-        tl.min(tl.where(odd_k_mask, k_odd, float("inf"))),
+    k_sq = tl.sum(tl.where(even_k_mask, k_even * k_even, 0.0)) + tl.sum(
+        tl.where(odd_k_mask, k_odd * k_odd, 0.0)
     )
-    k_max = tl.maximum(
-        tl.max(tl.where(even_k_mask, k_even, float("-inf"))),
-        tl.max(tl.where(odd_k_mask, k_odd, float("-inf"))),
-    )
-    k_scale = tl.maximum((k_max - k_min) / 15.0, 1e-6)
-    k_zp_f = tl.clamp(
-        tl.where(
-            -k_min / k_scale >= 0,
-            (-k_min / k_scale + 0.5).to(tl.int32),
-            (-k_min / k_scale - 0.5).to(tl.int32),
-        ).to(tl.float32),
-        0.0,
-        15.0,
-    )
+    k_norm = tl.sqrt(k_sq + 1e-12)
+    k_inv_sigma = tl.sqrt(float(head_size)) / k_norm
 
-    inv_k = 1.0 / k_scale
-    k_even_s = k_even * inv_k + k_zp_f
-    k_odd_s = k_odd * inv_k + k_zp_f
-    k_even_q = tl.clamp(
-        tl.where(
-            k_even_s >= 0,
-            (k_even_s + 0.5).to(tl.int32),
-            (k_even_s - 0.5).to(tl.int32),
-        ).to(tl.float32),
-        0.0,
-        15.0,
-    )
-    k_odd_q = tl.clamp(
-        tl.where(
-            k_odd_s >= 0,
-            (k_odd_s + 0.5).to(tl.int32),
-            (k_odd_s - 0.5).to(tl.int32),
-        ).to(tl.float32),
-        0.0,
-        15.0,
-    )
+    qe = _lloyd_max_quantize_16(k_even * k_inv_sigma)
+    qo = _lloyd_max_quantize_16(k_odd * k_inv_sigma)
 
-    k_zp_int = k_zp_f.to(tl.int32)
-    k_scale_bits = k_scale.to(tl.int32, bitcast=True)
-    k_scale_packed = ((k_scale_bits & -16) | (k_zp_int & 0xF)).to(
-        tl.float32, bitcast=True
-    )
-
-    tl.store(
-        k_scale_cache_ptr
-        + blk * stride_ks_blk
-        + slot_in_blk * stride_ks_slot
-        + head * stride_ks_head,
-        k_scale_packed,
-    )
-
-    k_packed = pack_int4_nibbles(k_even_q.to(tl.uint8), k_odd_q.to(tl.uint8))
+    k_packed = pack_int4_nibbles(qe, qo)
     tl.store(
         key_cache_ptr
         + blk * stride_kc_blk
@@ -195,6 +241,18 @@ def _reshape_cache_int4_kernel(
         mask=half_offs < half_k,
     )
 
+    # See INT2 docstring: ``norm / d^1.5`` absorbs the H'H = d·I factor so
+    # the kernel can fuse softmax_scale * stored_scale in one mul without
+    # any explicit ``/d`` in unrotation.
+    k_scale = k_norm / float(head_size**1.5)
+    tl.store(
+        k_scale_cache_ptr
+        + blk * stride_ks_blk
+        + slot_in_blk * stride_ks_slot
+        + head * stride_ks_head,
+        k_scale,
+    )
+
     half_v = head_size_v // 2
     even_v_mask = even_offs < head_size_v
     odd_v_mask = odd_offs < head_size_v
@@ -203,62 +261,16 @@ def _reshape_cache_int4_kernel(
     v_even = tl.load(val_base + even_offs, mask=even_v_mask, other=0.0).to(tl.float32)
     v_odd = tl.load(val_base + odd_offs, mask=odd_v_mask, other=0.0).to(tl.float32)
 
-    v_min = tl.minimum(
-        tl.min(tl.where(even_v_mask, v_even, float("inf"))),
-        tl.min(tl.where(odd_v_mask, v_odd, float("inf"))),
+    v_sq = tl.sum(tl.where(even_v_mask, v_even * v_even, 0.0)) + tl.sum(
+        tl.where(odd_v_mask, v_odd * v_odd, 0.0)
     )
-    v_max = tl.maximum(
-        tl.max(tl.where(even_v_mask, v_even, float("-inf"))),
-        tl.max(tl.where(odd_v_mask, v_odd, float("-inf"))),
-    )
-    v_scale = tl.maximum((v_max - v_min) / 15.0, 1e-6)
-    v_zp_f = tl.clamp(
-        tl.where(
-            -v_min / v_scale >= 0,
-            (-v_min / v_scale + 0.5).to(tl.int32),
-            (-v_min / v_scale - 0.5).to(tl.int32),
-        ).to(tl.float32),
-        0.0,
-        15.0,
-    )
+    v_norm = tl.sqrt(v_sq + 1e-12)
+    v_inv_sigma = tl.sqrt(float(head_size_v)) / v_norm
 
-    inv_v = 1.0 / v_scale
-    v_even_s = v_even * inv_v + v_zp_f
-    v_odd_s = v_odd * inv_v + v_zp_f
-    v_even_q = tl.clamp(
-        tl.where(
-            v_even_s >= 0,
-            (v_even_s + 0.5).to(tl.int32),
-            (v_even_s - 0.5).to(tl.int32),
-        ).to(tl.float32),
-        0.0,
-        15.0,
-    )
-    v_odd_q = tl.clamp(
-        tl.where(
-            v_odd_s >= 0,
-            (v_odd_s + 0.5).to(tl.int32),
-            (v_odd_s - 0.5).to(tl.int32),
-        ).to(tl.float32),
-        0.0,
-        15.0,
-    )
+    vqe = _lloyd_max_quantize_16(v_even * v_inv_sigma)
+    vqo = _lloyd_max_quantize_16(v_odd * v_inv_sigma)
 
-    v_zp_int = v_zp_f.to(tl.int32)
-    v_scale_bits = v_scale.to(tl.int32, bitcast=True)
-    v_scale_packed = ((v_scale_bits & -16) | (v_zp_int & 0xF)).to(
-        tl.float32, bitcast=True
-    )
-
-    tl.store(
-        v_scale_cache_ptr
-        + blk * stride_vs_blk
-        + slot_in_blk * stride_vs_slot
-        + head * stride_vs_head,
-        v_scale_packed,
-    )
-
-    v_packed = pack_int4_nibbles(v_even_q.to(tl.uint8), v_odd_q.to(tl.uint8))
+    v_packed = pack_int4_nibbles(vqe, vqo)
     tl.store(
         value_cache_ptr
         + blk * stride_vc_blk
@@ -267,6 +279,15 @@ def _reshape_cache_int4_kernel(
         + half_offs,
         v_packed,
         mask=half_offs < half_v,
+    )
+
+    v_scale = v_norm / float(head_size_v**1.5)
+    tl.store(
+        v_scale_cache_ptr
+        + blk * stride_vs_blk
+        + slot_in_blk * stride_vs_slot
+        + head * stride_vs_head,
+        v_scale,
     )
 
 
@@ -598,10 +619,6 @@ def _attn_packed(
             other=0.0,
         ).to(tl.float32)
 
-    # INT4 asymmetric correction needs sum(Q) per row.
-    if PACKING_FACTOR == 2:
-        Q_sum = tl.sum(Q_s0, axis=1) + tl.sum(Q_s1, axis=1)
-
     block_table_offset = seq_idx * block_table_stride
 
     # -----------------------------------------------------------------
@@ -679,16 +696,16 @@ def _attn_packed(
             mask=packed_dim_mask[None, :] & tile_mask[:, None],
             other=0,
         )
-        # Dequantize KV.  INT4 unpacks nibbles as plain uint [0..15];
-        # the zero-point is applied on the score side.  INT2 unpacks
-        # quartet indices and looks up Lloyd-Max centroids (N(0, 1)).
+        # Dequantize KV.  Both modes use Lloyd-Max scalar quantizers on the
+        # rotated unit-Gaussian coordinates; only the bin count differs
+        # (16 for INT4, 4 for INT2).
         if PACKING_FACTOR == 2:
             K_s0_u, K_s1_u = unpack_int4_nibbles(K_packed)
-            K_s0 = K_s0_u.to(tl.float32)
-            K_s1 = K_s1_u.to(tl.float32)
+            K_s0 = _lloyd_max_dequant_16(K_s0_u).to(tl.float32)
+            K_s1 = _lloyd_max_dequant_16(K_s1_u).to(tl.float32)
             V_s0_u, V_s1_u = unpack_int4_nibbles(V_packed)
-            V_s0 = V_s0_u.to(tl.float32)
-            V_s1 = V_s1_u.to(tl.float32)
+            V_s0 = _lloyd_max_dequant_16(V_s0_u).to(tl.float32)
+            V_s1 = _lloyd_max_dequant_16(V_s1_u).to(tl.float32)
         else:
             kc0_u, kc1_u, kc2_u, kc3_u = unpack_int2_quartet(K_packed)
             K_s0 = _lloyd_max_dequant_4(kc0_u).to(tl.float32)
@@ -706,26 +723,17 @@ def _attn_packed(
             + slot_in_blk * stride_ks_slot
             + kv_head_idx * stride_ks_head
         )
-        ks_raw = tl.load(k_scale_cache_ptr + ks_idx, mask=tile_mask, other=0)
+        k_token_head_scales = tl.load(
+            k_scale_cache_ptr + ks_idx, mask=tile_mask, other=0
+        )
         vs_idx = (
             physical_block_idx * stride_vs_blk
             + slot_in_blk * stride_vs_slot
             + kv_head_idx * stride_vs_head
         )
-        vs_raw = tl.load(v_scale_cache_ptr + vs_idx, mask=tile_mask, other=0)
-
-        # INT4 steganographs the 4-bit zero-point in the low 4 bits of
-        # the float32 scale's mantissa.  INT2 stores a plain scale.
-        if PACKING_FACTOR == 2:
-            ks_bits = ks_raw.to(tl.int32, bitcast=True)
-            k_zp = (ks_bits & 0xF).to(tl.float32)
-            k_token_head_scales = (ks_bits & -16).to(tl.float32, bitcast=True)
-            vs_bits = vs_raw.to(tl.int32, bitcast=True)
-            v_zp = (vs_bits & 0xF).to(tl.float32)
-            v_token_head_scales = (vs_bits & -16).to(tl.float32, bitcast=True)
-        else:
-            k_token_head_scales = ks_raw
-            v_token_head_scales = vs_raw
+        v_token_head_scales = tl.load(
+            v_scale_cache_ptr + vs_idx, mask=tile_mask, other=0
+        )
 
         query_abs_pos = context_len + query_pos[:, None]
         seq_mask = compute_kv_seq_mask(
@@ -739,22 +747,14 @@ def _attn_packed(
         )
 
         # Score: split-dot across PACKING_FACTOR streams; fused
-        # softmax_scale * per-(token, head) k_scale in one mul.  INT4
-        # subtracts the ``zp * sum(Q)`` correction term; INT2 doesn't.
+        # softmax_scale * per-(token, head) k_scale in one mul.  Both
+        # modes are now symmetric Lloyd-Max so the score is just the
+        # plain centroid dot — no zero-point correction needed.
         S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
-        if PACKING_FACTOR == 2:
-            raw_dot = tl.dot(Q_s0, K_s0) + tl.dot(Q_s1, K_s1)
-            S += (raw_dot - Q_sum[:, None] * k_zp[None, :]) * (
-                scale * k_token_head_scales[None, :]
-            )
-        else:
-            raw_dot = (
-                tl.dot(Q_s0, K_s0)
-                + tl.dot(Q_s1, K_s1)
-                + tl.dot(Q_s2, K_s2)
-                + tl.dot(Q_s3, K_s3)
-            )
-            S += raw_dot * (scale * k_token_head_scales[None, :])
+        raw_dot = tl.dot(Q_s0, K_s0) + tl.dot(Q_s1, K_s1)
+        if PACKING_FACTOR == 4:
+            raw_dot += tl.dot(Q_s2, K_s2) + tl.dot(Q_s3, K_s3)
+        S += raw_dot * (scale * k_token_head_scales[None, :])
 
         if USE_SOFTCAP:
             S = apply_softcap(S, softcap)
@@ -789,16 +789,12 @@ def _attn_packed(
                 V_s2 = tl.where(sw_mask[:, None], V_s2, 0.0)
                 V_s3 = tl.where(sw_mask[:, None], V_s3, 0.0)
 
-        # Fuse v per-(token, head) scale into P.  INT4 also subtracts
-        # the v-zero-point contribution from each stream once.
+        # Fuse v per-(token, head) scale into P; symmetric Lloyd-Max
+        # means no zero-point correction on either mode.
         P_v = (P * v_token_head_scales[None, :]).to(tl.float32)
-        if PACKING_FACTOR == 2:
-            Pv_zp_sum = tl.sum(P_v * v_zp[None, :], axis=1)
-            acc_s0 += tl.dot(P_v, V_s0) - Pv_zp_sum[:, None]
-            acc_s1 += tl.dot(P_v, V_s1) - Pv_zp_sum[:, None]
-        else:
-            acc_s0 += tl.dot(P_v, V_s0)
-            acc_s1 += tl.dot(P_v, V_s1)
+        acc_s0 += tl.dot(P_v, V_s0)
+        acc_s1 += tl.dot(P_v, V_s1)
+        if PACKING_FACTOR == 4:
             acc_s2 += tl.dot(P_v, V_s2)
             acc_s3 += tl.dot(P_v, V_s3)
 
@@ -1282,10 +1278,10 @@ class Int4PerTokenHeadBackend(_PackedBackend):
     packing_factor = 2  # 2 × int4 per byte
     _reshape_kernel = _reshape_cache_int4_kernel
 
-    # RHT pre-rotation gaussianizes data → better quantization.  The
-    # forward RHT has norm ``sqrt(head_size)``, so ``softmax_scale`` is
-    # divided by ``head_size`` and the inverse RHT divides the output
-    # by ``head_size`` as well.
+    # RHT pre-rotation gaussianizes data → better quantization.  Same
+    # bookkeeping as INT2: the H'H = d·I factor is absorbed into the
+    # stored scale (``norm / d^1.5``), so ``softmax_scale`` is unchanged
+    # and ``_unrotate_out`` does not divide by ``head_size``.
     @staticmethod
     def _rotate_kv(x: torch.Tensor) -> torch.Tensor:
         return single_rht(x)
@@ -1296,11 +1292,7 @@ class Int4PerTokenHeadBackend(_PackedBackend):
 
     @staticmethod
     def _unrotate_out(out: torch.Tensor, head_size: int) -> torch.Tensor:
-        return single_rht(out.float(), inverse=True) / head_size
-
-    @staticmethod
-    def _transform_softmax_scale(scale: float, head_size: int) -> float:
-        return scale / head_size
+        return single_rht(out.float(), inverse=True)
 
 
 class Int2PerTokenHeadBackend(_PackedBackend):

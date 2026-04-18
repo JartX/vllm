@@ -269,8 +269,9 @@ def test_reshape_and_cache_per_token_head(
         kv_quant_mode=qcfg.kv_quant_mode,
     )
 
-    # INT2 (Hadamard + Lloyd-Max), INT4 (RHT + asymmetric), INT8/FP8 have different
-    # dequant paths.  Only INT8/FP8 can be compared to a PyTorch reference.
+    # INT2 (Hadamard + Lloyd-Max 4) and INT4 (RHT + Lloyd-Max 16) share a
+    # symmetric ``norm / d^1.5`` scale layout; INT8/FP8 are absmax-symmetric.
+    # Only INT8/FP8 can be compared to a generic PyTorch reference.
     if not is_int4 and not is_int2:
         ref_k_quant, ref_k_scales = _quantize_per_token_head_ref(key, qcfg)
         ref_v_quant, ref_v_scales = _quantize_per_token_head_ref(value, qcfg)
@@ -283,9 +284,32 @@ def test_reshape_and_cache_per_token_head(
     else:
         deq_atol, deq_rtol = 0.1, 0.1
 
-    # Lloyd-Max centroids for INT2 dequant reference
+    # Lloyd-Max centroids: 4 (uncorrected) for INT2 and 16 (bias-corrected)
+    # for INT4.  Must match the constants baked into the Triton kernel.
     _LM4 = torch.tensor(
         [-1.5104, -0.4528, 0.4528, 1.5104], device="cuda", dtype=torch.float32
+    )
+    _LM16 = torch.tensor(
+        [
+            -2.7456,
+            -2.0788,
+            -1.6258,
+            -1.2622,
+            -0.9469,
+            -0.6599,
+            -0.3899,
+            -0.1290,
+            0.1290,
+            0.3899,
+            0.6599,
+            0.9469,
+            1.2622,
+            1.6258,
+            2.0788,
+            2.7456,
+        ],
+        device="cuda",
+        dtype=torch.float32,
     )
 
     for i, slot in enumerate(slot_mapping.tolist()):
@@ -328,22 +352,17 @@ def test_reshape_and_cache_per_token_head(
                 ("key", key, key_cache, k_scale_cache),
                 ("val", value, value_cache, v_scale_cache),
             ]:
-                packed_scale = sc[blk, off]  # [num_heads] float32
-                scale_bits = packed_scale.view(torch.int32)
-                zp = (scale_bits & 0xF).to(torch.float32)
-                clean_scale = (scale_bits & -16).view(torch.float32)
-
-                packed = cache[blk, off]
-                lo = (packed & 0xF).to(torch.float32)
-                hi = ((packed >> 4) & 0xF).to(torch.float32)
+                stored_scale = sc[blk, off]  # [num_heads] = norm/d^1.5
+                packed = cache[blk, off]  # [num_heads, cache_head_size] uint8
+                lo = (packed & 0xF).long()
+                hi = ((packed >> 4) & 0xF).long()
                 full = torch.zeros(
                     num_heads, head_size, dtype=torch.float32, device=packed.device
                 )
-                full[:, 0::2] = lo
-                full[:, 1::2] = hi
-                # Asymmetric dequant in RHT domain, then IRHT/d → original
-                deq_rht = (full - zp[:, None]) * clean_scale[:, None]
-                deq = _single_rht(deq_rht, inverse=True) / head_size
+                full[:, 0::2] = _LM16[lo]
+                full[:, 1::2] = _LM16[hi]
+                # inverse_RHT(centroids × scale) ≈ original (scale absorbs d).
+                deq = _single_rht(full * stored_scale[:, None], inverse=True)
                 ref_deq = data[i].float()
                 torch.testing.assert_close(deq, ref_deq, atol=deq_atol, rtol=deq_rtol)
         else:
@@ -514,20 +533,39 @@ def test_per_token_head_round_trip_accuracy(
                             _single_rht,
                         )
 
-                        sc_bits = actual_sc.view(torch.int32)
-                        zp = (sc_bits & 0xF).to(torch.float32)
-                        clean_sc = (sc_bits & -16).view(torch.float32)
-                        packed = cache[blk, off, h]
-                        lo = (packed & 0xF).to(torch.float32)
-                        hi = ((packed >> 4) & 0xF).to(torch.float32)
-                        full = torch.zeros(head_size, device=packed.device)
-                        full[0::2] = lo
-                        full[1::2] = hi
-                        deq_rht = (full - zp) * clean_sc
-                        actual_deq = (
-                            _single_rht(deq_rht.unsqueeze(0), inverse=True).squeeze(0)
-                            / head_size
+                        _LM16 = torch.tensor(
+                            [
+                                -2.7456,
+                                -2.0788,
+                                -1.6258,
+                                -1.2622,
+                                -0.9469,
+                                -0.6599,
+                                -0.3899,
+                                -0.1290,
+                                0.1290,
+                                0.3899,
+                                0.6599,
+                                0.9469,
+                                1.2622,
+                                1.6258,
+                                2.0788,
+                                2.7456,
+                            ],
+                            device="cuda",
+                            dtype=torch.float32,
                         )
+                        packed = cache[blk, off, h]
+                        lo = (packed & 0xF).long()
+                        hi = ((packed >> 4) & 0xF).long()
+                        full = torch.zeros(
+                            head_size, device=packed.device, dtype=torch.float32
+                        )
+                        full[0::2] = _LM16[lo]
+                        full[1::2] = _LM16[hi]
+                        actual_deq = _single_rht(
+                            (full * actual_sc).unsqueeze(0), inverse=True
+                        ).squeeze(0)
                     else:
                         actual_deq = cache[blk, off, h].float() * actual_sc
                     torch.testing.assert_close(
@@ -785,48 +823,84 @@ def test_triton_unified_attention_per_token_head_scale(
         )
 
     elif is_int4:
-        # Asymmetric quantization reference (matches the Triton kernel).
-        kf = key_cache_bf16.float()
-        vf = value_cache_bf16.float()
-        k_min = kf.amin(dim=-1)
-        k_max = kf.amax(dim=-1)
-        v_min = vf.amin(dim=-1)
-        v_max = vf.amax(dim=-1)
-        k_scale_cache = ((k_max - k_min) / 15.0).clamp(min=1e-6).to(torch.float32)
-        v_scale_cache = ((v_max - v_min) / 15.0).clamp(min=1e-6).to(torch.float32)
-        k_zp = (-k_min / k_scale_cache).round().clamp(0, 15)
-        v_zp = (-v_min / v_scale_cache).round().clamp(0, 15)
-
-        key_cache_q_full = (
-            (kf / k_scale_cache[..., None] + k_zp[..., None]).round().clamp(0, 15)
-        )
-        value_cache_q_full = (
-            (vf / v_scale_cache[..., None] + v_zp[..., None]).round().clamp(0, 15)
+        # INT4 RHT + Lloyd-Max 16-centroid quantization reference.
+        from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
+            _single_rht,
         )
 
-        # Dequantized reference: x_hat = (q - zp) * scale
-        key_cache_deq = (key_cache_q_full - k_zp[..., None]) * k_scale_cache[..., None]
-        value_cache_deq = (value_cache_q_full - v_zp[..., None]) * v_scale_cache[
-            ..., None
-        ]
+        _LM16 = torch.tensor(
+            [
+                -2.7456,
+                -2.0788,
+                -1.6258,
+                -1.2622,
+                -0.9469,
+                -0.6599,
+                -0.3899,
+                -0.1290,
+                0.1290,
+                0.3899,
+                0.6599,
+                0.9469,
+                1.2622,
+                1.6258,
+                2.0788,
+                2.7456,
+            ],
+            device=device,
+            dtype=torch.float32,
+        )
+        # Lloyd-Max 16 boundaries on N(0,1); must match the kernel binary tree.
+        _LM16_BOUNDS = torch.tensor(
+            [
+                -2.4008,
+                -1.8435,
+                -1.4371,
+                -1.0993,
+                -0.7996,
+                -0.5224,
+                -0.2582,
+                0.0,
+                0.2582,
+                0.5224,
+                0.7996,
+                1.0993,
+                1.4371,
+                1.8435,
+                2.4008,
+            ],
+            device=device,
+            dtype=torch.float32,
+        )
 
-        # Pack two uint4 values into one byte
-        def _pack_int4(data_float):
-            u = data_float.to(torch.uint8)
-            lo = u[..., 0::2]
-            hi = u[..., 1::2]
-            return (lo & 0xF) | ((hi & 0xF) << 4)
+        def _int4_quantize_cache(data_bf16):
+            """RHT → normalize → Lloyd-Max 16 → pack; return (packed, scale, deq)."""
+            shape = data_bf16.shape  # (B, S, H, D)
+            flat = data_bf16.float().reshape(-1, shape[-1])
+            rotated = _single_rht(flat).reshape(shape)
 
-        key_cache_q = _pack_int4(key_cache_q_full)
-        value_cache_q = _pack_int4(value_cache_q_full)
+            norm = rotated.float().norm(dim=-1, keepdim=True).clamp(min=1e-6)
+            inv_sigma = (head_size**0.5) / norm
+            z = rotated.float() * inv_sigma
 
-        # Steganography: pack zp into low 4 bits of scale
-        k_zp_int = k_zp.to(torch.int32)
-        k_bits = k_scale_cache.view(torch.int32)
-        k_scale_cache = ((k_bits & -16) | (k_zp_int & 0xF)).view(torch.float32)
-        v_zp_int = v_zp.to(torch.int32)
-        v_bits = v_scale_cache.view(torch.int32)
-        v_scale_cache = ((v_bits & -16) | (v_zp_int & 0xF)).view(torch.float32)
+            indices = torch.bucketize(z, _LM16_BOUNDS).to(torch.uint8)
+
+            i0 = indices[..., 0::2]
+            i1 = indices[..., 1::2]
+            packed = (i0 & 0xF) | ((i1 & 0xF) << 4)
+
+            sc = norm.squeeze(-1) / (head_size**1.5)
+
+            centroids = _LM16[indices.long()]
+            deq_rht = centroids * sc[..., None]
+            flat_deq = deq_rht.reshape(-1, shape[-1])
+            deq = _single_rht(flat_deq, inverse=True).reshape(shape)
+            return packed, sc.to(torch.float32), deq.to(torch.bfloat16)
+
+        key_cache_q, k_scale_cache, key_cache_deq = _int4_quantize_cache(key_cache_bf16)
+        value_cache_q, v_scale_cache, value_cache_deq = _int4_quantize_cache(
+            value_cache_bf16
+        )
     else:
         # Symmetric quantization for int8/fp8.
         k_absmax = key_cache_bf16.float().abs().amax(dim=-1)
