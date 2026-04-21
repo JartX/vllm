@@ -2,14 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """INT4 per-token-head KV cache quantization plugin.
 
-Packs 2×int4 per byte using asymmetric (min/max) dynamic quantization
-with a 4-bit zero-point steganographed into the low nibble of the
-float32 scale.  RHT (single-round random Hadamard) pre-rotation on
-the inputs gaussianises the data for better quantization; the inverse
-RHT is applied on the attention output.
+Owns only the INT4-specific write kernel (2 x int4 per byte,
+asymmetric min/max quantization with a 4-bit zero-point steganographed
+into the low nibble of the float32 scale).  The shared sub-byte
+attention kernel + launcher + factory plumbing lives in
+:mod:`_packed_core`; this file only declares the mode-specific pieces.
 
-The attention read path (:func:`_attn_packed`) is shared with INT2 in
-:mod:`_packed_core` and dispatched there by ``PACKING_FACTOR=2``.
+Adding a new sub-byte packed mode = copy this file, change the name +
+packing factor + reshape kernel (+ rotation hooks if needed).  No
+other file needs editing — the loader auto-discovers new plugins.
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ from vllm.v1.attention.ops.triton_quant_kv import register
 from vllm.v1.attention.ops.triton_quant_kv._hadamard import single_rht
 from vllm.v1.attention.ops.triton_quant_kv._pack_unpack import pack_int4_nibbles
 from vllm.v1.attention.ops.triton_quant_kv._packed_core import _PackedFactory
-from vllm.v1.kv_cache_interface import KVQuantMode
+from vllm.v1.attention.ops.triton_quant_kv.base import QuantKVSpec
 
 
 @triton.jit
@@ -218,18 +219,26 @@ def _reshape_cache_int4_kernel(
     )
 
 
-
 class Int4PerTokenHeadFactory(_PackedFactory):
-    """KV cache factory for ``KVQuantMode.INT4_PER_TOKEN_HEAD``."""
+    """KV cache plugin for ``int4_per_token_head``.
 
-    mode = KVQuantMode.INT4_PER_TOKEN_HEAD
-    packing_factor = 2  # 2 × int4 per byte
+    RHT pre-rotation gaussianizes K/V so the asymmetric quantization
+    has a useful dynamic range.  The forward RHT has norm
+    ``sqrt(head_size)``, so ``softmax_scale`` is divided by
+    ``head_size`` and the inverse RHT on the attention output divides
+    by ``head_size`` as well.
+    """
+
+    spec = QuantKVSpec(
+        name="int4_per_token_head",
+        storage_dtype=torch.uint8,
+        packing_factor=2,  # 2 x int4 per byte
+        needs_per_token_head_scales=True,
+        description="INT4 asymmetric per-(token, head) + RHT rotation",
+    )
+
     _reshape_kernel = _reshape_cache_int4_kernel
 
-    # RHT pre-rotation gaussianizes data → better quantization.  The
-    # forward RHT has norm ``sqrt(head_size)``, so ``softmax_scale`` is
-    # divided by ``head_size`` and the inverse RHT divides the output
-    # by ``head_size`` as well.
     @staticmethod
     def _rotate_kv(x: torch.Tensor) -> torch.Tensor:
         return single_rht(x)

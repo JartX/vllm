@@ -50,7 +50,7 @@ from vllm.v1.attention.ops.triton_quant_kv._pack_unpack import (
     unpack_int2_quartet,
     unpack_int4_nibbles,
 )
-from vllm.v1.attention.ops.triton_quant_kv.base import QuantKVFactory
+from vllm.v1.attention.ops.triton_quant_kv.base import QuantKVPlugin
 from vllm.v1.attention.ops.triton_unified_attention import reduce_segments
 
 float8_info = torch.finfo(current_platform.fp8_dtype())
@@ -744,15 +744,23 @@ def _run_reshape_kernel(
     )
 
 
-class _PackedFactory(QuantKVFactory):
-    """Shared factory for sub-byte packed per-token-head modes.
+class _PackedFactory(QuantKVPlugin):
+    """Shared base for sub-byte packed per-token-head plugins.
 
     Subclasses declare the mode-specific pieces as class attributes /
-    classmethods; the ``reshape_and_cache`` / ``unified_attention``
-    bodies are identical and live here.
+    static methods; the ``reshape_and_cache`` / ``unified_attention``
+    bodies are identical and live here.  No :class:`KVQuantMode` enum
+    value is referenced — each subclass identifies itself via its
+    :class:`QuantKVSpec` (``spec.name`` is the string the dispatcher
+    uses end-to-end), so adding a new sub-byte mode requires only
+    creating a subclass of this class.
 
-    Mode-specific hooks (must be set/overridden by subclasses)
-    ---------------------------------------------------------
+    Mode-specific hooks (subclass must set / override)
+    --------------------------------------------------
+    ``spec``
+        :class:`QuantKVSpec` with at least ``name`` and
+        ``packing_factor`` populated.
+        ``needs_per_token_head_scales`` must be ``True``.
     ``_reshape_kernel``
         The ``@triton.jit`` reshape kernel for this mode.
     ``_rotate_kv(x)``
@@ -768,8 +776,6 @@ class _PackedFactory(QuantKVFactory):
         divides by ``head_size`` to absorb the RHT scale; INT2 is a
         no-op).
     """
-
-    needs_scale_caches = True
 
     # Filled in by subclasses.
     _reshape_kernel: object
@@ -802,7 +808,7 @@ class _PackedFactory(QuantKVFactory):
         v_scale_cache: torch.Tensor | None = None,
     ) -> None:
         assert k_scale_cache is not None and v_scale_cache is not None, (
-            f"{self.mode.name} requires k_scale_cache / v_scale_cache"
+            f"{self.spec.name!r} requires k_scale_cache / v_scale_cache"
         )
         key = self._rotate_kv(key.float()).to(key.dtype)
         value = self._rotate_kv(value.float()).to(value.dtype)
@@ -815,7 +821,7 @@ class _PackedFactory(QuantKVFactory):
             k_scale_cache=k_scale_cache,
             v_scale_cache=v_scale_cache,
             slot_mapping=slot_mapping,
-            packing_factor=self.packing_factor,
+            packing_factor=self.spec.packing_factor,
         )
 
     def unified_attention(
@@ -879,7 +885,7 @@ class _PackedFactory(QuantKVFactory):
             softmax_segm_output=softmax_segm_output,
             softmax_segm_max=softmax_segm_max,
             softmax_segm_expsum=softmax_segm_expsum,
-            packing_factor=self.packing_factor,
+            packing_factor=self.spec.packing_factor,
         )
 
         out_f = self._unrotate_out(out, head_size)

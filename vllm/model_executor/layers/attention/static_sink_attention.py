@@ -226,6 +226,7 @@ class StaticSinkAttention(Attention, CustomOp):
             sink_len=self.sink_len,
             dtype=self.kv_cache_torch_dtype,
             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
+            kv_cache_dtype=self.kv_cache_dtype,
         )
 
 

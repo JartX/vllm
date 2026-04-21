@@ -54,7 +54,16 @@ FP8_MIN, FP8_MAX = get_fp8_min_max()
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class QuantConfig:
-    """Quantization parameters for a given cache dtype."""
+    """Quantization parameters for a given cache dtype.
+
+    ``kv_cache_dtype_str`` is the source of truth end-to-end — it's
+    the string the user passes to ``--kv-cache-dtype`` and is the
+    lookup key into the KV-quant plugin registry.  ``kv_quant_mode``
+    is kept only for the two modes the core attention kernel still
+    dispatches on via constexpr (``INT8_PER_TOKEN_HEAD`` /
+    ``FP8_PER_TOKEN_HEAD``); packed modes (``int4`` / ``int2``) set
+    it to ``None`` and flow through the plugin-first dispatch path.
+    """
 
     cache_dtype: torch.dtype  # torch.uint8, torch.int8, or FP8_DTYPE
     kv_cache_dtype_str: (
@@ -62,7 +71,7 @@ class QuantConfig:
     )
     quant_max: float
     quant_min: float
-    kv_quant_mode: KVQuantMode
+    kv_quant_mode: KVQuantMode | None
     # INT8 Triton stores truncate; FP8 hardware casts round.
     uses_trunc: bool
 
@@ -88,7 +97,7 @@ INT4_CONFIG = QuantConfig(
     kv_cache_dtype_str="int4_per_token_head",
     quant_max=7.0,
     quant_min=-8.0,
-    kv_quant_mode=KVQuantMode.INT4_PER_TOKEN_HEAD,
+    kv_quant_mode=None,  # plugin-only; not in the core-kernel enum
     uses_trunc=False,  # INT4 uses round-to-nearest via rint
 )
 INT2_CONFIG = QuantConfig(
@@ -96,7 +105,7 @@ INT2_CONFIG = QuantConfig(
     kv_cache_dtype_str="int2_per_token_head",
     quant_max=3.0,
     quant_min=0.0,
-    kv_quant_mode=KVQuantMode.INT2_PER_TOKEN_HEAD,
+    kv_quant_mode=None,  # plugin-only; not in the core-kernel enum
     uses_trunc=False,  # Hadamard + Lloyd-Max
 )
 QUANT_CONFIGS = [INT2_CONFIG, INT4_CONFIG, INT8_CONFIG, FP8_CONFIG]
@@ -158,19 +167,25 @@ class TestIsQuantizedKvCache:
     def test_bfloat16(self):
         assert not is_quantized_kv_cache("bfloat16")
 
-    def test_kv_quant_mode_int2(self):
-        from vllm.v1.kv_cache_interface import get_kv_quant_mode
+    def test_int2_resolves_to_plugin(self):
+        """INT2 is plugin-only (no enum value); resolution goes through
+        the plugin registry."""
+        from vllm.v1.attention.ops.triton_quant_kv import get_plugin_for_dtype
 
-        assert (
-            get_kv_quant_mode("int2_per_token_head") == KVQuantMode.INT2_PER_TOKEN_HEAD
-        )
+        plugin = get_plugin_for_dtype("int2_per_token_head")
+        assert plugin is not None
+        assert plugin.spec.name == "int2_per_token_head"
+        assert plugin.spec.packing_factor == 4
 
-    def test_kv_quant_mode_int4(self):
-        from vllm.v1.kv_cache_interface import get_kv_quant_mode
+    def test_int4_resolves_to_plugin(self):
+        """INT4 is plugin-only (no enum value); resolution goes through
+        the plugin registry."""
+        from vllm.v1.attention.ops.triton_quant_kv import get_plugin_for_dtype
 
-        assert (
-            get_kv_quant_mode("int4_per_token_head") == KVQuantMode.INT4_PER_TOKEN_HEAD
-        )
+        plugin = get_plugin_for_dtype("int4_per_token_head")
+        assert plugin is not None
+        assert plugin.spec.name == "int4_per_token_head"
+        assert plugin.spec.packing_factor == 2
 
     def test_kv_quant_mode_int8(self):
         from vllm.v1.kv_cache_interface import get_kv_quant_mode
@@ -212,8 +227,8 @@ def test_reshape_and_cache_per_token_head(
     device = "cuda"
 
     num_blocks = (num_tokens + block_size - 1) // block_size + 4
-    is_int4 = qcfg.kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD
-    is_int2 = qcfg.kv_quant_mode == KVQuantMode.INT2_PER_TOKEN_HEAD
+    is_int4 = qcfg.kv_cache_dtype_str == "int4_per_token_head"
+    is_int2 = qcfg.kv_cache_dtype_str == "int2_per_token_head"
     if is_int4:
         cache_head_size = head_size // 2
     elif is_int2:
@@ -266,7 +281,8 @@ def test_reshape_and_cache_per_token_head(
         k_scale_cache,
         v_scale_cache,
         slot_mapping,
-        kv_quant_mode=qcfg.kv_quant_mode,
+        kv_quant_mode=qcfg.kv_quant_mode or KVQuantMode.NONE,
+        kv_cache_dtype=qcfg.kv_cache_dtype_str,
     )
 
     # INT2 (Hadamard + Lloyd-Max), INT4 (RHT + asymmetric), INT8/FP8 have different
@@ -402,8 +418,8 @@ def test_per_token_head_round_trip_accuracy(
     set_random_seed(42)
     device = "cuda"
 
-    is_int4 = qcfg.kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD
-    is_int2 = qcfg.kv_quant_mode == KVQuantMode.INT2_PER_TOKEN_HEAD
+    is_int4 = qcfg.kv_cache_dtype_str == "int4_per_token_head"
+    is_int2 = qcfg.kv_cache_dtype_str == "int2_per_token_head"
     num_blocks = (num_tokens + block_size - 1) // block_size + 2
     if is_int4:
         cache_head_size = head_size // 2
@@ -458,7 +474,8 @@ def test_per_token_head_round_trip_accuracy(
         k_scale_cache,
         v_scale_cache,
         slot_mapping,
-        kv_quant_mode=qcfg.kv_quant_mode,
+        kv_quant_mode=qcfg.kv_quant_mode or KVQuantMode.NONE,
+        kv_cache_dtype=qcfg.kv_cache_dtype_str,
     )
 
     if is_int2:
@@ -555,8 +572,8 @@ def test_per_token_head_negative_slot_skipped(qcfg: QuantConfig):
     head_size = 64
     block_size = 16
     num_blocks = 2
-    is_int4 = qcfg.kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD
-    is_int2 = qcfg.kv_quant_mode == KVQuantMode.INT2_PER_TOKEN_HEAD
+    is_int4 = qcfg.kv_cache_dtype_str == "int4_per_token_head"
+    is_int2 = qcfg.kv_cache_dtype_str == "int2_per_token_head"
     if is_int4:
         cache_head_size = head_size // 2
     elif is_int2:
@@ -607,7 +624,8 @@ def test_per_token_head_negative_slot_skipped(qcfg: QuantConfig):
         k_scale_cache,
         v_scale_cache,
         slot_mapping,
-        kv_quant_mode=qcfg.kv_quant_mode,
+        kv_quant_mode=qcfg.kv_quant_mode or KVQuantMode.NONE,
+        kv_cache_dtype=qcfg.kv_cache_dtype_str,
     )
 
     # Slots 0 and 1 should have been written (tokens 0 and 2)
@@ -693,8 +711,8 @@ def test_triton_unified_attention_per_token_head_scale(
     set_random_seed(0)
     device = "cuda"
 
-    is_int2 = qcfg.kv_quant_mode == KVQuantMode.INT2_PER_TOKEN_HEAD
-    is_int4 = qcfg.kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD
+    is_int2 = qcfg.kv_cache_dtype_str == "int2_per_token_head"
+    is_int4 = qcfg.kv_cache_dtype_str == "int4_per_token_head"
 
     num_seqs = len(seq_lens)
     query_lens = [s[0] for s in seq_lens]
@@ -911,7 +929,8 @@ def test_triton_unified_attention_per_token_head_scale(
         softmax_segm_output=softmax_segm_output,
         softmax_segm_max=softmax_segm_max,
         softmax_segm_expsum=softmax_segm_expsum,
-        kv_quant_mode=qcfg.kv_quant_mode,
+        kv_quant_mode=qcfg.kv_quant_mode or KVQuantMode.NONE,
+        kv_cache_dtype=qcfg.kv_cache_dtype_str,
         k_scale_cache=k_scale_cache,
         v_scale_cache=v_scale_cache,
     )

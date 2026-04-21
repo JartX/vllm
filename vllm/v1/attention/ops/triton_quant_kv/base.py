@@ -115,12 +115,13 @@ class QuantKVPlugin(ABC):
 
     Plugin modules register themselves at import by calling
     :func:`vllm.v1.attention.ops.triton_quant_kv.register` on an
-    instance.  In-tree plugins live under ``triton_quant_kv/`` and are
-    listed in ``_BUILTIN_MODULES`` for lazy import on first use.
-    External plugins live in any directory named by the
-    ``VLLM_QUANT_KV_PATH`` environment variable — the loader scans
-    those paths once per process and imports every ``*.py`` file it
-    finds, giving each a chance to self-register.
+    instance.  The loader auto-discovers them: every ``*.py`` file
+    sitting next to the ``__init__.py`` of the plugin package (and
+    not starting with ``_``) is treated as a builtin plugin, and
+    every ``*.py`` file in directories listed in the
+    ``VLLM_QUANT_KV_PATH`` environment variable is treated as an
+    external plugin.  No registry file needs editing to add a new
+    mode — drop the ``.py`` and it shows up on next process start.
     """
 
     #: Static metadata for this plugin.  Must be set by subclasses.
@@ -280,12 +281,12 @@ class QuantKVFactory(QuantKVPlugin):
         Approximate on purpose — legacy call sites read the dtype
         directly from allocated cache tensors rather than from the
         spec, so this field exists only for parity with new-style
-        plugins that populate it explicitly.
+        plugins that populate it explicitly.  Covers the handful of
+        modes still addressed by :class:`KVQuantMode`; packed modes
+        are plugin-only and set ``spec.storage_dtype`` directly.
         """
         from vllm.v1.kv_cache_interface import KVQuantMode as _M
 
-        if self.mode in (_M.INT4_PER_TOKEN_HEAD, _M.INT2_PER_TOKEN_HEAD):
-            return torch.uint8
         if self.mode == _M.INT8_PER_TOKEN_HEAD:
             return torch.int8
         if self.mode in (_M.FP8_PER_TOKEN_HEAD, _M.FP8_PER_TENSOR):

@@ -4,10 +4,10 @@
 
 INT8 and FP8 per-token-head quantization differ only in the
 (``QUANT_MAX``, ``QUANT_MIN``) constants and the storage dtype — which
-Triton infers directly from the cache pointer.  This module factors out
-the one kernel + launcher + base factory that both modes share; the
-concrete plugin files (``int8_per_token_head.py`` and
-``fp8_per_token_head.py``) add only the mode enum binding and the
+Triton infers directly from the cache pointer.  This module factors
+out the one kernel + launcher + base plugin that both modes share;
+the concrete plugin files (``int8_per_token_head.py`` and
+``fp8_per_token_head.py``) only supply their :class:`QuantKVSpec` and
 per-format clamp range.
 
 The leading underscore in the filename keeps this module out of the
@@ -27,7 +27,7 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-from vllm.v1.attention.ops.triton_quant_kv.base import QuantKVFactory
+from vllm.v1.attention.ops.triton_quant_kv.base import QuantKVPlugin
 
 
 @triton.jit
@@ -194,18 +194,18 @@ def run_per_token_head_reshape_and_cache(
     )
 
 
-class PerTokenHeadFactoryBase(QuantKVFactory):
-    """Common base for byte-aligned per-token-head factories (INT8 / FP8).
+class PerTokenHeadFactoryBase(QuantKVPlugin):
+    """Common base for byte-aligned per-token-head plugins (INT8 / FP8).
 
-    Concrete subclasses set ``mode``, ``_quant_max`` and ``_quant_min``.
+    Concrete subclasses set :attr:`QuantKVPlugin.spec`, ``_quant_max``
+    and ``_quant_min``.  No :class:`KVQuantMode` enum value is
+    referenced — the plugin name comes from :attr:`QuantKVSpec.name`.
+
     The attention read path lives in the core kernel via the
     ``USE_PER_TOKEN_HEAD_SCALES`` constexpr branch; this base only owns
     the write path and scale-cache allocation (inherited from the
     :class:`QuantKVPlugin` default).
     """
-
-    packing_factor = 1
-    needs_scale_caches = True
 
     _quant_max: float
     _quant_min: float
@@ -222,7 +222,7 @@ class PerTokenHeadFactoryBase(QuantKVFactory):
         v_scale_cache: torch.Tensor | None = None,
     ) -> None:
         assert k_scale_cache is not None and v_scale_cache is not None, (
-            f"{self.mode.name} requires k_scale_cache / v_scale_cache"
+            f"{self.spec.name!r} requires k_scale_cache / v_scale_cache"
         )
         run_per_token_head_reshape_and_cache(
             key=key,

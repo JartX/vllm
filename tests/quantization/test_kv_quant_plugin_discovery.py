@@ -5,7 +5,9 @@
 Covers the pure-Python discovery layer that sits above the Triton
 kernels:
 
-* in-tree builtin plugins load via ``_BUILTIN_MODULES``;
+* in-tree builtin plugins auto-discover by scanning every ``*.py``
+  file next to the plugin package's ``__init__.py`` (skipping
+  ``_``-prefixed private helpers and ``base.py``);
 * user-supplied plugins load by scanning every directory listed in
   ``VLLM_QUANT_KV_PATH`` and importing each ``*.py`` file;
 * first-registration wins, so an external plugin with the same name
@@ -47,15 +49,18 @@ def fresh_registry():
     tests requires snapshot/clear/restore around each test body.
     """
     original_registry = dict(_qkv._REGISTRY)
-    original_loaded = _qkv._EXTERNAL_LOADED
+    original_external = _qkv._EXTERNAL_LOADED
+    original_builtin = _qkv._BUILTIN_LOADED
     _qkv._REGISTRY.clear()
     _qkv._EXTERNAL_LOADED = False
+    _qkv._BUILTIN_LOADED = False
     try:
         yield
     finally:
         _qkv._REGISTRY.clear()
         _qkv._REGISTRY.update(original_registry)
-        _qkv._EXTERNAL_LOADED = original_loaded
+        _qkv._EXTERNAL_LOADED = original_external
+        _qkv._BUILTIN_LOADED = original_builtin
 
 
 def _write_plugin(

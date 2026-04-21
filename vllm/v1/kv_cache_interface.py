@@ -28,28 +28,51 @@ logger = init_logger(__name__)
 
 
 class KVQuantMode(IntEnum):
-    """KV cache quantization mode.
+    """KV cache quantization mode handled directly by the core kernel.
 
-    Used by attention backends and kernels to dispatch quantization logic
-    without string matching on ``kv_cache_dtype``.
+    The enum values in this class map 1:1 to the ``KV_QUANT_MODE``
+    integer constexpr that :func:`kernel_unified_attention` uses to
+    dispatch inside the Triton kernel, so every value listed here
+    **must** stay stable — the kernel checks them numerically.
+
+    Quantization modes that ship their own paged-attention kernel
+    (INT4 / INT2 packed, and anything new the user registers via
+    :mod:`vllm.v1.attention.ops.triton_quant_kv`) are NOT listed
+    here.  They're identified end-to-end by their plugin name
+    (``spec.name`` string) and dispatched outside the core kernel,
+    so they need no enum value.  Adding a new plugin never requires
+    touching this enum.
     """
 
     NONE = 0
-    FP8_PER_TENSOR = 1  # per-tensor scales (current fp8 path)
+    FP8_PER_TENSOR = 1  # per-tensor scales (classic fp8 path)
     INT8_PER_TOKEN_HEAD = 2  # per-token-head dynamic scales for int8
     FP8_PER_TOKEN_HEAD = 3  # per-token-head dynamic scales for fp8
-    INT4_PER_TOKEN_HEAD = 4  # packed 2×int4/byte, RHT + asymmetric zp
-    INT2_PER_TOKEN_HEAD = 5  # Hadamard + Lloyd-Max 4 centroids, 4×int2/byte
     NVFP4 = 6  # packed fp4 data + fp8 block scales
 
     @property
     def is_per_token_head(self) -> bool:
-        """True for any per-token-head quantization mode."""
+        """True for any per-token-head quantization mode.
+
+        Data-driven: queries the plugin registry first (the real
+        source of truth for every mode that has a plugin); falls back
+        to the two enum values the core kernel handles via its
+        ``USE_PER_TOKEN_HEAD_SCALES`` constexpr branch.
+        """
+        from vllm.v1.attention.ops.triton_quant_kv import (
+            get_quant_kv_plugin,
+            has_quant_kv_plugin,
+        )
+
+        name = self.name.lower()
+        if has_quant_kv_plugin(name):
+            try:
+                return get_quant_kv_plugin(name).spec.needs_per_token_head_scales
+            except Exception:
+                pass
         return self in (
             KVQuantMode.INT8_PER_TOKEN_HEAD,
             KVQuantMode.FP8_PER_TOKEN_HEAD,
-            KVQuantMode.INT4_PER_TOKEN_HEAD,
-            KVQuantMode.INT2_PER_TOKEN_HEAD,
         )
 
     @property
@@ -59,20 +82,21 @@ class KVQuantMode(IntEnum):
 
     @property
     def packing_factor(self) -> int:
-        """Number of quantized values stored per cache byte (1 unless packed).
+        """Number of quantized values stored per cache byte.
 
-        Data-driven: queries the KV-quant plugin registry when a plugin
-        is registered for this mode and uses its
-        :class:`QuantKVSpec.packing_factor`.  Falls back to the legacy
-        table for sentinel modes (``NONE``, ``FP8_PER_TENSOR``,
-        ``NVFP4``) that are not backed by a plugin.
+        Data-driven: queries the plugin registry for the plugin's
+        :attr:`QuantKVSpec.packing_factor`.  Every core-kernel enum
+        value (``NONE``, ``FP8_PER_TENSOR``, ``INT8_PER_TOKEN_HEAD``,
+        ``FP8_PER_TOKEN_HEAD``, ``NVFP4``) is byte-aligned so the
+        fallback when no plugin answers is always 1 — sub-byte
+        packed modes are plugin-only and resolve via the plugin path.
         """
         # Local import to avoid a top-level cycle with the plugin
         # registry module, which imports this enum for its own type
         # hints.
         from vllm.v1.attention.ops.triton_quant_kv import (
-            has_quant_kv_plugin,
             get_quant_kv_plugin,
+            has_quant_kv_plugin,
         )
 
         name = self.name.lower()
@@ -80,13 +104,8 @@ class KVQuantMode(IntEnum):
             try:
                 return get_quant_kv_plugin(name).spec.packing_factor
             except Exception:
-                # Fall through to the hard-coded table; a broken plugin
-                # should not tank page-size arithmetic during startup.
+                # Broken plugin should not tank page-size arithmetic.
                 pass
-        if self == KVQuantMode.INT2_PER_TOKEN_HEAD:
-            return 4
-        if self == KVQuantMode.INT4_PER_TOKEN_HEAD:
-            return 2
         return 1
 
     def packed_head_size(self, head_size: int) -> int:
@@ -102,14 +121,15 @@ class KVQuantMode(IntEnum):
 def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
     """Map a ``kv_cache_dtype`` string to a :class:`KVQuantMode`.
 
-    Uses the enum's own name table for the per-token-head modes
-    (``"int2_per_token_head"`` → :attr:`KVQuantMode.INT2_PER_TOKEN_HEAD`,
-    etc.), so adding a new enum value makes it selectable without
-    editing this function.  ``"nvfp4"`` and any ``fp8*`` string map
-    to their dedicated sentinel modes.  Anything else — including
-    external plugins registered under names not present in the enum —
-    resolves to ``NONE`` and is handled by the caller (typically by
-    consulting the plugin registry directly).
+    Returns the matching enum value for the handful of modes the core
+    kernel dispatches internally (``INT8_PER_TOKEN_HEAD``,
+    ``FP8_PER_TOKEN_HEAD``, ``FP8_PER_TENSOR``, ``NVFP4``).  Anything
+    else — including every plugin-backed mode (``int4_per_token_head``,
+    ``int2_per_token_head``, and any user-supplied plugin loaded via
+    ``VLLM_QUANT_KV_PATH``) — resolves to ``NONE`` because those
+    modes don't participate in the core kernel's constexpr dispatch.
+    Callers that need to recover the mode for plugin-backed paths
+    look up ``get_plugin_for_dtype(kv_cache_dtype)`` directly.
     """
     if not isinstance(kv_cache_dtype, str):
         return KVQuantMode.NONE
@@ -184,7 +204,42 @@ class AttentionSpec(KVCacheSpec):
     head_size: int
     dtype: torch.dtype
     kv_quant_mode: KVQuantMode = KVQuantMode.NONE
+    #: Original ``--kv-cache-dtype`` string.  Carried separately from
+    #: ``kv_quant_mode`` so modes registered as external plugins (names
+    #: not present in :class:`KVQuantMode`) can still resolve to the
+    #: correct packing factor / scale layout via
+    #: :func:`get_plugin_for_dtype` during page-size arithmetic.
+    kv_cache_dtype: str | None = None
     page_size_padded: int | None = None
+
+    def _resolve_plugin(self):
+        """Return the KV-quant plugin for this spec, if any.
+
+        Plugin-first: ``kv_cache_dtype`` (string) lookup picks up both
+        in-tree plugins and external ones loaded via
+        ``VLLM_QUANT_KV_PATH``, even for names not present in
+        :class:`KVQuantMode`.  Falls back to ``None`` when the dtype
+        is not plugin-backed (``auto``, ``float16``, ``nvfp4``, …).
+        """
+        if not self.kv_cache_dtype:
+            return None
+        from vllm.v1.attention.ops.triton_quant_kv import get_plugin_for_dtype
+
+        return get_plugin_for_dtype(self.kv_cache_dtype)
+
+    @property
+    def _packing_factor(self) -> int:
+        plugin = self._resolve_plugin()
+        if plugin is not None:
+            return plugin.spec.packing_factor
+        return self.kv_quant_mode.packing_factor
+
+    @property
+    def _needs_per_token_head_scales(self) -> bool:
+        plugin = self._resolve_plugin()
+        if plugin is not None:
+            return plugin.spec.needs_per_token_head_scales
+        return self.kv_quant_mode.is_per_token_head
 
     @property
     def page_size_bytes(self) -> int:
@@ -192,7 +247,7 @@ class AttentionSpec(KVCacheSpec):
         # Per-token-head scales are stored in separate tensors managed
         # by the attention backend, but the memory is carved from the
         # raw KV cache allocation so it must be budgeted here.
-        if self.kv_quant_mode.is_per_token_head:
+        if self._needs_per_token_head_scales:
             real_page_size += (
                 2 * self.block_size * self.num_kv_heads * get_dtype_size(torch.float32)
             )
@@ -203,11 +258,16 @@ class AttentionSpec(KVCacheSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
+        pf = self._packing_factor
+        assert self.head_size % pf == 0, (
+            f"head_size={self.head_size} not divisible by packing factor "
+            f"{pf} (kv_cache_dtype={self.kv_cache_dtype!r})"
+        )
         return (
             2
             * self.block_size
             * self.num_kv_heads
-            * self.kv_quant_mode.packed_head_size(self.head_size)
+            * (self.head_size // pf)
             * get_dtype_size(self.dtype)
         )
 
@@ -285,6 +345,7 @@ class FullAttentionSpec(AttentionSpec):
             head_size_v=specs[0].head_size_v,
             dtype=specs[0].dtype,
             kv_quant_mode=specs[0].kv_quant_mode,
+            kv_cache_dtype=specs[0].kv_cache_dtype,
             page_size_padded=specs[0].page_size_padded,
             sliding_window=cls.merge_window_sizes(sliding_window),
             attention_chunk_size=cls.merge_window_sizes(attention_chunk_size),
@@ -318,13 +379,17 @@ class FullAttentionSpec(AttentionSpec):
                 * last_dim
                 * get_dtype_size(self.dtype)
             )
+        pf = self._packing_factor
+        assert (
+            self.head_size % pf == 0 and self.head_size_v % pf == 0
+        ), (
+            f"head sizes ({self.head_size}, {self.head_size_v}) not divisible "
+            f"by packing factor {pf} (kv_cache_dtype={self.kv_cache_dtype!r})"
+        )
         return (
             self.block_size
             * self.num_kv_heads
-            * (
-                self.kv_quant_mode.packed_head_size(self.head_size)
-                + self.kv_quant_mode.packed_head_size(self.head_size_v)
-            )
+            * ((self.head_size // pf) + (self.head_size_v // pf))
             * get_dtype_size(self.dtype)
         )
 
@@ -366,10 +431,11 @@ class MLAAttentionSpec(FullAttentionSpec):
             # See `vllm/v1/attention/backends/mla/flashmla_sparse.py`
             #  for details.
             return self.block_size * 656
+        pf = self._packing_factor
         return (
             self.block_size
             * self.num_kv_heads
-            * self.kv_quant_mode.packed_head_size(self.head_size)
+            * (self.head_size // pf)
             * get_dtype_size(self.dtype)
         )
 
@@ -389,6 +455,7 @@ class MLAAttentionSpec(FullAttentionSpec):
             head_size=specs[0].head_size,
             dtype=specs[0].dtype,
             kv_quant_mode=specs[0].kv_quant_mode,
+            kv_cache_dtype=specs[0].kv_cache_dtype,
             page_size_padded=specs[0].page_size_padded,
             cache_dtype_str=cache_dtype_str_set.pop(),
         )
@@ -522,6 +589,7 @@ class SinkFullAttentionSpec(FullAttentionSpec):
             sink_len=specs[0].sink_len,
             dtype=specs[0].dtype,
             kv_quant_mode=specs[0].kv_quant_mode,
+            kv_cache_dtype=specs[0].kv_cache_dtype,
             page_size_padded=specs[0].page_size_padded,
             sliding_window=cls.merge_window_sizes(sliding_window),
             attention_chunk_size=cls.merge_window_sizes(attention_chunk_size),

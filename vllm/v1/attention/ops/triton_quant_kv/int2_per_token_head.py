@@ -2,15 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """INT2 per-token-head KV cache quantization plugin.
 
-Packs 4×int2 per byte using Lloyd-Max 4-centroid quantization for
-N(0, 1) inputs.  Full (non-random) Hadamard pre-rotation gaussianises
-the data; the same Hadamard is its own inverse, so no separate output
-rotation math is needed.  The stored scale encodes
-``norm(x) / head_size**1.5`` so the attention read fuses
-normalisation and dequantisation into one factor.
+Owns the INT2-specific Lloyd-Max centroid lookup + reshape kernel
+(4 x int2 per byte, full Hadamard pre-rotation, ``norm / d^1.5`` scale).
+The shared sub-byte attention kernel + launcher + factory plumbing
+lives in :mod:`_packed_core`.
 
-The attention read path (:func:`_attn_packed`) is shared with INT4 in
-:mod:`_packed_core` and dispatched there by ``PACKING_FACTOR=4``.
+Adding a new sub-byte packed mode = copy this file, change the name +
+packing factor + reshape kernel (+ rotation hooks if needed).  No
+other file needs editing.
 """
 
 from __future__ import annotations
@@ -19,10 +18,12 @@ import torch
 
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.ops.triton_quant_kv import register
-from vllm.v1.attention.ops.triton_quant_kv._hadamard import fast_hadamard_transform
+from vllm.v1.attention.ops.triton_quant_kv._hadamard import (
+    fast_hadamard_transform,
+)
 from vllm.v1.attention.ops.triton_quant_kv._pack_unpack import pack_int2_quartet
 from vllm.v1.attention.ops.triton_quant_kv._packed_core import _PackedFactory
-from vllm.v1.kv_cache_interface import KVQuantMode
+from vllm.v1.attention.ops.triton_quant_kv.base import QuantKVSpec
 
 
 @triton.jit
@@ -192,15 +193,24 @@ def _reshape_cache_int2_kernel(
 
 
 class Int2PerTokenHeadFactory(_PackedFactory):
-    """KV cache factory for ``KVQuantMode.INT2_PER_TOKEN_HEAD``."""
+    """KV cache plugin for ``int2_per_token_head``.
 
-    mode = KVQuantMode.INT2_PER_TOKEN_HEAD
-    packing_factor = 4  # 4 × int2 per byte
+    Full (non-random) Hadamard pre-rotation gaussianizes K/V.  Because
+    the Hadamard is its own inverse, the output rotation reuses the
+    same transform; no ``softmax_scale`` adjustment is needed — the
+    ``d^1.5`` factor is absorbed into the stored scale at write time.
+    """
+
+    spec = QuantKVSpec(
+        name="int2_per_token_head",
+        storage_dtype=torch.uint8,
+        packing_factor=4,  # 4 x int2 per byte
+        needs_per_token_head_scales=True,
+        description="INT2 Lloyd-Max centroids + full Hadamard rotation",
+    )
+
     _reshape_kernel = _reshape_cache_int2_kernel
 
-    # Full Hadamard (no random sign).  Its own inverse — so the output
-    # rotation is identical.  No softmax_scale adjustment: the ``d^1.5``
-    # factor is absorbed into the stored scale at write time.
     @staticmethod
     def _rotate_kv(x: torch.Tensor) -> torch.Tensor:
         return fast_hadamard_transform(x)

@@ -532,6 +532,7 @@ class Platform:
             kv_cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
 
         kv_quant_mode = get_kv_quant_mode(cache_config.cache_dtype)
+        kv_cache_dtype_str = cache_config.cache_dtype
 
         # Compute attention page size for 1 token
         if model_config.use_mla:
@@ -541,6 +542,7 @@ class Platform:
                 head_size=model_config.get_head_size(),
                 dtype=kv_cache_dtype,
                 kv_quant_mode=kv_quant_mode,
+                kv_cache_dtype=kv_cache_dtype_str,
             ).page_size_bytes
         else:
             attn_page_size_1_token = FullAttentionSpec(
@@ -549,6 +551,7 @@ class Platform:
                 head_size=model_config.get_head_size(),
                 dtype=kv_cache_dtype,
                 kv_quant_mode=kv_quant_mode,
+                kv_cache_dtype=kv_cache_dtype_str,
             ).page_size_bytes
 
         # Compute mamba page size
