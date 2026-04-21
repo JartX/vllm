@@ -701,23 +701,29 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             num_warps=4,
         )
 
-        # Inverse-rotate MSE keys back to original space
+        # Inverse-rotate MSE keys back to original space.
+        # Rotate in FP16 (not FP32) to avoid a ~cached_len*Hk*D*4 B transient
+        # spike at long context. The FP32 intermediate doubled peak memory for
+        # no accuracy benefit: the rotation is applied to keys that were already
+        # reconstructed from 3-4 bit MSE indices, and any FP16 roundoff is
+        # negligible vs that quantization error.
         if not self.tq_config.key_fp8:
-            k_flat = k_cached[0, :, :cached_len, :].reshape(-1, D).float()
-            k_flat = k_flat @ Pi
+            Pi_half = Pi.to(torch.float16) if Pi.dtype != torch.float16 else Pi
+            k_flat = k_cached[0, :, :cached_len, :].reshape(-1, D)  # (Hk*cached_len, D) FP16
+            k_flat = k_flat @ Pi_half  # FP16 matmul, single transient output
             k_cached_trim = (
-                k_flat.to(torch.float16).reshape(Hk, cached_len, D).transpose(0, 1)
-            )  # (cached_len, Hk, D)
+                k_flat.reshape(Hk, cached_len, D).transpose(0, 1)
+            )  # (cached_len, Hk, D) — non-contiguous view
         else:
-            k_cached_trim = (
-                k_cached[0, :, :cached_len, :].transpose(0, 1).contiguous()
-            )  # (cached_len, Hk, D)
+            k_cached_trim = k_cached[0, :, :cached_len, :].transpose(0, 1)
+            # (cached_len, Hk, D) — non-contiguous view
 
-        v_cached_trim = (
-            v_cached[0, :, :cached_len, :].transpose(0, 1).contiguous()
-        )  # (cached_len, Hk, D)
+        v_cached_trim = v_cached[0, :, :cached_len, :].transpose(0, 1)
+        # (cached_len, Hk, D) — non-contiguous view
 
-        # Concatenate cached + current chunk K/V (match query dtype)
+        # torch.cat already produces a contiguous output, so the upstream
+        # .contiguous() materializations previously here were redundant and
+        # doubled peak memory at long context.
         qdtype = query.dtype
         k_full = torch.cat([k_cached_trim.to(qdtype), key_chunk], dim=0)
         v_full = torch.cat([v_cached_trim.to(qdtype), val_chunk], dim=0)
