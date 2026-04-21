@@ -499,53 +499,77 @@ def unified_attention(
     kv_quant_mode: KVQuantMode = KVQuantMode.NONE,
     k_scale_cache=None,  # [num_blocks, block_size, num_kv_heads] float32
     v_scale_cache=None,  # [num_blocks, block_size, num_kv_heads] float32
+    kv_cache_dtype: str | None = None,
 ):
     assert causal, "Only causal attention is supported"
     assert q_descale is None, "Q scales not supported"
 
-    # Sub-byte packed modes (INT4 / INT2) need bespoke kernels — they
-    # split the dot, look up centroids / dequantize from packed bytes,
-    # and live in their own factory modules under
-    # ``vllm.v1.attention.ops.triton_quant_kv``.  Everything else
-    # (NONE, FP8 per-tensor, INT8 / FP8 per-token-head) goes through the
-    # core kernel below via constexpr branches.
-    if kv_quant_mode in (
-        KVQuantMode.INT4_PER_TOKEN_HEAD,
-        KVQuantMode.INT2_PER_TOKEN_HEAD,
-    ):
-        from vllm.v1.attention.ops.triton_quant_kv import get_quant_kv_factory
-
-        factory = get_quant_kv_factory(kv_quant_mode)
-        if sinks is not None:
-            assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
-        factory.unified_attention(
-            q=q,
-            k_cache=k,
-            v_cache=v,
-            out=out,
-            cu_seqlens_q=cu_seqlens_q,
-            max_seqlen_q=max_seqlen_q,
-            seqused_k=seqused_k,
-            max_seqlen_k=max_seqlen_k,
-            softmax_scale=softmax_scale,
-            window_size=window_size,
-            block_table=block_table,
-            softcap=softcap,
-            sinks=sinks,
-            alibi_slopes=alibi_slopes,
-            use_alibi_sqrt=use_alibi_sqrt,
-            qq_bias=qq_bias,
-            output_scale=output_scale,
-            mm_prefix_range=mm_prefix_range,
-            k_scale_cache=k_scale_cache,
-            v_scale_cache=v_scale_cache,
-            seq_threshold_3D=seq_threshold_3D,
-            num_par_softmax_segments=num_par_softmax_segments,
-            softmax_segm_output=softmax_segm_output,
-            softmax_segm_max=softmax_segm_max,
-            softmax_segm_expsum=softmax_segm_expsum,
+    # Plugin-first dispatch: any registered KV-quant plugin whose
+    # ``has_bespoke_attention`` property is True owns the attention
+    # read path for its mode and we route the call to it here.  This
+    # covers the in-tree sub-byte packed factories (INT4 / INT2 split
+    # the dot and look up centroids / dequantize from packed bytes)
+    # and every external plugin loaded via ``VLLM_QUANT_KV_PATH``
+    # whose data layout does not match any of the core kernel's
+    # constexpr branches (``NONE``, ``FP8_PER_TENSOR``, ``INT8`` /
+    # ``FP8_PER_TOKEN_HEAD``).  Plugins without a bespoke kernel fall
+    # through to the core kernel below.
+    #
+    # Two lookup paths coexist:
+    #
+    # * ``kv_cache_dtype`` (string) — preferred, works for external
+    #   plugins whose names are not in :class:`KVQuantMode`.  Resolves
+    #   via :func:`get_plugin_for_dtype` so the name the user passed
+    #   on the command line is the key end-to-end.
+    #
+    # * ``kv_quant_mode`` (enum) — legacy path.  Still used when the
+    #   caller has not yet threaded the dtype string through.
+    factory = None
+    if kv_quant_mode != KVQuantMode.NONE or kv_cache_dtype:
+        from vllm.v1.attention.ops.triton_quant_kv import (
+            get_plugin_for_dtype,
+            get_quant_kv_factory,
+            has_quant_kv_factory,
         )
-        return
+
+        if kv_cache_dtype:
+            factory = get_plugin_for_dtype(kv_cache_dtype)
+        if factory is None and has_quant_kv_factory(kv_quant_mode):
+            factory = get_quant_kv_factory(kv_quant_mode)
+
+        if factory is not None and factory.has_bespoke_attention:
+            if sinks is not None:
+                assert sinks.shape[0] == q.shape[1], (
+                    "Sinks must be num_query_heads size"
+                )
+            factory.unified_attention(
+                q=q,
+                k_cache=k,
+                v_cache=v,
+                out=out,
+                cu_seqlens_q=cu_seqlens_q,
+                max_seqlen_q=max_seqlen_q,
+                seqused_k=seqused_k,
+                max_seqlen_k=max_seqlen_k,
+                softmax_scale=softmax_scale,
+                window_size=window_size,
+                block_table=block_table,
+                softcap=softcap,
+                sinks=sinks,
+                alibi_slopes=alibi_slopes,
+                use_alibi_sqrt=use_alibi_sqrt,
+                qq_bias=qq_bias,
+                output_scale=output_scale,
+                mm_prefix_range=mm_prefix_range,
+                k_scale_cache=k_scale_cache,
+                v_scale_cache=v_scale_cache,
+                seq_threshold_3D=seq_threshold_3D,
+                num_par_softmax_segments=num_par_softmax_segments,
+                softmax_segm_output=softmax_segm_output,
+                softmax_segm_max=softmax_segm_max,
+                softmax_segm_expsum=softmax_segm_expsum,
+            )
+            return
 
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"

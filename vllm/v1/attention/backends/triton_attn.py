@@ -638,6 +638,7 @@ class TritonAttentionImpl(AttentionImpl):
             output_scale=output_scale,
             mm_prefix_range=mm_prefix_range_tensor,
             kv_quant_mode=self._kv_quant_mode,
+            kv_cache_dtype=self.kv_cache_dtype,
             k_scale_cache=k_scale_cache,
             v_scale_cache=v_scale_cache,
         )
@@ -721,6 +722,7 @@ class TritonAttentionImpl(AttentionImpl):
                 self._v_scale_cache,
                 slot_mapping,
                 kv_quant_mode=self._kv_quant_mode,
+                kv_cache_dtype=self.kv_cache_dtype,
             )
             return
         # For decoder and cross-attention, use KV cache as before.

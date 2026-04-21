@@ -1,19 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""INT8 and FP8 per-token-head KV cache quantization factories.
+"""Shared reshape-and-cache kernel for byte-aligned per-token-head modes.
 
-The attention read path for these modes lives in the core kernel
-(:mod:`vllm.v1.attention.ops.triton_unified_attention`) — the only thing
-that differs from the unquantized path is loading per-(token, head)
-scales and fusing them into S/P, both gated by a constexpr branch.
+INT8 and FP8 per-token-head quantization differ only in the
+(``QUANT_MAX``, ``QUANT_MIN``) constants and the storage dtype — which
+Triton infers directly from the cache pointer.  This module factors out
+the one kernel + launcher + base factory that both modes share; the
+concrete plugin files (``int8_per_token_head.py`` and
+``fp8_per_token_head.py``) add only the mode enum binding and the
+per-format clamp range.
 
-This module owns the write side: a small reshape kernel that does
-per-(token, head) absmax + symmetric quantization and writes both the
-quantized cache values and the float32 scale buffer.  INT8 and FP8 share
-the same kernel and only differ in (QUANT_MAX, QUANT_MIN) and the cache
-storage dtype (which Triton infers from the cache pointer).
+The leading underscore in the filename keeps this module out of the
+external plugin discovery scan — see
+:func:`vllm.v1.attention.ops.triton_quant_kv._ensure_external_loaded`.
 
-Symmetric quantization::
+Symmetric per-(token, head) quantization::
 
     scale = absmax / QUANT_MAX
     q = clamp(round(x / scale), QUANT_MIN, QUANT_MAX)
@@ -24,26 +25,11 @@ from __future__ import annotations
 
 import torch
 
-from vllm.model_executor.layers.quantization.utils.quant_utils import (
-    get_fp8_min_max,
-)
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-from vllm.v1.attention.ops.triton_quant_kv import register
 from vllm.v1.attention.ops.triton_quant_kv.base import QuantKVFactory
-from vllm.v1.kv_cache_interface import KVQuantMode
-
-# ---------------------------------------------------------------------------
-# Per-mode quantization range
-# ---------------------------------------------------------------------------
-_INT8_QUANT_MAX = 127.0
-_INT8_QUANT_MIN = -128.0
-_FP8_QUANT_MIN, _FP8_QUANT_MAX = get_fp8_min_max()
 
 
-# ---------------------------------------------------------------------------
-# Reshape kernel: per-(token, head) absmax → scale, store quantized + scale
-# ---------------------------------------------------------------------------
 @triton.jit
 def _reshape_cache_per_token_head_kernel(
     key_ptr,
@@ -151,7 +137,7 @@ def _reshape_cache_per_token_head_kernel(
     )
 
 
-def _run_reshape_and_cache(
+def run_per_token_head_reshape_and_cache(
     key: torch.Tensor,
     value: torch.Tensor,
     key_cache: torch.Tensor,
@@ -163,6 +149,7 @@ def _run_reshape_and_cache(
     quant_max: float,
     quant_min: float,
 ) -> None:
+    """Launch :func:`_reshape_cache_per_token_head_kernel` with autotuned warps."""
     num_tokens, num_kv_heads, head_size = key.shape
     head_size_v = value.shape[2]
     block_size = key_cache.shape[1]
@@ -207,12 +194,14 @@ def _run_reshape_and_cache(
     )
 
 
-class _PerTokenHeadFactory(QuantKVFactory):
-    """Common implementation for INT8 / FP8 per-token-head modes.
+class PerTokenHeadFactoryBase(QuantKVFactory):
+    """Common base for byte-aligned per-token-head factories (INT8 / FP8).
 
-    Subclasses set ``mode``, ``_quant_max`` and ``_quant_min``.  The
-    attention read path lives in the core kernel; this factory only
-    owns the write path and the scale-cache allocation.
+    Concrete subclasses set ``mode``, ``_quant_max`` and ``_quant_min``.
+    The attention read path lives in the core kernel via the
+    ``USE_PER_TOKEN_HEAD_SCALES`` constexpr branch; this base only owns
+    the write path and scale-cache allocation (inherited from the
+    :class:`QuantKVPlugin` default).
     """
 
     packing_factor = 1
@@ -235,7 +224,7 @@ class _PerTokenHeadFactory(QuantKVFactory):
         assert k_scale_cache is not None and v_scale_cache is not None, (
             f"{self.mode.name} requires k_scale_cache / v_scale_cache"
         )
-        _run_reshape_and_cache(
+        run_per_token_head_reshape_and_cache(
             key=key,
             value=value,
             key_cache=key_cache,
@@ -246,23 +235,3 @@ class _PerTokenHeadFactory(QuantKVFactory):
             quant_max=self._quant_max,
             quant_min=self._quant_min,
         )
-
-
-class Int8PerTokenHeadFactory(_PerTokenHeadFactory):
-    """KV cache factory for ``KVQuantMode.INT8_PER_TOKEN_HEAD``."""
-
-    mode = KVQuantMode.INT8_PER_TOKEN_HEAD
-    _quant_max = _INT8_QUANT_MAX
-    _quant_min = _INT8_QUANT_MIN
-
-
-class Fp8PerTokenHeadFactory(_PerTokenHeadFactory):
-    """KV cache factory for ``KVQuantMode.FP8_PER_TOKEN_HEAD``."""
-
-    mode = KVQuantMode.FP8_PER_TOKEN_HEAD
-    _quant_max = _FP8_QUANT_MAX
-    _quant_min = _FP8_QUANT_MIN
-
-
-register(Int8PerTokenHeadFactory())
-register(Fp8PerTokenHeadFactory())

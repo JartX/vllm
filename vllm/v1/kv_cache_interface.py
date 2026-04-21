@@ -59,7 +59,30 @@ class KVQuantMode(IntEnum):
 
     @property
     def packing_factor(self) -> int:
-        """Number of quantized values stored per cache byte (1 unless packed)."""
+        """Number of quantized values stored per cache byte (1 unless packed).
+
+        Data-driven: queries the KV-quant plugin registry when a plugin
+        is registered for this mode and uses its
+        :class:`QuantKVSpec.packing_factor`.  Falls back to the legacy
+        table for sentinel modes (``NONE``, ``FP8_PER_TENSOR``,
+        ``NVFP4``) that are not backed by a plugin.
+        """
+        # Local import to avoid a top-level cycle with the plugin
+        # registry module, which imports this enum for its own type
+        # hints.
+        from vllm.v1.attention.ops.triton_quant_kv import (
+            has_quant_kv_plugin,
+            get_quant_kv_plugin,
+        )
+
+        name = self.name.lower()
+        if has_quant_kv_plugin(name):
+            try:
+                return get_quant_kv_plugin(name).spec.packing_factor
+            except Exception:
+                # Fall through to the hard-coded table; a broken plugin
+                # should not tank page-size arithmetic during startup.
+                pass
         if self == KVQuantMode.INT2_PER_TOKEN_HEAD:
             return 4
         if self == KVQuantMode.INT4_PER_TOKEN_HEAD:
@@ -77,18 +100,26 @@ class KVQuantMode(IntEnum):
 
 
 def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
-    """Map a ``kv_cache_dtype`` string to a :class:`KVQuantMode`."""
-    if kv_cache_dtype == "int2_per_token_head":
-        return KVQuantMode.INT2_PER_TOKEN_HEAD
-    if kv_cache_dtype == "int4_per_token_head":
-        return KVQuantMode.INT4_PER_TOKEN_HEAD
-    if kv_cache_dtype == "int8_per_token_head":
-        return KVQuantMode.INT8_PER_TOKEN_HEAD
-    if kv_cache_dtype == "fp8_per_token_head":
-        return KVQuantMode.FP8_PER_TOKEN_HEAD
+    """Map a ``kv_cache_dtype`` string to a :class:`KVQuantMode`.
+
+    Uses the enum's own name table for the per-token-head modes
+    (``"int2_per_token_head"`` → :attr:`KVQuantMode.INT2_PER_TOKEN_HEAD`,
+    etc.), so adding a new enum value makes it selectable without
+    editing this function.  ``"nvfp4"`` and any ``fp8*`` string map
+    to their dedicated sentinel modes.  Anything else — including
+    external plugins registered under names not present in the enum —
+    resolves to ``NONE`` and is handled by the caller (typically by
+    consulting the plugin registry directly).
+    """
+    if not isinstance(kv_cache_dtype, str):
+        return KVQuantMode.NONE
+    try:
+        return KVQuantMode[kv_cache_dtype.upper()]
+    except KeyError:
+        pass
     if kv_cache_dtype == "nvfp4":
         return KVQuantMode.NVFP4
-    if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("fp8"):
+    if kv_cache_dtype.startswith("fp8"):
         return KVQuantMode.FP8_PER_TENSOR
     return KVQuantMode.NONE
 

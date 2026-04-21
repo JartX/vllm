@@ -70,15 +70,46 @@ T = TypeVar("T")
 
 
 def is_quantized_kv_cache(kv_cache_dtype: str) -> bool:
-    return (
+    """Return True if *kv_cache_dtype* names a quantized KV cache mode.
+
+    Recognises the builtin string patterns (``fp8*``, ``*per_token_head``,
+    ``nvfp4``) plus any external plugin registered via
+    ``VLLM_QUANT_KV_PATH``.  External plugin lookup is lazy so this
+    function stays cheap for the common unquantized path.
+    """
+    if (
         kv_cache_dtype.startswith("fp8")
         or kv_cache_dtype.endswith("per_token_head")
         or kv_cache_dtype == "nvfp4"
-    )
+    ):
+        return True
+    if kv_cache_dtype in ("auto", "float16", "bfloat16", "float32"):
+        return False
+    # Lazy plugin lookup — avoids a top-level import cycle with
+    # triton_quant_kv (which imports this module transitively).
+    try:
+        from vllm.v1.attention.ops.triton_quant_kv import get_plugin_for_dtype
+    except ImportError:
+        return False
+    plugin = get_plugin_for_dtype(kv_cache_dtype)
+    return plugin is not None and plugin.spec.name != "none"
 
 
 def kv_cache_uses_per_token_head_scales(kv_cache_dtype: str) -> bool:
-    """Return True if *kv_cache_dtype* needs per-token-head scales."""
+    """Return True if *kv_cache_dtype* needs per-token-head scales.
+
+    Checks the plugin spec first (so external plugins declaring
+    ``needs_per_token_head_scales=True`` are honoured) and falls
+    back to the name suffix convention for builtins.
+    """
+    try:
+        from vllm.v1.attention.ops.triton_quant_kv import get_plugin_for_dtype
+    except ImportError:
+        pass
+    else:
+        plugin = get_plugin_for_dtype(kv_cache_dtype)
+        if plugin is not None:
+            return plugin.spec.needs_per_token_head_scales
     return kv_cache_dtype.endswith("per_token_head")
 
 
