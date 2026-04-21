@@ -149,7 +149,20 @@ def is_quantized_kv_cache(kv_cache_dtype: str) -> bool:
 
 
 def kv_cache_uses_per_token_head_scales(kv_cache_dtype: str) -> bool:
-    """Return True if *kv_cache_dtype* needs per-token-head scales."""
+    """Return True if *kv_cache_dtype* needs per-token-head scales.
+
+    Plugin-first: for modes registered as plugins (including every
+    packed mode and any external plugin loaded via
+    ``VLLM_QUANT_KV_PATH``) the answer comes from
+    :attr:`QuantKVSpec.needs_per_token_head_scales`.  Falls back to
+    the legacy enum-based check for dtype strings not known to the
+    plugin registry.
+    """
+    from vllm.v1.attention.ops.triton_quant_kv import get_plugin_for_dtype
+
+    plugin = get_plugin_for_dtype(kv_cache_dtype)
+    if plugin is not None:
+        return plugin.spec.needs_per_token_head_scales
     return get_kv_quant_mode(kv_cache_dtype).is_per_token_head
 
 

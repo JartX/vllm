@@ -321,12 +321,25 @@ class TritonAttentionBackend(AttentionBackend):
                 STR_DTYPE_TO_TORCH_DTYPE,
                 get_dtype_size,
             )
+            from vllm.v1.attention.ops.triton_quant_kv import (
+                get_plugin_for_dtype,
+            )
 
             cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_dtype_str]
             scale_pad = get_dtype_size(torch.float32) // get_dtype_size(cache_dtype)
-            data_head_size = get_kv_quant_mode(cache_dtype_str).packed_head_size(
-                head_size
-            )
+            # Plugin-first: packed modes (int4/int2/arbitrary external
+            # plugins) are not in ``KVQuantMode`` and resolve via the
+            # registry.  Fall back to the enum for legacy byte-aligned
+            # modes (int8 / fp8 per-token-head still map to an enum
+            # value) and for anything the plugin registry does not
+            # claim.
+            plugin = get_plugin_for_dtype(cache_dtype_str)
+            if plugin is not None:
+                data_head_size = plugin.packed_head_size(head_size)
+            else:
+                data_head_size = get_kv_quant_mode(
+                    cache_dtype_str
+                ).packed_head_size(head_size)
             return (num_blocks, 2, block_size, num_kv_heads, data_head_size + scale_pad)
         return (num_blocks, 2, block_size, num_kv_heads, head_size)
 
@@ -501,7 +514,15 @@ class TritonAttentionImpl(AttentionImpl):
         self.supports_quant_query_input = current_platform.is_cuda()
 
         self._kv_quant_mode = get_kv_quant_mode(kv_cache_dtype)
-        self._is_per_token_head_quant = self._kv_quant_mode.is_per_token_head
+        # Plugin-aware: packed modes (int4/int2/external) are not in
+        # :class:`KVQuantMode` so resolving via the enum would miss
+        # them.  ``kv_cache_uses_per_token_head_scales`` consults the
+        # plugin registry first and falls back to the enum.
+        from vllm.utils.torch_utils import kv_cache_uses_per_token_head_scales
+
+        self._is_per_token_head_quant = kv_cache_uses_per_token_head_scales(
+            kv_cache_dtype
+        )
 
     def forward(
         self,
