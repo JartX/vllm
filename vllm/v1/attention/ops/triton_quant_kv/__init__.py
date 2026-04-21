@@ -279,7 +279,19 @@ def has_quant_kv_plugin(name: str) -> bool:
 
 
 def has_quant_kv_factory(mode: "KVQuantMode") -> bool:
-    """Legacy predicate keyed by :class:`KVQuantMode`."""
+    """Legacy predicate keyed by :class:`KVQuantMode`.
+
+    Returns False for :attr:`KVQuantMode.NONE` to match the contract of
+    :func:`get_quant_kv_factory` (which raises for NONE).  This keeps
+    the common ``if has_*: get_*`` pattern safe — a caller that passes
+    NONE (e.g. because the call site uses
+    ``if mode != NONE or kv_cache_dtype``) shortcuts out cleanly instead
+    of hitting the raise from the follow-up ``get_*`` call.
+    """
+    from vllm.v1.kv_cache_interface import KVQuantMode
+
+    if mode == KVQuantMode.NONE:
+        return False
     return has_quant_kv_plugin(mode.name.lower())
 
 

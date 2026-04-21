@@ -564,7 +564,17 @@ def unified_attention(
 
         if kv_cache_dtype:
             factory = get_plugin_for_dtype(kv_cache_dtype)
-        if factory is None and has_quant_kv_factory(kv_quant_mode):
+        # Legacy enum lookup is only defined for quantized modes; NONE
+        # has no plugin (``get_quant_kv_factory`` raises for it).  The
+        # outer ``kv_quant_mode != NONE or kv_cache_dtype`` condition
+        # above lets us enter this block with ``kv_quant_mode == NONE``
+        # when the caller passed a dtype string ("auto", "float16"…),
+        # so we must guard the enum branch explicitly.
+        if (
+            factory is None
+            and kv_quant_mode != KVQuantMode.NONE
+            and has_quant_kv_factory(kv_quant_mode)
+        ):
             factory = get_quant_kv_factory(kv_quant_mode)
 
         if factory is not None and factory.has_bespoke_attention:
