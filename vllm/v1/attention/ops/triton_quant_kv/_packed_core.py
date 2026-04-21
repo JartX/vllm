@@ -55,6 +55,25 @@ from vllm.v1.attention.ops.triton_unified_attention import reduce_segments
 
 float8_info = torch.finfo(current_platform.fp8_dtype())
 
+
+# ---------------------------------------------------------------------------
+# INT2 centroid dequant (used by the shared attention kernel's
+# ``PACKING_FACTOR == 4`` constexpr branch).  The quantize-side
+# companion (``_lloyd_max_quantize_4``) lives in ``int2_per_token_head``
+# because it's only used by the INT2 reshape kernel at write time; the
+# dequant lookup must live here so Triton resolves the name when
+# compiling ``_attn_packed``.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _lloyd_max_dequant_4(idx):
+    """Look up INT2 Lloyd-Max centroid for N(0, 1) inputs.  idx in [0..3]."""
+    return tl.where(
+        idx < 2,
+        tl.where(idx == 0, -1.5104, -0.4528),
+        tl.where(idx == 2, 0.4528, 1.5104),
+    )
+
+
 @triton.jit
 def _attn_packed(
     # Output destinations.  In 2D mode the final result is written into

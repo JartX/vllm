@@ -31,21 +31,16 @@ def _lloyd_max_quantize_4(z):
     """Quantize N(0,1) values to 4 Lloyd-Max centroids (INT2).
 
     Returns index in [0, 3].  Boundaries: [-0.9816, 0, 0.9816].
+
+    The inverse (centroid lookup at attention-read time) lives in
+    :mod:`_packed_core` as ``_lloyd_max_dequant_4`` because the
+    shared ``_attn_packed`` kernel references it from its
+    ``PACKING_FACTOR == 4`` constexpr branch.
     """
     return tl.where(
         z < 0.0,
         tl.where(z < -0.9816, 0, 1).to(tl.uint8),
         tl.where(z < 0.9816, 2, 3).to(tl.uint8),
-    )
-
-
-@triton.jit
-def _lloyd_max_dequant_4(idx):
-    """Look up INT2 Lloyd-Max centroid for N(0,1).  idx in [0..3]."""
-    return tl.where(
-        idx < 2,
-        tl.where(idx == 0, -1.5104, -0.4528),
-        tl.where(idx == 2, 0.4528, 1.5104),
     )
 
 
