@@ -12,6 +12,7 @@ other file in the repo.
 - [5. Adding a new mode — decide the category](#5-adding-a-new-mode--decide-the-category)
 - [6. Category A — byte-aligned symmetric absmax](#6-category-a--byte-aligned-symmetric-absmax)
 - [7. Category C — sub-byte packed compatible with the shared kernel](#7-category-c--sub-byte-packed-compatible-with-the-shared-kernel)
+  - [7.1 Where to put `@triton.jit` helpers](#71-where-to-put-tritonjit-helpers)
 - [8. Category D — custom total (new reshape AND new attention kernel)](#8-category-d--custom-total-new-reshape-and-new-attention-kernel)
 - [9. What you must NEVER touch](#9-what-you-must-never-touch)
 - [10. Testing](#10-testing)
@@ -253,6 +254,40 @@ Either:
    `_packed_core.py` (you're editing shared code — cheap if the
    delta is small), OR
 2. Jump to Category D (write your own attention kernel).
+
+### 7.1 Where to put `@triton.jit` helpers
+
+When you add a new centroid / dequant helper for your Category C
+plugin, ask which kernel actually calls it:
+
+| Helper is called by...         | Where it lives                    |
+|---|---|
+| **Shared** `_attn_packed` (read path) | `_packed_core.py`           |
+| Only your **plugin's** reshape kernel (write path) | Your plugin `.py` file |
+
+Triton's `@triton.jit` resolves referenced names from the **module
+globals where the calling kernel is defined**.  `_attn_packed` lives
+in `_packed_core.py`, so any helper it references — for example the
+`PACKING_FACTOR == 4` branch dequant — must be importable as a
+global in `_packed_core.py` itself.  Putting that helper in the
+plugin file will blow up at launch with:
+
+```
+NameError('<helper> is not defined')
+```
+
+Rule of thumb: if `grep -n <helper_name> _packed_core.py` returns a
+hit, the helper belongs in `_packed_core.py`.  Write-path helpers
+(the ones only your reshape kernel calls) stay local to the plugin
+so the plugin file remains the single source of truth for that
+mode's encode math.
+
+Concrete split, using INT2 as the worked example:
+
+- `_lloyd_max_dequant_4` (read-path centroid lookup, used by the
+  shared kernel) → lives in `_packed_core.py`.
+- `_lloyd_max_quantize_4` (write-path quantizer, used only by the
+  INT2 reshape kernel) → lives in `int2_per_token_head.py`.
 
 ## 8. Category D — custom total (new reshape AND new attention kernel)
 
