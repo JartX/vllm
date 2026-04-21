@@ -707,6 +707,389 @@ def _launch_packed_attn(
         )
 
 
+# ===========================================================================
+# Flash-attention-shape prefill kernel for sub-byte packed modes.
+#
+# ``_attn_packed`` above is grid-tuned for decode (small BLOCK_M, split-KV
+# via IS_3D when num_seqs fits).  For long chunked prefill with cached
+# context, its BLOCK_M defaults to 16 for MHA / small-group GQA, which
+# wastes the K-reuse opportunity across BLOCK_M queries of the same
+# request.  ``_attn_packed_prefill`` uses the flash-attention layout —
+# grid ``(num_reqs, Hq, cdiv(max_q_len, BLOCK_M))`` with BLOCK_M × BLOCK_N
+# tiles — so one K tile feeds 32 or 64 queries instead of 16.  Scope is
+# intentionally narrow (no alibi / sinks / softcap / sliding window /
+# mm_prefix / qq_bias); the factory routes those cases back to
+# ``_launch_packed_attn``.  Same split-dot across PACKING_FACTOR streams
+# as ``_attn_packed``; INT4 applies the asymmetric zero-point correction
+# (packed in the low 4 mantissa bits of the fp32 scale), INT2 does the
+# Lloyd-Max centroid lookup.
+# ===========================================================================
+
+
+@triton.jit
+def _attn_packed_prefill(
+    Q_ptr,
+    K_cache_ptr,
+    V_cache_ptr,
+    K_scale_ptr,
+    V_scale_ptr,
+    Block_table_ptr,
+    Query_start_loc_ptr,
+    Seq_lens_ptr,
+    Out_ptr,
+    stride_q_tok: tl.int64,
+    stride_q_h: tl.int64,
+    stride_kc_blk: tl.int64,
+    stride_kc_slot: tl.int64,
+    stride_kc_head: tl.int64,
+    stride_vc_blk: tl.int64,
+    stride_vc_slot: tl.int64,
+    stride_vc_head: tl.int64,
+    stride_ks_blk: tl.int64,
+    stride_ks_slot: tl.int64,
+    stride_ks_head: tl.int64,
+    stride_vs_blk: tl.int64,
+    stride_vs_slot: tl.int64,
+    stride_vs_head: tl.int64,
+    stride_bt_r: tl.int64,
+    stride_o_tok: tl.int64,
+    stride_o_h: tl.int64,
+    SM_SCALE: tl.constexpr,
+    KV_GROUP: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_SIZE: tl.constexpr,
+    PACKED_HEAD_PADDED: tl.constexpr,
+    # 2 → INT4 nibbles (asymmetric + zp); 4 → INT2 quartets (Lloyd-Max).
+    PACKING_FACTOR: tl.constexpr,
+):
+    req_id = tl.program_id(0)
+    head_id = tl.program_id(1)
+    start_m = tl.program_id(2)
+
+    kv_head = head_id // KV_GROUP
+
+    q_start = tl.load(Query_start_loc_ptr + req_id)
+    q_end = tl.load(Query_start_loc_ptr + req_id + 1)
+    q_len = q_end - q_start
+
+    block_start = start_m * BLOCK_M
+    if block_start >= q_len:
+        return
+
+    seq_len = tl.load(Seq_lens_ptr + req_id)
+    cached_len = seq_len - q_len
+
+    offs_m = block_start + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    packed_offs = tl.arange(0, PACKED_HEAD_PADDED)
+    m_mask = offs_m < q_len
+
+    # Split-Q prologue: PACKING_FACTOR interleaved streams.  K is stored
+    # as 1 byte per packed_offs holding PACKING_FACTOR values at indices
+    # (packed_offs*PF + 0..PF-1).  We load matching Q stripes so the
+    # split dot ``sum_i Q_si·K_si`` reconstructs the full Q·Kᵀ.
+    offs_s0 = packed_offs * PACKING_FACTOR
+    offs_s1 = packed_offs * PACKING_FACTOR + 1
+    mask_s0 = offs_s0 < HEAD_SIZE
+    mask_s1 = offs_s1 < HEAD_SIZE
+    packed_dim_mask = packed_offs < HEAD_SIZE // PACKING_FACTOR
+
+    q_row_off = (q_start + offs_m)[:, None] * stride_q_tok + head_id * stride_q_h
+    q_mask = m_mask[:, None]
+
+    Q_s0 = tl.load(
+        Q_ptr + q_row_off + offs_s0[None, :],
+        mask=mask_s0[None, :] & q_mask,
+        other=0.0,
+    ).to(tl.float32)
+    Q_s1 = tl.load(
+        Q_ptr + q_row_off + offs_s1[None, :],
+        mask=mask_s1[None, :] & q_mask,
+        other=0.0,
+    ).to(tl.float32)
+    if PACKING_FACTOR == 4:
+        offs_s2 = packed_offs * 4 + 2
+        offs_s3 = packed_offs * 4 + 3
+        mask_s2 = offs_s2 < HEAD_SIZE
+        mask_s3 = offs_s3 < HEAD_SIZE
+        Q_s2 = tl.load(
+            Q_ptr + q_row_off + offs_s2[None, :],
+            mask=mask_s2[None, :] & q_mask,
+            other=0.0,
+        ).to(tl.float32)
+        Q_s3 = tl.load(
+            Q_ptr + q_row_off + offs_s3[None, :],
+            mask=mask_s3[None, :] & q_mask,
+            other=0.0,
+        ).to(tl.float32)
+
+    # INT4 asymmetric correction needs sum(Q) per row.
+    if PACKING_FACTOR == 2:
+        Q_sum = tl.sum(Q_s0, axis=1) + tl.sum(Q_s1, axis=1)
+
+    m_i = tl.full([BLOCK_M], -float("inf"), dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc_s0 = tl.zeros([BLOCK_M, PACKED_HEAD_PADDED], dtype=tl.float32)
+    acc_s1 = tl.zeros([BLOCK_M, PACKED_HEAD_PADDED], dtype=tl.float32)
+    if PACKING_FACTOR == 4:
+        acc_s2 = tl.zeros([BLOCK_M, PACKED_HEAD_PADDED], dtype=tl.float32)
+        acc_s3 = tl.zeros([BLOCK_M, PACKED_HEAD_PADDED], dtype=tl.float32)
+
+    q_pos = cached_len + offs_m
+    end_n = tl.minimum(seq_len, cached_len + block_start + BLOCK_M)
+
+    bt_base = req_id * stride_bt_r
+
+    for start_n in range(0, end_n, BLOCK_N):
+        k_pos = start_n + offs_n
+        valid_k = k_pos < seq_len
+
+        page_idx = k_pos // BLOCK_SIZE
+        page_off = k_pos % BLOCK_SIZE
+        block_nums = tl.load(
+            Block_table_ptr + bt_base + page_idx, mask=valid_k, other=0
+        )
+
+        # K : [PACKED_HEAD_PADDED, BLOCK_N] — packed bytes, 1 byte holds
+        # PACKING_FACTOR values.  Stride within a head is 1 byte.
+        k_addrs = (
+            block_nums[None, :] * stride_kc_blk
+            + page_off[None, :] * stride_kc_slot
+            + kv_head * stride_kc_head
+            + packed_offs[:, None]
+        )
+        K_packed = tl.load(
+            K_cache_ptr + k_addrs,
+            mask=valid_k[None, :] & packed_dim_mask[:, None],
+            other=0,
+        )
+
+        # V : [BLOCK_N, PACKED_HEAD_PADDED]
+        v_addrs = (
+            block_nums[:, None] * stride_vc_blk
+            + page_off[:, None] * stride_vc_slot
+            + kv_head * stride_vc_head
+            + packed_offs[None, :]
+        )
+        V_packed = tl.load(
+            V_cache_ptr + v_addrs,
+            mask=valid_k[:, None] & packed_dim_mask[None, :],
+            other=0,
+        )
+
+        # Dequantize KV.  Layouts mirror ``_attn_packed``:
+        # INT4 → nibble pair, zp on the score side.
+        # INT2 → quartet indices, Lloyd-Max centroids.
+        if PACKING_FACTOR == 2:
+            K_s0_u, K_s1_u = unpack_int4_nibbles(K_packed)
+            K_s0 = K_s0_u.to(tl.float32)
+            K_s1 = K_s1_u.to(tl.float32)
+            V_s0_u, V_s1_u = unpack_int4_nibbles(V_packed)
+            V_s0 = V_s0_u.to(tl.float32)
+            V_s1 = V_s1_u.to(tl.float32)
+        else:
+            kc0_u, kc1_u, kc2_u, kc3_u = unpack_int2_quartet(K_packed)
+            K_s0 = _lloyd_max_dequant_4(kc0_u).to(tl.float32)
+            K_s1 = _lloyd_max_dequant_4(kc1_u).to(tl.float32)
+            K_s2 = _lloyd_max_dequant_4(kc2_u).to(tl.float32)
+            K_s3 = _lloyd_max_dequant_4(kc3_u).to(tl.float32)
+            vc0_u, vc1_u, vc2_u, vc3_u = unpack_int2_quartet(V_packed)
+            V_s0 = _lloyd_max_dequant_4(vc0_u).to(tl.float32)
+            V_s1 = _lloyd_max_dequant_4(vc1_u).to(tl.float32)
+            V_s2 = _lloyd_max_dequant_4(vc2_u).to(tl.float32)
+            V_s3 = _lloyd_max_dequant_4(vc3_u).to(tl.float32)
+
+        ks_idx = (
+            block_nums * stride_ks_blk
+            + page_off * stride_ks_slot
+            + kv_head * stride_ks_head
+        )
+        ks_raw = tl.load(K_scale_ptr + ks_idx, mask=valid_k, other=0.0)
+        vs_idx = (
+            block_nums * stride_vs_blk
+            + page_off * stride_vs_slot
+            + kv_head * stride_vs_head
+        )
+        vs_raw = tl.load(V_scale_ptr + vs_idx, mask=valid_k, other=0.0)
+
+        # INT4 steganographs the 4-bit zero-point in the low 4 bits of
+        # the float32 scale's mantissa.  INT2 stores a plain scale.
+        if PACKING_FACTOR == 2:
+            ks_bits = ks_raw.to(tl.int32, bitcast=True)
+            k_zp = (ks_bits & 0xF).to(tl.float32)
+            k_tok_head_scales = (ks_bits & -16).to(tl.float32, bitcast=True)
+            vs_bits = vs_raw.to(tl.int32, bitcast=True)
+            v_zp = (vs_bits & 0xF).to(tl.float32)
+            v_tok_head_scales = (vs_bits & -16).to(tl.float32, bitcast=True)
+        else:
+            k_tok_head_scales = ks_raw
+            v_tok_head_scales = vs_raw
+
+        # S = Q @ Kᵀ (split across PACKING_FACTOR streams).  Fused
+        # softmax_scale * per-(token, head) k_scale in one mul.
+        if PACKING_FACTOR == 2:
+            raw_dot = tl.dot(Q_s0, K_s0) + tl.dot(Q_s1, K_s1)
+            qk = (raw_dot - Q_sum[:, None] * k_zp[None, :]) * (
+                SM_SCALE * k_tok_head_scales[None, :]
+            )
+        else:
+            raw_dot = (
+                tl.dot(Q_s0, K_s0)
+                + tl.dot(Q_s1, K_s1)
+                + tl.dot(Q_s2, K_s2)
+                + tl.dot(Q_s3, K_s3)
+            )
+            qk = raw_dot * (SM_SCALE * k_tok_head_scales[None, :])
+
+        # Causal mask: absolute positions within the sequence.
+        causal = k_pos[None, :] <= q_pos[:, None]
+        full_mask = causal & valid_k[None, :]
+        qk = tl.where(full_mask, qk, -float("inf"))
+
+        m_ij = tl.maximum(m_i, tl.max(qk, 1))
+        qk = qk - m_ij[:, None]
+        p = tl.exp(qk)
+        l_ij = tl.sum(p, 1)
+
+        alpha = tl.exp(m_i - m_ij)
+        l_i = l_i * alpha + l_ij
+        acc_s0 = acc_s0 * alpha[:, None]
+        acc_s1 = acc_s1 * alpha[:, None]
+        if PACKING_FACTOR == 4:
+            acc_s2 = acc_s2 * alpha[:, None]
+            acc_s3 = acc_s3 * alpha[:, None]
+
+        # P @ V (split across streams).  INT4 also subtracts the
+        # v-zero-point contribution from each stream once.
+        P_v = p * v_tok_head_scales[None, :]
+        if PACKING_FACTOR == 2:
+            Pv_zp_sum = tl.sum(P_v * v_zp[None, :], axis=1)
+            acc_s0 += tl.dot(P_v, V_s0) - Pv_zp_sum[:, None]
+            acc_s1 += tl.dot(P_v, V_s1) - Pv_zp_sum[:, None]
+        else:
+            acc_s0 += tl.dot(P_v, V_s0)
+            acc_s1 += tl.dot(P_v, V_s1)
+            acc_s2 += tl.dot(P_v, V_s2)
+            acc_s3 += tl.dot(P_v, V_s3)
+
+        m_i = m_ij
+
+    safe_l = tl.where(l_i > 0.0, l_i, 1.0)
+    acc_s0 = acc_s0 / safe_l[:, None]
+    acc_s1 = acc_s1 / safe_l[:, None]
+    if PACKING_FACTOR == 4:
+        acc_s2 = acc_s2 / safe_l[:, None]
+        acc_s3 = acc_s3 / safe_l[:, None]
+
+    out_row_off = (q_start + offs_m)[:, None] * stride_o_tok + head_id * stride_o_h
+    out_mask = m_mask[:, None]
+    tl.store(
+        Out_ptr + out_row_off + offs_s0[None, :],
+        acc_s0,
+        mask=mask_s0[None, :] & out_mask,
+    )
+    tl.store(
+        Out_ptr + out_row_off + offs_s1[None, :],
+        acc_s1,
+        mask=mask_s1[None, :] & out_mask,
+    )
+    if PACKING_FACTOR == 4:
+        tl.store(
+            Out_ptr + out_row_off + offs_s2[None, :],
+            acc_s2,
+            mask=mask_s2[None, :] & out_mask,
+        )
+        tl.store(
+            Out_ptr + out_row_off + offs_s3[None, :],
+            acc_s3,
+            mask=mask_s3[None, :] & out_mask,
+        )
+
+
+def launch_packed_prefill(
+    *,
+    q: torch.Tensor,
+    out: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k_scale_cache: torch.Tensor,
+    v_scale_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    softmax_scale: float,
+    num_reqs: int,
+    max_query_len: int,
+    packing_factor: int,
+) -> None:
+    """Launch ``_attn_packed_prefill`` for INT4 or INT2.
+
+    Scope: causal attention only, no alibi / sinks / softcap / sliding
+    window / mm_prefix / qq_bias.  Callers that need those features
+    should route back to ``_launch_packed_attn``.
+    """
+    total_q, Hq, head_size = q.shape
+    Hkv = k_cache.shape[2]
+    kv_group = Hq // Hkv
+    block_size = k_cache.shape[1]
+
+    if total_q == 0 or num_reqs == 0:
+        return
+
+    # BLOCK_M × PACKING_FACTOR streams dominates register pressure;
+    # back off on large heads.  Values match the tuning of the
+    # byte-aligned prefill kernel once you account for the extra streams.
+    if head_size <= 64:
+        BLOCK_M = 64
+    else:
+        BLOCK_M = 32
+    BLOCK_N = 64
+    packed_head_padded = triton.next_power_of_2(head_size) // packing_factor
+
+    grid = (num_reqs, Hq, triton.cdiv(max_query_len, BLOCK_M))
+
+    _attn_packed_prefill[grid](
+        q,
+        k_cache,
+        v_cache,
+        k_scale_cache,
+        v_scale_cache,
+        block_table,
+        query_start_loc,
+        seq_lens,
+        out,
+        q.stride(0),
+        q.stride(1),
+        k_cache.stride(0),
+        k_cache.stride(1),
+        k_cache.stride(2),
+        v_cache.stride(0),
+        v_cache.stride(1),
+        v_cache.stride(2),
+        k_scale_cache.stride(0),
+        k_scale_cache.stride(1),
+        k_scale_cache.stride(2),
+        v_scale_cache.stride(0),
+        v_scale_cache.stride(1),
+        v_scale_cache.stride(2),
+        block_table.stride(0),
+        out.stride(0),
+        out.stride(1),
+        SM_SCALE=softmax_scale,
+        KV_GROUP=kv_group,
+        BLOCK_SIZE=block_size,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        HEAD_SIZE=head_size,
+        PACKED_HEAD_PADDED=packed_head_padded,
+        PACKING_FACTOR=packing_factor,
+        num_warps=4 if head_size <= 64 else 8,
+        num_stages=2,
+    )
+
+
 def _run_reshape_kernel(
     kernel,
     *,
@@ -904,6 +1287,54 @@ class _PackedFactory(QuantKVPlugin):
             softmax_segm_output=softmax_segm_output,
             softmax_segm_max=softmax_segm_max,
             softmax_segm_expsum=softmax_segm_expsum,
+            packing_factor=self.spec.packing_factor,
+        )
+
+        out_f = self._unrotate_out(out, head_size)
+        out.copy_(out_f.to(q_orig_dtype))
+
+    def unified_attention_prefill(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        out: torch.Tensor,
+        *,
+        query_start_loc: torch.Tensor,
+        seq_lens: torch.Tensor,
+        block_table: torch.Tensor,
+        softmax_scale: float,
+        num_reqs: int,
+        max_query_len: int,
+        k_scale_cache: torch.Tensor,
+        v_scale_cache: torch.Tensor,
+    ) -> None:
+        """Flash-attention-shape prefill for this packed mode.
+
+        Scope matches :func:`launch_packed_prefill`: causal attention
+        only, no alibi / sinks / softcap / sliding window / mm_prefix /
+        qq_bias.  Caller gates on those being unset; when they're set,
+        route to :meth:`unified_attention` which forwards to
+        ``_launch_packed_attn`` (handles all of the above).
+        """
+        q_orig_dtype = q.dtype
+        q = self._rotate_q(q.float()).to(q_orig_dtype)
+        head_size = q.shape[2]
+        softmax_scale = self._transform_softmax_scale(softmax_scale, head_size)
+
+        launch_packed_prefill(
+            q=q,
+            out=out,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            k_scale_cache=k_scale_cache,
+            v_scale_cache=v_scale_cache,
+            block_table=block_table,
+            query_start_loc=query_start_loc,
+            seq_lens=seq_lens,
+            softmax_scale=softmax_scale,
+            num_reqs=num_reqs,
+            max_query_len=max_query_len,
             packing_factor=self.spec.packing_factor,
         )
 

@@ -117,6 +117,10 @@ def kernel_unified_attention(
     # Sub-byte packed modes (INT4=4, INT2=5) are dispatched to dedicated
     # backends in ``vllm.v1.attention.ops.triton_quant_kv``.
     KV_QUANT_MODE: tl.constexpr = 0,
+    # Route the Q·Kᵀ dot through native int8 WMMA/MFMA when the K cache is
+    # int8 and the platform has int8 tensor cores (ROCm RDNA3/4, CDNA2/3).
+    # Requires KV_QUANT_MODE >= 2 (per-token-head scales present).
+    QK_INT8_WMMA: tl.constexpr = False,
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
 ):
@@ -169,6 +173,15 @@ def kernel_unified_attention(
         mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
         other=0.0,
     )
+
+    # Per-row symmetric int8 quantization of Q, reused across all K tiles.
+    # Lifts the fp32→int8 cast out of the K loop and feeds the int8
+    # WMMA/MFMA dot on the Q side.  Dead code when QK_INT8_WMMA=False.
+    if QK_INT8_WMMA:
+        Q_f32 = Q.to(tl.float32)
+        q_absmax = tl.max(tl.abs(Q_f32), axis=1)
+        q_scale = tl.maximum(q_absmax * (1.0 / 127.0), 1e-6)
+        Q_q = tl.clamp(Q_f32 * (1.0 / q_scale)[:, None], -128.0, 127.0).to(tl.int8)
 
     block_table_offset = seq_idx * block_table_stride
 
@@ -224,12 +237,22 @@ def kernel_unified_attention(
             + offs_d[:, None] * stride_k_cache_3
             + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
         )
-        K_load = tl.load(
-            key_cache_ptr + k_offset,
-            mask=dim_mask[:, None] & tile_mask[None, :],
-            other=0.0,
-        )
-        K = cast_kv_tile(K_load, Q, k_scale, KV_QUANT_MODE)
+        if QK_INT8_WMMA:
+            # `other` must stay integer in the int8 path so Triton doesn't
+            # promote the int8 load to float and break the int8 tl.dot.
+            K_load = tl.load(
+                key_cache_ptr + k_offset,
+                mask=dim_mask[:, None] & tile_mask[None, :],
+                other=0,
+            )
+            K = K_load
+        else:
+            K_load = tl.load(
+                key_cache_ptr + k_offset,
+                mask=dim_mask[:, None] & tile_mask[None, :],
+                other=0.0,
+            )
+            K = cast_kv_tile(K_load, Q, k_scale, KV_QUANT_MODE)
         V_load = tl.load(
             value_cache_ptr + v_offset,
             mask=dim_mask[None, :] & tile_mask[:, None],
@@ -269,7 +292,14 @@ def kernel_unified_attention(
 
         # S : (BLOCK_M, TILE_SIZE)
         S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
-        if USE_PER_TOKEN_HEAD_SCALES:
+        if QK_INT8_WMMA:
+            # int8 WMMA/MFMA QK: fused rescale =
+            #   softmax_scale * q_scale(per row) * k_scale(per col)
+            qk_i32 = tl.dot(Q_q, K, out_dtype=tl.int32)
+            S += qk_i32.to(tl.float32) * (
+                scale * q_scale[:, None] * k_token_head_scales[None, :]
+            )
+        elif USE_PER_TOKEN_HEAD_SCALES:
             # Fuse softmax_scale with per-(token, head) k_scale in one mul.
             S += tl.dot(Q, K) * (scale * k_token_head_scales[None, :])
         else:
@@ -666,6 +696,13 @@ def unified_attention(
         grid = (total_num_q_blocks, num_kv_heads, num_par_softmax_segments)
         tile_size = TILE_SIZE_DECODE
 
+    # Int8 per-token-head on ROCm → route the Q·Kᵀ dot through native
+    # int8 WMMA (RDNA3/4) / MFMA (CDNA2/3) for ~2× bf16 throughput.
+    use_rocm_int8_wmma_qk = (
+        kv_quant_mode == KVQuantMode.INT8_PER_TOKEN_HEAD
+        and current_platform.is_rocm()
+    )
+
     kernel_unified_attention[grid](
         output_ptr=out,
         segm_output_ptr=segm_output_ptr,
@@ -729,6 +766,7 @@ def unified_attention(
         USE_FP8=output_scale is not None,
         IS_3D=use_3d,
         KV_QUANT_MODE=kv_quant_mode,
+        QK_INT8_WMMA=use_rocm_int8_wmma_qk,
     )
 
     if use_3d:

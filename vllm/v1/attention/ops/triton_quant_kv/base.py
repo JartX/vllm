@@ -143,6 +143,23 @@ class QuantKVPlugin(ABC):
         """
         return type(self).unified_attention is not QuantKVPlugin.unified_attention
 
+    @property
+    def has_bespoke_prefill(self) -> bool:
+        """True if this plugin provides a flash-attention-shape prefill.
+
+        The triton backend uses this to gate its continuation-chunk
+        prefill fast paths (FP3 / FP4): when True, the prefill slice is
+        routed to :meth:`unified_attention_prefill`; when False, the
+        slice falls through to :meth:`unified_attention` (or the core
+        kernel) which is decode-tuned and under-utilizes the dot units
+        for long chunks.  Plugins without a prefill specialization
+        simply leave this as the default.
+        """
+        return (
+            type(self).unified_attention_prefill
+            is not QuantKVPlugin.unified_attention_prefill
+        )
+
     # ----- Cache shape introspection ---------------------------------------
     def packed_head_size(self, head_size: int) -> int:
         """Storage head size after packing: ``head_size // packing_factor``."""
@@ -236,6 +253,46 @@ class QuantKVPlugin(ABC):
             f"attention kernel.  Modes without a bespoke kernel are "
             f"expected to be handled by the core unified_attention "
             f"kernel via its constexpr dispatch."
+        )
+
+    def unified_attention_prefill(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        out: torch.Tensor,
+        *,
+        query_start_loc: torch.Tensor,
+        seq_lens: torch.Tensor,
+        block_table: torch.Tensor,
+        softmax_scale: float,
+        num_reqs: int,
+        max_query_len: int,
+        k_scale_cache: torch.Tensor | None = None,
+        v_scale_cache: torch.Tensor | None = None,
+    ) -> None:
+        """Optional flash-attention-shape prefill for this plugin.
+
+        When overridden, :attr:`has_bespoke_prefill` becomes True and
+        the triton backend routes continuation-chunk prefill slices
+        (per-request ``q_len > 1`` with cached context) here instead
+        of to the decode-shaped :meth:`unified_attention`.  The
+        caller pre-filters for the narrow-scope prefill contract:
+
+          * Causal attention, no alibi / sinks / softcap / qq_bias.
+          * No sliding window, no ``mm_prefix_range``, no
+            ``output_scale``.
+
+        Plugins that need any of those features should leave this
+        unoverridden; the slice will fall through to
+        :meth:`unified_attention` (slower but full-feature).
+
+        The default raises: callers must gate on
+        :attr:`has_bespoke_prefill` before invoking.
+        """
+        raise NotImplementedError(
+            f"Plugin {self.spec.name!r} does not implement a prefill "
+            f"kernel.  Check ``has_bespoke_prefill`` before calling."
         )
 
 

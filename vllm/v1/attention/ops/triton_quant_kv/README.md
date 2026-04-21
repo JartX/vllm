@@ -125,6 +125,26 @@ class QuantKVPlugin(ABC):
         """Read path — override only when your mode needs a custom kernel.
         Default raises; modes that can ride the core kernel leave this
         alone and the dispatcher falls through."""
+
+    @property
+    def has_bespoke_prefill(self) -> bool:
+        """Auto: True iff unified_attention_prefill is overridden."""
+
+    def unified_attention_prefill(
+        self, q, k_cache, v_cache, out, *,
+        query_start_loc, seq_lens, block_table,
+        softmax_scale, num_reqs, max_query_len,
+        k_scale_cache=None, v_scale_cache=None,
+    ) -> None:
+        """Optional flash-attention-shape prefill entry point.
+
+        The triton backend routes continuation-chunk prefill slices
+        (q_len > 1 with cached context) here when ``has_bespoke_prefill``
+        is True.  Narrow contract: causal attention only, no alibi /
+        sinks / softcap / sliding window / mm_prefix / qq_bias /
+        output_scale.  Plugins that need any of those features leave
+        this unoverridden; the slice falls back to ``unified_attention``
+        which carries the full feature set at decode-tuned shape."""
 ```
 
 ### `register(plugin)`

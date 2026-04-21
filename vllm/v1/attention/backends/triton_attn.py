@@ -30,6 +30,10 @@ from vllm.v1.attention.backend import (
     MultipleOf,
 )
 from vllm.v1.attention.backends.utils import get_kv_cache_layout
+from vllm.v1.attention.ops.triton_per_token_head_attention import (
+    triton_per_token_head_attention,
+    triton_per_token_head_prefill,
+)
 from vllm.v1.attention.ops.triton_prefill_attention import context_attention_fwd
 from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash,
@@ -44,6 +48,8 @@ from vllm.v1.kv_cache_interface import (
 )
 
 logger = init_logger(__name__)
+
+_CONTINUATION_DECODE_THRESHOLD = 128
 
 
 # constants
@@ -87,6 +93,21 @@ class TritonAttentionMetadata:
     prefix_scheduler_metadata: torch.Tensor | None = None
     mm_prefix_range: dict[int, list[tuple[int, int]]] | None = None
     mm_prefix_range_tensor: torch.Tensor | None = None
+
+    all_pure_first_prefill: bool = False
+
+    num_decodes: int = 0
+    num_decode_tokens: int = 0
+    prefill_is_first_chunk: bool = False
+
+    seq_lens_cpu: torch.Tensor | None = None
+    query_start_loc_cpu: torch.Tensor | None = None
+
+    # Per-token-head kernel inputs: precomputed on CPU in build() and copied
+    # into pre-allocated GPU buffers so pointers are stable across CUDA graph
+    # capture/replay. Slices into the builder-owned buffers.
+    q_to_req: torch.Tensor | None = None
+    q_to_klen: torch.Tensor | None = None
 
     @staticmethod
     def compute_mm_prefix_range_tensor(
@@ -135,6 +156,23 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         device: torch.device,
     ):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+
+        # Plugin-aware: includes modes not in :class:`KVQuantMode`
+        # (int2/int4/external plugins).
+        self._is_per_token_head = kv_cache_spec._needs_per_token_head_scales
+        if self._is_per_token_head:
+            self._init_reorder_batch_threshold(1, supports_spec_as_decode=False)
+            # Persistent GPU buffers for the kernel's per-query maps. Sized
+            # to max_num_batched_tokens — the scheduler's upper bound on
+            # tokens per forward. Pointers stay stable across CUDA graph
+            # capture/replay; build() writes contents via .copy_().
+            max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+            self._q_to_req_buf = torch.empty(
+                max_tokens, dtype=torch.int32, device=device
+            )
+            self._q_to_klen_buf = torch.empty(
+                max_tokens, dtype=torch.int32, device=device
+            )
 
         self.block_size = kv_cache_spec.block_size
 
@@ -207,6 +245,8 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         # max_model_len will cause graph capture to be extremely
         # slow, so here we set it to 1.
         attn_metadata.seq_lens.fill_(1)
+        attn_metadata.all_pure_first_prefill = False
+        attn_metadata.prefill_is_first_chunk = False
         return attn_metadata
 
     def build(
@@ -225,6 +265,67 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         slot_mapping = common_attn_metadata.slot_mapping
 
         use_cascade = common_prefix_len > 0
+
+        # Per-request check.  Only runs when the scheduler already
+        # materialized the CPU copy of seq_lens — otherwise we skip the
+        # fast-path gate to avoid triggering a D2H sync here.
+        seq_lens_cpu = common_attn_metadata._seq_lens_cpu
+        qsl_cpu = None
+        num_decodes = 0
+        num_decode_tokens = 0
+        prefill_is_first_chunk = False
+        if seq_lens_cpu is not None:
+            qsl_cpu = common_attn_metadata.query_start_loc_cpu
+            query_lens_cpu = qsl_cpu[1:] - qsl_cpu[:-1]
+            all_pure_first_prefill = bool(
+                torch.equal(query_lens_cpu, seq_lens_cpu.to(query_lens_cpu.dtype))
+            )
+            if self._is_per_token_head:
+                decode_mask = query_lens_cpu <= 1
+                if bool(decode_mask.all()):
+                    num_decodes = int(query_lens_cpu.shape[0])
+                elif not bool(decode_mask[0]):
+                    num_decodes = 0
+                else:
+                    num_decodes = int(decode_mask.to(torch.int32).sum().item())
+                num_decode_tokens = int(qsl_cpu[num_decodes].item())
+                if num_decodes < query_lens_cpu.shape[0]:
+                    ql_pref = query_lens_cpu[num_decodes:]
+                    sl_pref = seq_lens_cpu[num_decodes:].to(ql_pref.dtype)
+                    prefill_is_first_chunk = bool(torch.equal(ql_pref, sl_pref))
+
+                # Compute per-query maps on CPU and stage into persistent
+                # GPU buffers. Pointers are stable; only contents change.
+                q_lens_i32 = query_lens_cpu.to(torch.int32)
+                num_reqs_total = q_lens_i32.shape[0]
+                total_q = int(qsl_cpu[-1].item())
+                if total_q > 0:
+                    if num_reqs_total == total_q:
+                        # Pure decode fast path: q_to_req = arange,
+                        # q_to_klen = seq_lens.
+                        q_to_req_cpu = torch.arange(num_reqs_total, dtype=torch.int32)
+                        q_to_klen_cpu = seq_lens_cpu.to(torch.int32)
+                    else:
+                        qsl_i32 = qsl_cpu[:-1].to(torch.int32)
+                        seq_lens_i32 = seq_lens_cpu.to(torch.int32)
+                        q_to_req_cpu = torch.repeat_interleave(
+                            torch.arange(num_reqs_total, dtype=torch.int32),
+                            q_lens_i32,
+                        )
+                        cached_len_per_req = seq_lens_i32 - q_lens_i32
+                        pos_in_req = (
+                            torch.arange(total_q, dtype=torch.int32)
+                            - qsl_i32[q_to_req_cpu.long()]
+                        )
+                        q_to_klen_cpu = (
+                            cached_len_per_req[q_to_req_cpu.long()] + pos_in_req + 1
+                        )
+                    self._q_to_req_buf[:total_q].copy_(q_to_req_cpu, non_blocking=True)
+                    self._q_to_klen_buf[:total_q].copy_(
+                        q_to_klen_cpu, non_blocking=True
+                    )
+        else:
+            all_pure_first_prefill = False
 
         if use_cascade:
             cu_prefix_query_lens = torch.tensor(
@@ -260,6 +361,22 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             softmax_segm_output=self.softmax_segm_output,
             softmax_segm_max=self.softmax_segm_max,
             softmax_segm_expsum=self.softmax_segm_expsum,
+            all_pure_first_prefill=all_pure_first_prefill,
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
+            prefill_is_first_chunk=prefill_is_first_chunk,
+            seq_lens_cpu=seq_lens_cpu,
+            query_start_loc_cpu=qsl_cpu,
+            q_to_req=(
+                self._q_to_req_buf[:num_actual_tokens]
+                if self._is_per_token_head and num_actual_tokens > 0
+                else None
+            ),
+            q_to_klen=(
+                self._q_to_klen_buf[:num_actual_tokens]
+                if self._is_per_token_head and num_actual_tokens > 0
+                else None
+            ),
         )
         return attn_metadata
 
@@ -314,9 +431,6 @@ class TritonAttentionBackend(AttentionBackend):
         if block_size % 16 != 0:
             raise ValueError("Block size must be a multiple of 16.")
         if kv_cache_uses_per_token_head_scales(cache_dtype_str):
-            # Pad head_size by sizeof(float32)/sizeof(cache_dtype) so
-            # the per-head scale fits inline.  The backend extracts
-            # data[:head_size] and scale[head_size:] via typed views.
             from vllm.utils.torch_utils import (
                 STR_DTYPE_TO_TORCH_DTYPE,
                 get_dtype_size,
@@ -327,12 +441,8 @@ class TritonAttentionBackend(AttentionBackend):
 
             cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_dtype_str]
             scale_pad = get_dtype_size(torch.float32) // get_dtype_size(cache_dtype)
-            # Plugin-first: packed modes (int4/int2/arbitrary external
-            # plugins) are not in ``KVQuantMode`` and resolve via the
-            # registry.  Fall back to the enum for legacy byte-aligned
-            # modes (int8 / fp8 per-token-head still map to an enum
-            # value) and for anything the plugin registry does not
-            # claim.
+            # Plugin-first: packed modes (int4/int2/external) resolve via
+            # the registry; fall back to the enum for byte-aligned modes.
             plugin = get_plugin_for_dtype(cache_dtype_str)
             if plugin is not None:
                 data_head_size = plugin.packed_head_size(head_size)
@@ -340,7 +450,10 @@ class TritonAttentionBackend(AttentionBackend):
                 data_head_size = get_kv_quant_mode(
                     cache_dtype_str
                 ).packed_head_size(head_size)
-            return (num_blocks, 2, block_size, num_kv_heads, data_head_size + scale_pad)
+            # Fused K+V layout: [K_data|K_scale|V_data|V_scale] per slot.
+            # Dim 1 is size-1 to keep the 5-dim rank for stride_order compat.
+            slot_size = 2 * (data_head_size + scale_pad)
+            return (num_blocks, 1, block_size, num_kv_heads, slot_size)
         return (num_blocks, 2, block_size, num_kv_heads, head_size)
 
     @staticmethod
@@ -404,27 +517,117 @@ class TritonAttentionBackend(AttentionBackend):
 
 
 class TritonAttentionImpl(AttentionImpl):
-    # Per-token-head quant: scale views carved from inline head padding.
+    # Per-token-head fused layout views (carved from single 4-dim cache).
+    _key_cache_view: torch.Tensor | None = None
+    _value_cache_view: torch.Tensor | None = None
     _k_scale_cache: torch.Tensor | None = None
     _v_scale_cache: torch.Tensor | None = None
 
-    def _ensure_scale_caches(self, kv_cache: torch.Tensor) -> None:
-        """Extract per-head scale views from the padded head dimension.
+    def _ensure_fused_cache_views(
+        self, kv_cache: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Create K, V, K_scale, V_scale strided views from fused cache.
 
-        The KV cache shape is ``(num_blocks, 2, block_size, nkv, hs+pad)``
-        where ``pad = sizeof(float32) / sizeof(cache_dtype)``.  The last
-        ``pad`` elements of each head hold one float32 scale.  We create
-        strided float32 views over those bytes.
+        Fused layout (5-dim with dummy size-1 dim for rank compat):
+        ``(num_blocks, 1, block_size, nkv, slot_size)`` where
+        ``slot = [K_data(hs) | K_scale(sp) | V_data(hs) | V_scale(sp)]``.
+        ``sp = sizeof(float32) / sizeof(cache_dtype)`` elements (=4 for fp8).
 
-        Scale shape: ``(num_blocks, block_size, num_kv_heads)``
+        Creates zero-copy views that existing Triton kernels (store + read)
+        can consume via ``.stride()`` without any kernel code changes.
         """
+        cur_ptr = kv_cache.data_ptr()
+        if (
+            self._k_scale_cache is not None
+            and self._key_cache_view is not None
+            and self._value_cache_view is not None
+            and self._v_scale_cache is not None
+            and getattr(self, "_pth_cache_ptr", None) == cur_ptr
+        ):
+            return (
+                self._key_cache_view,
+                self._value_cache_view,
+                self._k_scale_cache,
+                self._v_scale_cache,
+            )
+        self._pth_cache_ptr = cur_ptr
+        from vllm.utils.torch_utils import get_dtype_size
+
+        num_blocks, _, block_size, nkv, slot_size = kv_cache.shape
+        dtype_sz = kv_cache.element_size()
+        scale_pad = get_dtype_size(torch.float32) // dtype_sz
+        padded_hs = slot_size // 2  # hs + scale_pad
+        hs = padded_hs - scale_pad
+
+        # Read physical strides from the tensor (tolerates any stride_order)
+        s_blk, _, s_slot, s_head, _ = kv_cache.stride()
+
+        # Key data view: (num_blocks, block_size, nkv, hs) at offset 0
+        self._key_cache_view = torch.as_strided(
+            kv_cache,
+            size=(num_blocks, block_size, nkv, hs),
+            stride=(s_blk, s_slot, s_head, 1),
+            storage_offset=0,
+        )
+
+        # Value data view: same strides, offset by padded_hs elements
+        self._value_cache_view = torch.as_strided(
+            kv_cache,
+            size=(num_blocks, block_size, nkv, hs),
+            stride=(s_blk, s_slot, s_head, 1),
+            storage_offset=padded_hs,
+        )
+
+        # Scale views (fp32) — same underlying storage, different dtype
+        raw = kv_cache.untyped_storage()
+        base_f32 = torch.tensor([], dtype=torch.float32, device=kv_cache.device).set_(
+            raw
+        )
+
+        s_blk_f32 = s_blk * dtype_sz // 4
+        s_slot_f32 = s_slot * dtype_sz // 4
+        s_head_f32 = s_head * dtype_sz // 4
+
+        # K scale at byte offset hs*dtype_sz within each slot
+        k_scale_off_f32 = hs * dtype_sz // 4
+        self._k_scale_cache = torch.as_strided(
+            base_f32,
+            size=(num_blocks, block_size, nkv),
+            stride=(s_blk_f32, s_slot_f32, s_head_f32),
+            storage_offset=k_scale_off_f32,
+        )
+        self._k_scale_cache.fill_(1.0)
+
+        # V scale at byte offset (padded_hs + hs)*dtype_sz within each slot
+        v_scale_off_f32 = (padded_hs + hs) * dtype_sz // 4
+        self._v_scale_cache = torch.as_strided(
+            base_f32,
+            size=(num_blocks, block_size, nkv),
+            stride=(s_blk_f32, s_slot_f32, s_head_f32),
+            storage_offset=v_scale_off_f32,
+        )
+        self._v_scale_cache.fill_(1.0)
+        return (
+            self._key_cache_view,
+            self._value_cache_view,
+            self._k_scale_cache,
+            self._v_scale_cache,
+        )
+
+    # Legacy 5-dim scale extraction kept for potential non-per-token-head
+    # callers; current code always uses _ensure_fused_cache_views when the
+    # per-token-head flag is on.
+    def _ensure_scale_caches(self, kv_cache: torch.Tensor) -> None:
+        if self._is_per_token_head_quant:
+            self._ensure_fused_cache_views(kv_cache)
+            return
         if self._k_scale_cache is not None:
             return
         from vllm.utils.torch_utils import get_dtype_size
 
         num_blocks, _, block_size, nkv, padded_hs = kv_cache.shape
         dtype_sz = kv_cache.element_size()
-        scale_pad = get_dtype_size(torch.float32) // dtype_sz  # e.g. 4
+        scale_pad = get_dtype_size(torch.float32) // dtype_sz
         hs = padded_hs - scale_pad
 
         raw = kv_cache.untyped_storage()
@@ -432,16 +635,12 @@ class TritonAttentionImpl(AttentionImpl):
             raw
         )
 
-        # In the raw bytes, each (block, kv_half, slot, head) occupies
-        # padded_hs * dtype_sz bytes.  The scale float32 sits at byte
-        # offset hs * dtype_sz within that region.
         kv_half_bytes = block_size * nkv * padded_hs * dtype_sz
-        full_block_f32 = 2 * kv_half_bytes // 4  # stride between blocks
-        slot_f32 = nkv * padded_hs * dtype_sz // 4  # stride between slots
-        head_f32 = padded_hs * dtype_sz // 4  # stride between heads
-        scale_off_f32 = hs * dtype_sz // 4  # offset to scale within head
+        full_block_f32 = 2 * kv_half_bytes // 4
+        slot_f32 = nkv * padded_hs * dtype_sz // 4
+        head_f32 = padded_hs * dtype_sz // 4
+        scale_off_f32 = hs * dtype_sz // 4
 
-        # K scales: kv_half=0
         self._k_scale_cache = torch.as_strided(
             base_f32,
             size=(num_blocks, block_size, nkv),
@@ -450,7 +649,6 @@ class TritonAttentionImpl(AttentionImpl):
         )
         self._k_scale_cache.fill_(1.0)
 
-        # V scales: kv_half=1, offset by kv_half_bytes
         v_base_f32 = kv_half_bytes // 4
         self._v_scale_cache = torch.as_strided(
             base_f32,
@@ -524,6 +722,29 @@ class TritonAttentionImpl(AttentionImpl):
             kv_cache_dtype
         )
 
+        # Stash any plugin that advertises a flash-attention-shape prefill
+        # kernel (``has_bespoke_prefill``).  The triton backend routes
+        # continuation-chunk prefill slices through
+        # ``unified_attention_prefill`` when this is set, avoiding the
+        # decode-tuned ``unified_attention`` for long prefill.  Contract
+        # is plugin-agnostic: in-tree packed factories (int4 / int2) set
+        # the override, and external plugins that implement the hook
+        # opt in automatically — no ``isinstance`` check.
+        self._prefill_plugin = None
+        if self._is_per_token_head_quant:
+            from vllm.config import get_current_vllm_config
+
+            vllm_config = get_current_vllm_config()
+            self.max_num_kv_splits = (
+                vllm_config.attention_config.tq_max_kv_splits_for_cuda_graph
+            )
+
+            from vllm.v1.attention.ops.triton_quant_kv import get_plugin_for_dtype
+
+            plugin = get_plugin_for_dtype(kv_cache_dtype)
+            if plugin is not None and plugin.has_bespoke_prefill:
+                self._prefill_plugin = plugin
+
     def forward(
         self,
         layer: torch.nn.Module,
@@ -584,10 +805,298 @@ class TritonAttentionImpl(AttentionImpl):
                 layer,
             )
 
-        # Per-token-head quantized KV cache: use separate scale caches.
+        # Per-token-head fast paths.  Two gates:
+        #
+        # * ``_is_per_token_head_quant`` (all int8 / fp8 / int4 / int2 /
+        #   external plugin modes) gates paths that do NOT inspect the
+        #   packed cache bytes directly — FP1 attends over raw K/V from
+        #   the model projection (the cache isn't read), and FP2 routes
+        #   its decode slice through ``unified_attention`` which
+        #   dispatches to the plugin's own attention kernel for packed
+        #   modes.  int4 / int2 benefit from both.
+        #
+        # * ``is_byte_aligned_pth`` (int8 / fp8 only) additionally gates
+        #   ``triton_per_token_head_{prefill, attention}`` — those kernels
+        #   assume 1 logical value per byte and would misread packed
+        #   quartets / nibbles.
+        is_byte_aligned_pth = self._is_per_token_head_quant and self._kv_quant_mode in (
+            KVQuantMode.INT8_PER_TOKEN_HEAD,
+            KVQuantMode.FP8_PER_TOKEN_HEAD,
+        )
+        if (
+            self._is_per_token_head_quant
+            and self.alibi_slopes is None
+            and not self.use_alibi_sqrt
+            and self.sinks is None
+            and not self.logits_soft_cap
+            and attn_metadata.mm_prefix_range_tensor is None
+            and output_scale is None
+            and self.kv_sharing_target_layer_name is None
+            and key is not None
+            and value is not None
+        ):
+            num_dec = attn_metadata.num_decodes
+            num_dec_tok = attn_metadata.num_decode_tokens
+            pref_first_chunk = attn_metadata.prefill_is_first_chunk
+            all_first_chunk = attn_metadata.all_pure_first_prefill
+
+            # FP1: pure first-chunk prefill over raw K/V (cache not read).
+            # Mode-agnostic.
+            if num_dec == 0 and all_first_chunk:
+                context_attention_fwd(
+                    q=query[:num_actual_tokens],
+                    k=key[:num_actual_tokens],
+                    v=value[:num_actual_tokens],
+                    o=output[:num_actual_tokens],
+                    b_start_loc=attn_metadata.query_start_loc,
+                    b_seq_len=attn_metadata.seq_lens,
+                    max_input_len=attn_metadata.max_query_len,
+                    is_causal=True,
+                    softmax_scale=self.scale,
+                    sliding_window_q=self.sliding_window[0],
+                    sliding_window_k=self.sliding_window[1],
+                )
+                return output
+
+            # FP2: decode + first-chunk prefill.  Decode slice goes
+            # through unified_attention (plugin dispatch handles packed
+            # modes); prefill slice attends over raw K/V.
+            if num_dec > 0 and num_dec_tok < num_actual_tokens and pref_first_chunk:
+                key_cache, value_cache, k_scale_cache, v_scale_cache = (
+                    self._ensure_fused_cache_views(kv_cache)
+                )
+                # fp8 re-interpret only applies to the fp8 mode; packed
+                # modes keep uint8 so the plugin kernel reads raw bytes.
+                if (
+                    self._kv_quant_mode == KVQuantMode.FP8_PER_TOKEN_HEAD
+                    and key_cache.dtype == torch.uint8
+                ):
+                    key_cache = key_cache.view(self.fp8_dtype)
+                    value_cache = value_cache.view(self.fp8_dtype)
+
+                unified_attention(
+                    q=query[:num_dec_tok],
+                    k=key_cache,
+                    v=value_cache,
+                    out=output[:num_dec_tok],
+                    cu_seqlens_q=attn_metadata.query_start_loc[: num_dec + 1],
+                    max_seqlen_q=1,
+                    seqused_k=attn_metadata.seq_lens[:num_dec],
+                    max_seqlen_k=attn_metadata.max_seq_len,
+                    softmax_scale=self.scale,
+                    causal=True,
+                    alibi_slopes=None,
+                    use_alibi_sqrt=False,
+                    window_size=self.sliding_window,
+                    block_table=attn_metadata.block_table[:num_dec],
+                    softcap=0,
+                    q_descale=None,
+                    k_descale=None,
+                    v_descale=None,
+                    seq_threshold_3D=attn_metadata.seq_threshold_3D,
+                    num_par_softmax_segments=attn_metadata.num_par_softmax_segments,
+                    softmax_segm_output=attn_metadata.softmax_segm_output,
+                    softmax_segm_max=attn_metadata.softmax_segm_max,
+                    softmax_segm_expsum=attn_metadata.softmax_segm_expsum,
+                    sinks=None,
+                    output_scale=None,
+                    mm_prefix_range=None,
+                    kv_quant_mode=self._kv_quant_mode,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    k_scale_cache=k_scale_cache,
+                    v_scale_cache=v_scale_cache,
+                )
+
+                pref_qsl = attn_metadata.query_start_loc[num_dec:] - num_dec_tok
+                pref_max_q = attn_metadata.max_query_len
+                context_attention_fwd(
+                    q=query[num_dec_tok:num_actual_tokens],
+                    k=key[num_dec_tok:num_actual_tokens],
+                    v=value[num_dec_tok:num_actual_tokens],
+                    o=output[num_dec_tok:num_actual_tokens],
+                    b_start_loc=pref_qsl,
+                    b_seq_len=attn_metadata.seq_lens[num_dec:],
+                    max_input_len=pref_max_q,
+                    is_causal=True,
+                    softmax_scale=self.scale,
+                    sliding_window_q=self.sliding_window[0],
+                    sliding_window_k=self.sliding_window[1],
+                )
+                return output
+
+            # FP3/FP4: continuation-chunk prefill.
+            # Byte-aligned (int8/fp8) → ``triton_per_token_head_prefill``.
+            # Any plugin advertising ``has_bespoke_prefill`` (including
+            # in-tree packed factories int4 / int2 and external plugins
+            # implementing the hook) → its ``unified_attention_prefill``.
+            # Plugins without a prefill override fall through below.
+            has_prefill_kernel = (
+                is_byte_aligned_pth or self._prefill_plugin is not None
+            )
+            if has_prefill_kernel:
+                # FP3: pure prefill with continuation.
+                if (
+                    num_dec == 0
+                    and num_actual_tokens > 0
+                    and self.sliding_window == (-1, -1)
+                ):
+                    key_cache, value_cache, k_scale_cache, v_scale_cache = (
+                        self._ensure_fused_cache_views(kv_cache)
+                    )
+                    # fp8 re-interpret only for FP8_PER_TOKEN_HEAD; packed
+                    # modes keep uint8 for the plugin's raw-byte reads.
+                    if (
+                        self._kv_quant_mode == KVQuantMode.FP8_PER_TOKEN_HEAD
+                        and key_cache.dtype == torch.uint8
+                    ):
+                        key_cache = key_cache.view(self.fp8_dtype)
+                        value_cache = value_cache.view(self.fp8_dtype)
+                    num_reqs_pref = attn_metadata.query_start_loc.shape[0] - 1
+
+                    if is_byte_aligned_pth:
+                        # int8 cache on ROCm → route Q·Kᵀ through native
+                        # int8 WMMA/MFMA (~2× bf16 throughput).  fp8
+                        # cache keeps the bf16 path.
+                        use_qk_int8_wmma = (
+                            key_cache.dtype == torch.int8
+                            and current_platform.is_rocm()
+                        )
+                        triton_per_token_head_prefill(
+                            query=query[:num_actual_tokens],
+                            output=output[:num_actual_tokens],
+                            key_cache=key_cache,
+                            value_cache=value_cache,
+                            k_scale_cache=k_scale_cache,
+                            v_scale_cache=v_scale_cache,
+                            block_table=attn_metadata.block_table,
+                            query_start_loc=attn_metadata.query_start_loc,
+                            seq_lens=attn_metadata.seq_lens,
+                            softmax_scale=self.scale,
+                            num_reqs=num_reqs_pref,
+                            max_query_len=attn_metadata.max_query_len,
+                            use_qk_int8_wmma=use_qk_int8_wmma,
+                        )
+                    else:
+                        self._prefill_plugin.unified_attention_prefill(
+                            q=query[:num_actual_tokens],
+                            k_cache=key_cache,
+                            v_cache=value_cache,
+                            out=output[:num_actual_tokens],
+                            query_start_loc=attn_metadata.query_start_loc,
+                            seq_lens=attn_metadata.seq_lens,
+                            block_table=attn_metadata.block_table,
+                            softmax_scale=self.scale,
+                            num_reqs=num_reqs_pref,
+                            max_query_len=attn_metadata.max_query_len,
+                            k_scale_cache=k_scale_cache,
+                            v_scale_cache=v_scale_cache,
+                        )
+                    return output
+
+                # FP4: mixed decode + continuation prefill.
+                if (
+                    num_dec > 0
+                    and num_dec_tok < num_actual_tokens
+                    and self.sliding_window == (-1, -1)
+                ):
+                    key_cache, value_cache, k_scale_cache, v_scale_cache = (
+                        self._ensure_fused_cache_views(kv_cache)
+                    )
+                    if (
+                        self._kv_quant_mode == KVQuantMode.FP8_PER_TOKEN_HEAD
+                        and key_cache.dtype == torch.uint8
+                    ):
+                        key_cache = key_cache.view(self.fp8_dtype)
+                        value_cache = value_cache.view(self.fp8_dtype)
+
+                    # Decode slice through unified_attention; the plugin
+                    # dispatcher routes packed modes to _attn_packed.
+                    unified_attention(
+                        q=query[:num_dec_tok],
+                        k=key_cache,
+                        v=value_cache,
+                        out=output[:num_dec_tok],
+                        cu_seqlens_q=attn_metadata.query_start_loc[: num_dec + 1],
+                        max_seqlen_q=1,
+                        seqused_k=attn_metadata.seq_lens[:num_dec],
+                        max_seqlen_k=attn_metadata.max_seq_len,
+                        softmax_scale=self.scale,
+                        causal=True,
+                        alibi_slopes=None,
+                        use_alibi_sqrt=False,
+                        window_size=self.sliding_window,
+                        block_table=attn_metadata.block_table[:num_dec],
+                        softcap=0,
+                        q_descale=None,
+                        k_descale=None,
+                        v_descale=None,
+                        seq_threshold_3D=attn_metadata.seq_threshold_3D,
+                        num_par_softmax_segments=attn_metadata.num_par_softmax_segments,
+                        softmax_segm_output=attn_metadata.softmax_segm_output,
+                        softmax_segm_max=attn_metadata.softmax_segm_max,
+                        softmax_segm_expsum=attn_metadata.softmax_segm_expsum,
+                        sinks=None,
+                        output_scale=None,
+                        mm_prefix_range=None,
+                        kv_quant_mode=self._kv_quant_mode,
+                        kv_cache_dtype=self.kv_cache_dtype,
+                        k_scale_cache=k_scale_cache,
+                        v_scale_cache=v_scale_cache,
+                    )
+
+                    pref_qsl = attn_metadata.query_start_loc[num_dec:] - num_dec_tok
+                    num_reqs_pref = (
+                        attn_metadata.query_start_loc.shape[0] - 1 - num_dec
+                    )
+
+                    if is_byte_aligned_pth:
+                        use_qk_int8_wmma = (
+                            key_cache.dtype == torch.int8
+                            and current_platform.is_rocm()
+                        )
+                        triton_per_token_head_prefill(
+                            query=query[num_dec_tok:num_actual_tokens],
+                            output=output[num_dec_tok:num_actual_tokens],
+                            key_cache=key_cache,
+                            value_cache=value_cache,
+                            k_scale_cache=k_scale_cache,
+                            v_scale_cache=v_scale_cache,
+                            block_table=attn_metadata.block_table[num_dec:],
+                            query_start_loc=pref_qsl,
+                            seq_lens=attn_metadata.seq_lens[num_dec:],
+                            softmax_scale=self.scale,
+                            num_reqs=num_reqs_pref,
+                            max_query_len=attn_metadata.max_query_len,
+                            use_qk_int8_wmma=use_qk_int8_wmma,
+                        )
+                    else:
+                        self._prefill_plugin.unified_attention_prefill(
+                            q=query[num_dec_tok:num_actual_tokens],
+                            k_cache=key_cache,
+                            v_cache=value_cache,
+                            out=output[num_dec_tok:num_actual_tokens],
+                            query_start_loc=pref_qsl,
+                            seq_lens=attn_metadata.seq_lens[num_dec:],
+                            block_table=attn_metadata.block_table[num_dec:],
+                            softmax_scale=self.scale,
+                            num_reqs=num_reqs_pref,
+                            max_query_len=attn_metadata.max_query_len,
+                            k_scale_cache=k_scale_cache,
+                            v_scale_cache=v_scale_cache,
+                        )
+                    return output
+
+        # Per-token-head: dedicated split-KV kernel for decode and small
+        # continuation prefill (q_len ≤ threshold). Same trick as TQ: each
+        # query gets its own causal K length via q_to_klen. For large
+        # continuation (q_len > threshold), fall through to unified_attention.
         if self._is_per_token_head_quant:
-            self._ensure_scale_caches(kv_cache)
-            key_cache, value_cache = kv_cache.unbind(1)
+            key_cache, value_cache, k_scale_cache, v_scale_cache = (
+                self._ensure_fused_cache_views(kv_cache)
+            )
+            # Only FP8_PER_TOKEN_HEAD stores bytes that should be viewed as
+            # fp8.  INT4/INT2 plugins keep uint8 storage so the plugin's
+            # kernel sees raw packed bytes via data_ptr/strides.
             if (
                 self._kv_quant_mode == KVQuantMode.FP8_PER_TOKEN_HEAD
                 and key_cache.dtype == torch.uint8
@@ -596,8 +1105,45 @@ class TritonAttentionImpl(AttentionImpl):
                 value_cache = value_cache.view(self.fp8_dtype)
             k_descale = None
             v_descale = None
-            k_scale_cache = self._k_scale_cache
-            v_scale_cache = self._v_scale_cache
+
+            if (
+                is_byte_aligned_pth
+                and attn_metadata.max_query_len <= _CONTINUATION_DECODE_THRESHOLD
+                and attn_metadata.q_to_req is not None
+                and attn_metadata.q_to_klen is not None
+                and self.alibi_slopes is None
+                and not self.use_alibi_sqrt
+                and self.sinks is None
+                and not self.logits_soft_cap
+                and self.sliding_window == (-1, -1)
+                and attn_metadata.mm_prefix_range_tensor is None
+                and output_scale is None
+            ):
+                mid_o_buf = getattr(layer, "_pth_mid_o_buf", None)
+                output_buf = getattr(layer, "_pth_output_buf", None)
+                lse_buf = getattr(layer, "_pth_lse_buf", None)
+                use_qk_int8_wmma = (
+                    key_cache.dtype == torch.int8 and current_platform.is_rocm()
+                )
+                triton_per_token_head_attention(
+                    query=query[:num_actual_tokens],
+                    key_cache=key_cache,
+                    value_cache=value_cache,
+                    k_scale_cache=k_scale_cache,
+                    v_scale_cache=v_scale_cache,
+                    block_table=attn_metadata.block_table,
+                    q_to_req=attn_metadata.q_to_req,
+                    q_to_klen=attn_metadata.q_to_klen,
+                    scale=self.scale,
+                    max_num_kv_splits=self.max_num_kv_splits,
+                    output=output[:num_actual_tokens],
+                    mid_o_buf=mid_o_buf,
+                    output_buf=output_buf,
+                    lse_buf=lse_buf,
+                    buf_holder=layer,
+                    use_qk_int8_wmma=use_qk_int8_wmma,
+                )
+                return output
         # FP8 per-tensor / auto path (original flow).
         else:
             key_cache, value_cache = kv_cache.unbind(1)
@@ -726,8 +1272,9 @@ class TritonAttentionImpl(AttentionImpl):
             return
         # Reshape the input keys and values and store them in the cache.
         if self._is_per_token_head_quant:
-            self._ensure_scale_caches(kv_cache)
-            key_cache, value_cache = kv_cache.unbind(1)
+            key_cache, value_cache, k_scale_cache, v_scale_cache = (
+                self._ensure_fused_cache_views(kv_cache)
+            )
             if (
                 self._kv_quant_mode == KVQuantMode.FP8_PER_TOKEN_HEAD
                 and key_cache.dtype == torch.uint8
@@ -739,8 +1286,8 @@ class TritonAttentionImpl(AttentionImpl):
                 value,
                 key_cache,
                 value_cache,
-                self._k_scale_cache,
-                self._v_scale_cache,
+                k_scale_cache,
+                v_scale_cache,
                 slot_mapping,
                 kv_quant_mode=self._kv_quant_mode,
                 kv_cache_dtype=self.kv_cache_dtype,
