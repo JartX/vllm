@@ -177,6 +177,8 @@ def compute_tile_loop_bounds(
     SLIDING_WINDOW: tl.constexpr,
     USE_MM_PREFIX: tl.constexpr,
     IS_3D: tl.constexpr,
+    CHUNK_LOOKBACK: tl.constexpr = -1,
+    CHUNK_SIZE: tl.constexpr = -1,
 ):
     """Compute the tile-loop bounds ``(loop_lo, loop_hi)`` and the
     derived ``max_seq_prefix_len`` used for per-tile masking.
@@ -187,8 +189,11 @@ def compute_tile_loop_bounds(
        Clamped to ``seq_len`` (causal) or extended to it when
        mm_prefix is active (bidirectional ranges can reach past the
        causal prefix).
-    2. Sliding-window pruning: narrows ``[tile_start, tile_end)`` to
-       only tiles that can contain an allowed key under SWA.
+    2. Sliding-window / chunked pruning: narrows ``[tile_start, tile_end)``
+       to only tiles that can contain an allowed key.  When
+       ``CHUNK_LOOKBACK > -1`` the first-allowed-key uses aligned
+       chunks (``(q_abs // CHUNK_SIZE - CHUNK_LOOKBACK) * CHUNK_SIZE``)
+       instead of the rolling window.
     3. 3D scoping: when ``IS_3D`` is True, further narrows to the
        segment's slice via ``(segm_idx * tiles_per_segment,
        (segm_idx + 1) * tiles_per_segment)``.
@@ -214,7 +219,11 @@ def compute_tile_loop_bounds(
             qpos_lo + (BLOCK_M - 1) // num_queries_per_kv,
             cur_batch_query_len - 1,
         )
-        first_allowed_key = context_len + qpos_lo - SLIDING_WINDOW + 1
+        q_abs = context_len + qpos_lo
+        if CHUNK_LOOKBACK > -1:
+            first_allowed_key = ((q_abs // CHUNK_SIZE) - CHUNK_LOOKBACK) * CHUNK_SIZE
+        else:
+            first_allowed_key = q_abs - SLIDING_WINDOW + 1
         last_allowed_key = context_len + qpos_hi
         tile_start = tl.maximum(0, first_allowed_key // TILE_SIZE)
         tile_end = tl.minimum((last_allowed_key // TILE_SIZE) + 1, num_tiles)
@@ -265,19 +274,36 @@ def compute_kv_seq_mask(
     seq_offset,
     seq_idx,
     mm_prefix_range_ptr,
+    context_len,
+    query_pos,
     SLIDING_WINDOW: tl.constexpr,
     USE_MM_PREFIX: tl.constexpr,
     MAX_MM_RANGES: tl.constexpr,
+    CHUNK_LOOKBACK: tl.constexpr = -1,
+    CHUNK_SIZE: tl.constexpr = -1,
 ):
     """Build the KV mask for one tile.
 
-    Causal (key <= query) by default; AND-ed with the sliding window when
-    enabled; OR-ed with the bidirectional ranges from ``mm_prefix_range``
-    when PrefixLM / multimodal attention is active.  The order matches
-    FlexAttention: ``(causal AND sliding_window) OR mm_prefix``.
+    Causal (key <= query) by default; AND-ed with the sliding window or
+    chunked-attention constraint when enabled; OR-ed with the
+    bidirectional ranges from ``mm_prefix_range`` when PrefixLM /
+    multimodal attention is active.  The order matches FlexAttention:
+    ``(causal AND [sliding_window | chunk]) OR mm_prefix``.
+
+    Chunked attention: when ``CHUNK_LOOKBACK > -1``, keys are restricted
+    to within ``CHUNK_LOOKBACK`` aligned chunks behind the query chunk
+    (``q // CHUNK_SIZE - k // CHUNK_SIZE <= CHUNK_LOOKBACK``).
     """
     seq_mask = seq_offset[None, :] <= query_abs_pos
-    if SLIDING_WINDOW > 0:
+    if CHUNK_LOOKBACK > -1:
+        seq_mask = seq_mask & (
+            (
+                (context_len + query_pos[:, None]) // CHUNK_SIZE
+                - (seq_offset[None, :] // CHUNK_SIZE)
+            )
+            <= CHUNK_LOOKBACK
+        )
+    elif SLIDING_WINDOW > 0:
         seq_mask = seq_mask & ((query_abs_pos - seq_offset) < SLIDING_WINDOW)
     if USE_MM_PREFIX:
         for i in range(MAX_MM_RANGES):

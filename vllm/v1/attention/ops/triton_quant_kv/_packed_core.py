@@ -363,6 +363,8 @@ def _attn_packed(
             seq_offset,
             seq_idx,
             mm_prefix_range_ptr,
+            context_len,
+            query_pos,
             SLIDING_WINDOW,
             USE_MM_PREFIX,
             MAX_MM_RANGES,
