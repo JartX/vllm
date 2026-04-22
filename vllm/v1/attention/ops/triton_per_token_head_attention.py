@@ -111,10 +111,14 @@ def _pth_attn_stage1(
             + kv_head * stride_kc_head
         )
         k_addrs = k_bases[:, None] + d_offs[None, :]
+        # ``other`` stays float so Triton does not have to cast an int
+        # literal to the K cache dtype — that fails for fp8e4nv.  This
+        # kernel does a scalar multiply-reduce (no int8 WMMA), so we can
+        # always use a float sentinel.
         k_raw = tl.load(
             K_ptr + k_addrs,
             mask=kv_mask[:, None] & d_mask[None, :],
-            other=0,
+            other=0.0,
         )
         k_f = k_raw.to(tl.float32)
 
@@ -144,7 +148,7 @@ def _pth_attn_stage1(
         v_raw = tl.load(
             V_ptr + v_addrs,
             mask=kv_mask[:, None] & d_mask[None, :],
-            other=0,
+            other=0.0,
         )
         v_f = v_raw.to(tl.float32)
 
