@@ -171,6 +171,16 @@ kMxfp4StaticGroupScale = ScaleDesc(MXFP_SCALE_DTYPE, True, GroupShape(1, 32))
 kMxfp4Static = QuantKey(FP4_DTYPE, scale=kMxfp4StaticGroupScale, symmetric=True)
 
 
+def create_fp8_quant_key(
+    static: bool,
+    group_shape: GroupShape,
+    symmetric: bool = True,
+    scale_dtype: torch.dtype = torch.float32,
+) -> QuantKey:
+    scale_desc = ScaleDesc(scale_dtype, static, group_shape)
+    return QuantKey(FP8_DTYPE, scale_desc, symmetric=symmetric)
+
+
 # Normalize the group_shape to the full extent for any dims that are -1
 def _normalize_quant_group_shape(x: torch.Tensor, group_shape: GroupShape):
     # -1 means full extent
@@ -808,7 +818,7 @@ def convert_bf16_scales_to_fp8(
 
     # restore original shape
     fp8_scales = fp8_scales.view(orig_shape)
-    chan_scales = chan_scales.view(orig_shape[:-1], -1)
+    chan_scales = chan_scales.view(*orig_shape[:-1], -1)
 
     return fp8_scales, chan_scales
 

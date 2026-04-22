@@ -17,7 +17,7 @@ from vllm.logger import init_logger
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 from vllm.utils.math_utils import cdiv
-from vllm.utils.torch_utils import get_dtype_size
+from vllm.utils.torch_utils import get_dtype_size, nvfp4_kv_cache_full_dim
 
 logger = init_logger(__name__)
 
@@ -38,23 +38,57 @@ class KVQuantMode(IntEnum):
     FP8_PER_TENSOR = 1  # per-tensor scales (current fp8 path)
     INT8_PER_TOKEN_HEAD = 2  # per-token-head dynamic scales for int8
     FP8_PER_TOKEN_HEAD = 3  # per-token-head dynamic scales for fp8
-    INT4_PER_TOKEN_HEAD = 4  # packed 2×int4/byte, asymmetric zp in scale bits
+    INT4_PER_TOKEN_HEAD = 4  # packed 2×int4/byte, RHT + asymmetric zp
+    INT2_PER_TOKEN_HEAD = 5  # Hadamard + Lloyd-Max 4 centroids, 4×int2/byte
+    NVFP4 = 6  # packed fp4 data + fp8 block scales
 
     @property
     def is_per_token_head(self) -> bool:
         """True for any per-token-head quantization mode."""
-        return self >= 2
+        return self in (
+            KVQuantMode.INT8_PER_TOKEN_HEAD,
+            KVQuantMode.FP8_PER_TOKEN_HEAD,
+            KVQuantMode.INT4_PER_TOKEN_HEAD,
+            KVQuantMode.INT2_PER_TOKEN_HEAD,
+        )
+
+    @property
+    def is_nvfp4(self) -> bool:
+        """True for NVFP4 packed quantization mode."""
+        return self == KVQuantMode.NVFP4
+
+    @property
+    def packing_factor(self) -> int:
+        """Number of quantized values stored per cache byte (1 unless packed)."""
+        if self == KVQuantMode.INT2_PER_TOKEN_HEAD:
+            return 4
+        if self == KVQuantMode.INT4_PER_TOKEN_HEAD:
+            return 2
+        return 1
+
+    def packed_head_size(self, head_size: int) -> int:
+        """Storage head size after packing: ``head_size // packing_factor``."""
+        factor = self.packing_factor
+        assert head_size % factor == 0, (
+            f"head_size={head_size} is not divisible by packing factor "
+            f"{factor} required by {self.name}"
+        )
+        return head_size // factor
 
 
 def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
     """Map a ``kv_cache_dtype`` string to a :class:`KVQuantMode`."""
+    if kv_cache_dtype == "int2_per_token_head":
+        return KVQuantMode.INT2_PER_TOKEN_HEAD
     if kv_cache_dtype == "int4_per_token_head":
         return KVQuantMode.INT4_PER_TOKEN_HEAD
     if kv_cache_dtype == "int8_per_token_head":
         return KVQuantMode.INT8_PER_TOKEN_HEAD
     if kv_cache_dtype == "fp8_per_token_head":
         return KVQuantMode.FP8_PER_TOKEN_HEAD
-    if kv_cache_dtype.startswith("fp8"):
+    if kv_cache_dtype == "nvfp4":
+        return KVQuantMode.NVFP4
+    if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("fp8"):
         return KVQuantMode.FP8_PER_TENSOR
     return KVQuantMode.NONE
 
@@ -136,19 +170,13 @@ class AttentionSpec(KVCacheSpec):
             return self.page_size_padded
         return real_page_size
 
-    def _effective_head_size(self, hs: int) -> int:
-        """Return the storage head size: halved for INT4 packed."""
-        if self.kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD:
-            return hs // 2
-        return hs
-
     @property
     def real_page_size_bytes(self) -> int:
         return (
             2
             * self.block_size
             * self.num_kv_heads
-            * self._effective_head_size(self.head_size)
+            * self.kv_quant_mode.packed_head_size(self.head_size)
             * get_dtype_size(self.dtype)
         )
 
@@ -246,15 +274,54 @@ class FullAttentionSpec(AttentionSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
+        if self.kv_quant_mode.is_nvfp4:
+            # Packed layout per head: fp4 data + fp8 block scales.
+            # fp4 data: head_size//2 bytes (2 fp4 values per byte)
+            # fp8 block scale: head_size//16 bytes (1 scale per 16 elements)
+            last_dim = nvfp4_kv_cache_full_dim(
+                self.head_size
+            ) + nvfp4_kv_cache_full_dim(self.head_size_v)
+            return (
+                self.block_size
+                * self.num_kv_heads
+                * last_dim
+                * get_dtype_size(self.dtype)
+            )
         return (
             self.block_size
             * self.num_kv_heads
             * (
-                self._effective_head_size(self.head_size)
-                + self._effective_head_size(self.head_size_v)
+                self.kv_quant_mode.packed_head_size(self.head_size)
+                + self.kv_quant_mode.packed_head_size(self.head_size_v)
             )
             * get_dtype_size(self.dtype)
         )
+
+
+@dataclass(frozen=True, kw_only=True)
+class TQFullAttentionSpec(FullAttentionSpec):
+    """FullAttentionSpec with TQ-aware page size.
+
+    Python equivalent of the C++ TQ4FullAttentionSpec. Overrides
+    real_page_size_bytes to use TQ slot bytes instead of the raw
+    head_size * dtype formula.
+    """
+
+    tq_slot_size: int = 0
+
+    @property
+    def real_page_size_bytes(self) -> int:
+        if self.tq_slot_size > 0:
+            return self.block_size * self.num_kv_heads * self.tq_slot_size
+        return super().real_page_size_bytes
+
+    @classmethod
+    def merge(cls, specs: list[Self]) -> Self:
+        merged = super().merge(specs)
+        assert all(s.tq_slot_size == specs[0].tq_slot_size for s in specs), (
+            "All TQ layers in the same KV cache group must use the same tq_slot_size."
+        )
+        return replace(merged, tq_slot_size=specs[0].tq_slot_size)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -271,7 +338,7 @@ class MLAAttentionSpec(FullAttentionSpec):
         return (
             self.block_size
             * self.num_kv_heads
-            * self._effective_head_size(self.head_size)
+            * self.kv_quant_mode.packed_head_size(self.head_size)
             * get_dtype_size(self.dtype)
         )
 

@@ -86,40 +86,42 @@ class TritonAttentionMetadata:
     scheduler_metadata: torch.Tensor | None = None
     prefix_scheduler_metadata: torch.Tensor | None = None
     mm_prefix_range: dict[int, list[tuple[int, int]]] | None = None
+    mm_prefix_range_tensor: torch.Tensor | None = None
 
-    @property
-    def mm_prefix_range_tensor(self) -> torch.Tensor | None:
+    @staticmethod
+    def compute_mm_prefix_range_tensor(
+        mm_prefix_range: dict[int, list[tuple[int, int]]] | None,
+        num_seqs: int,
+        device: torch.device,
+    ) -> torch.Tensor | None:
         """Convert mm_prefix_range dict to padded tensor for Triton kernel.
 
         Returns shape: (num_seqs, max_ranges, 2) with 0-padding for empty ranges.
         Empty ranges have start==end==0, which kernel skips via is_valid check.
         """
-        # TODO(Isotr0py): Move to model runner's attention metadata
-        # preparation to avoid duplicate computation.
-        if self.mm_prefix_range is None:
+        if mm_prefix_range is None:
             return None
-
-        num_seqs = self.seq_lens.shape[0]
-        device = self.seq_lens.device
 
         # Collect ranges, using [(0,0)] for empty sequences to ensure uniform dims
         range_lists = [
-            self.mm_prefix_range.get(i, [(0, 0)]) or [(0, 0)] for i in range(num_seqs)
+            mm_prefix_range.get(i, [(0, 0)]) or [(0, 0)] for i in range(num_seqs)
         ]
 
         # Return None if all ranges are trivial (only (0,0) placeholders)
         if all(r == [(0, 0)] for r in range_lists):
             return None
 
-        # Create 2D tensors with shape (num_ranges, 2) for each sequence
-        range_tensors = [
-            torch.tensor(r, dtype=torch.int32, device=device).view(-1, 2)
-            for r in range_lists
-        ]
-
-        return torch.nested.nested_tensor(
-            range_tensors, layout=torch.jagged
-        ).to_padded_tensor(0)
+        # Build on CPU first then move to GPU in a single H2D transfer
+        max_ranges = max(len(r) for r in range_lists)
+        # Pad all sequences to the same number of ranges
+        padded = []
+        for r in range_lists:
+            padded_r = list(r) + [(0, 0)] * (max_ranges - len(r))
+            padded.append(padded_r)
+        # Create tensor with efficient H2D transfer
+        return torch.tensor(padded, dtype=torch.int32, device=device).view(
+            num_seqs, max_ranges, 2
+        )
 
 
 class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMetadata]):
@@ -263,7 +265,6 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
 
 
 class TritonAttentionBackend(AttentionBackend):
-    accept_output_buffer: bool = True
     supported_dtypes: ClassVar[list[torch.dtype]] = [
         torch.float16,
         torch.bfloat16,
@@ -276,6 +277,7 @@ class TritonAttentionBackend(AttentionBackend):
         "fp8",
         "fp8_e4m3",
         "fp8_e5m2",
+        "int2_per_token_head",
         "int4_per_token_head",
         "int8_per_token_head",
         "fp8_per_token_head",
@@ -322,13 +324,9 @@ class TritonAttentionBackend(AttentionBackend):
 
             cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_dtype_str]
             scale_pad = get_dtype_size(torch.float32) // get_dtype_size(cache_dtype)
-            # INT4 packed: two int4 values per byte → half the head bytes.
-            data_head_size = head_size
-            if cache_dtype_str == "int4_per_token_head":
-                assert head_size % 2 == 0, (
-                    f"INT4 packed requires even head_size, got {head_size}"
-                )
-                data_head_size = head_size // 2
+            data_head_size = get_kv_quant_mode(cache_dtype_str).packed_head_size(
+                head_size
+            )
             return (num_blocks, 2, block_size, num_kv_heads, data_head_size + scale_pad)
         return (num_blocks, 2, block_size, num_kv_heads, head_size)
 
@@ -466,6 +464,7 @@ class TritonAttentionImpl(AttentionImpl):
         kv_sharing_target_layer_name: int | None = None,
         sinks: torch.Tensor | None = None,
         use_alibi_sqrt: bool = False,
+        chunk_lookback: int = -1,
     ) -> None:
         self.num_heads = num_heads
         self.head_size = head_size
@@ -500,6 +499,7 @@ class TritonAttentionImpl(AttentionImpl):
                 f"num_heads: {num_heads}."
             )
         self.use_alibi_sqrt = use_alibi_sqrt
+        self.chunk_lookback = chunk_lookback
         self.supports_quant_query_input = current_platform.is_cuda()
 
         self._kv_quant_mode = get_kv_quant_mode(kv_cache_dtype)
@@ -513,7 +513,7 @@ class TritonAttentionImpl(AttentionImpl):
         value: torch.Tensor,
         kv_cache: torch.Tensor,
         attn_metadata: TritonAttentionMetadata,
-        output: torch.Tensor | None = None,
+        output: torch.Tensor,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -529,8 +529,6 @@ class TritonAttentionImpl(AttentionImpl):
         Returns:
             shape = [num_tokens, num_heads * head_size]
         """
-        assert output is not None, "Output tensor must be provided."
-
         if output_block_scale is not None:
             raise NotImplementedError(
                 "fused block_scale output quantization is not yet supported"
@@ -571,8 +569,6 @@ class TritonAttentionImpl(AttentionImpl):
         if self._is_per_token_head_quant:
             self._ensure_scale_caches(kv_cache)
             key_cache, value_cache = kv_cache.unbind(1)
-            # FP8 per-token-head stores uint8 that must be viewed as fp8.
-            # INT4 packed stores uint8 natively — do NOT reinterpret.
             if (
                 self._kv_quant_mode == KVQuantMode.FP8_PER_TOKEN_HEAD
                 and key_cache.dtype == torch.uint8
@@ -646,6 +642,7 @@ class TritonAttentionImpl(AttentionImpl):
             kv_quant_mode=self._kv_quant_mode,
             k_scale_cache=k_scale_cache,
             v_scale_cache=v_scale_cache,
+            chunk_lookback=self.chunk_lookback,
         )
 
         return output
@@ -712,8 +709,6 @@ class TritonAttentionImpl(AttentionImpl):
         if self._is_per_token_head_quant:
             self._ensure_scale_caches(kv_cache)
             key_cache, value_cache = kv_cache.unbind(1)
-            # FP8 per-token-head stores uint8 that must be viewed as fp8.
-            # INT4 packed stores uint8 natively — do NOT reinterpret.
             if (
                 self._kv_quant_mode == KVQuantMode.FP8_PER_TOKEN_HEAD
                 and key_cache.dtype == torch.uint8
