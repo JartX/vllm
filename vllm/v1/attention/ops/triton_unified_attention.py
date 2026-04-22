@@ -123,6 +123,11 @@ def kernel_unified_attention(
     QK_INT8_WMMA: tl.constexpr = False,
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
+    # Chunked attention: restrict attention to ``CHUNK_LOOKBACK`` aligned
+    # chunks of size ``CHUNK_SIZE`` behind the query chunk (``-1`` disables,
+    # falling back to the plain sliding-window constraint).
+    CHUNK_LOOKBACK: tl.constexpr = -1,
+    CHUNK_SIZE: tl.constexpr = -1,
 ):
     USE_PER_TOKEN_HEAD_SCALES: tl.constexpr = KV_QUANT_MODE >= 2
 
@@ -215,6 +220,8 @@ def kernel_unified_attention(
         SLIDING_WINDOW,
         USE_MM_PREFIX,
         IS_3D,
+        CHUNK_LOOKBACK=CHUNK_LOOKBACK,
+        CHUNK_SIZE=CHUNK_SIZE,
     )
 
     for j in range(loop_lo, loop_hi):
@@ -285,9 +292,13 @@ def kernel_unified_attention(
             seq_offset,
             seq_idx,
             mm_prefix_range_ptr,
+            context_len,
+            query_pos,
             SLIDING_WINDOW,
             USE_MM_PREFIX,
             MAX_MM_RANGES,
+            CHUNK_LOOKBACK=CHUNK_LOOKBACK,
+            CHUNK_SIZE=CHUNK_SIZE,
         )
 
         # S : (BLOCK_M, TILE_SIZE)
@@ -530,6 +541,11 @@ def unified_attention(
     k_scale_cache=None,  # [num_blocks, block_size, num_kv_heads] float32
     v_scale_cache=None,  # [num_blocks, block_size, num_kv_heads] float32
     kv_cache_dtype: str | None = None,
+    # Chunked attention: restrict to aligned blocks with lookback.  ``-1``
+    # disables (falls back to plain sliding-window mask).  Propagates as a
+    # constexpr to the unified kernel and its helpers.
+    chunk_lookback: int = -1,
+    chunk_size: int = -1,
 ):
     assert causal, "Only causal attention is supported"
     assert q_descale is None, "Q scales not supported"
@@ -654,6 +670,15 @@ def unified_attention(
     total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
 
     sliding_window_val = 1 + window_size[0] if window_size[0] >= 0 else 0
+
+    # Compute chunked block size from sliding window if needed.
+    chunk_size = -1
+    if sliding_window_val > 0 and chunk_lookback > -1:
+        chunk_size = sliding_window_val // (chunk_lookback + 1)
+        assert chunk_size > 0, "sliding_window must be > chunk_lookback+1"
+    elif sliding_window_val <= 0:
+        chunk_lookback = -1
+
     TILE_SIZE_PREFILL = _get_tile_size(
         head_size, sliding_window_val, q.element_size(), is_prefill=True
     )
@@ -777,6 +802,8 @@ def unified_attention(
         IS_3D=use_3d,
         KV_QUANT_MODE=kv_quant_mode,
         QK_INT8_WMMA=use_rocm_int8_wmma_qk,
+        CHUNK_LOOKBACK=chunk_lookback,
+        CHUNK_SIZE=chunk_size,
     )
 
     if use_3d:
