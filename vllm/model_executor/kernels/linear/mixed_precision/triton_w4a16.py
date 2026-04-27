@@ -57,7 +57,7 @@ def triton_w4a16_gemm_kernel(
     stride_cm,
     stride_cn,
     # Quantization parameters
-    group_size,
+    GROUP_SIZE: tl.constexpr,
     # Whether explicit zero points are provided
     HAS_ZP: tl.constexpr,
     # Zero bias used when HAS_ZP is False (e.g. 8 for uint4b8)
@@ -70,6 +70,12 @@ def triton_w4a16_gemm_kernel(
     # broadcast `(b_packed[:,:,None] >> shifts_row) & 0xF` then reshape.
     # Mathematically identical; usually fewer register shuffles on RDNA3.
     FAST_UNPACK: tl.constexpr = False,
+    # Number of quant groups packed into a single K tile. When >1 the
+    # tile loads `GROUPS_PER_TILE` scale rows (and zero rows under HAS_ZP)
+    # and applies the right one to each contiguous GROUP_SIZE-row slice
+    # of B. Lets BLOCK_K exceed GROUP_SIZE without corrupting dequant.
+    # Required: BLOCK_K == GROUPS_PER_TILE * GROUP_SIZE.
+    GROUPS_PER_TILE: tl.constexpr = 1,
 ):
     """
     Fused W4A16 GEMM: C[M,N] = A[M,K] @ dequant(B)[K,N]
@@ -136,36 +142,74 @@ def triton_w4a16_gemm_kernel(
             # Extract the correct 4-bit nibble for each output column
             b = (b >> shifts) & 0xF
 
-        # ---- Compute scale/zero group row index ----
-        g_idx = (k_start * BLOCK_K) // group_size
+        # ---- Load scales / zeros and dequantize ----
+        if GROUPS_PER_TILE > 1:
+            # Multi-group K-tile: load GROUPS_PER_TILE distinct scale
+            # rows and dequant each GROUP_SIZE-row slice of B with its
+            # own group's scale/zero. Only valid when
+            # BLOCK_K == GROUPS_PER_TILE * GROUP_SIZE.
+            g_base = k_start * GROUPS_PER_TILE
+            g_offs = tl.arange(0, GROUPS_PER_TILE)
+            scale_offset_2d = (g_base + g_offs)[:, None] * N + offs_sn[None, :]
+            scale_mask_2d = (offs_sn < N)[None, :]
+            scales_g = tl.load(
+                scales_ptr + scale_offset_2d, mask=scale_mask_2d, other=1.0
+            )
+            # scales_g : (GROUPS_PER_TILE, BLOCK_N)
 
-        # ---- Load scales: [BLOCK_N] → broadcast to [BLOCK_K, BLOCK_N] ----
-        scale_offset = g_idx * N + offs_sn
-        scale_mask = offs_sn < N
-        scales = tl.load(scales_ptr + scale_offset, mask=scale_mask, other=1.0)
-        scales = tl.broadcast_to(scales[None, :], (BLOCK_K, BLOCK_N))
+            if HAS_ZP:
+                zero_offset_2d = (g_base + g_offs)[:, None] * (N // 8) + offs_bn[
+                    None, :
+                ]
+                zero_mask_2d = (offs_bn < N // 8)[None, :]
+                z_packed_g = tl.load(
+                    zeros_ptr + zero_offset_2d, mask=zero_mask_2d, other=0
+                )
+                # z_packed_g : (GROUPS_PER_TILE, BLOCK_N//8)
+                if FAST_UNPACK:
+                    z_g = (z_packed_g[:, :, None] >> shifts_row[None, None, :]) & 0xF
+                    z_g = tl.reshape(z_g, (GROUPS_PER_TILE, BLOCK_N))
+                else:
+                    z_g = tl.interleave(z_packed_g, z_packed_g)
+                    z_g = tl.interleave(z_g, z_g)
+                    z_g = tl.interleave(z_g, z_g)
+                    z_g = (z_g >> shifts_1d[None, :]) & 0xF
+                # z_g : (GROUPS_PER_TILE, BLOCK_N)
 
-        # ---- Load / compute zeros ----
-        if HAS_ZP:
-            # Load packed zeros row: [BLOCK_N//8] int32
-            zero_offset = g_idx * (N // 8) + offs_bn
-            zero_mask = offs_bn < N // 8
-            z_packed = tl.load(zeros_ptr + zero_offset, mask=zero_mask, other=0)
-            # Unpack to [BLOCK_N] using same pattern as B above.
-            if FAST_UNPACK:
-                z = (z_packed[:, None] >> shifts_row[None, :]) & 0xF
-                z = tl.reshape(z, (BLOCK_N,))
+            # Reshape B from (BLOCK_K, BLOCK_N) to
+            # (GROUPS_PER_TILE, GROUP_SIZE, BLOCK_N) so the rows of each
+            # group get its own scale/zero broadcasted.
+            b_3d = tl.reshape(b, (GROUPS_PER_TILE, GROUP_SIZE, BLOCK_N))
+            if HAS_ZP:
+                b_dq = (b_3d - z_g[:, None, :]).to(a.dtype) * scales_g[:, None, :]
             else:
-                z = tl.interleave(z_packed, z_packed)
-                z = tl.interleave(z, z)
-                z = tl.interleave(z, z)
-                z = (z >> shifts_1d) & 0xF
-            z = tl.broadcast_to(z[None, :], (BLOCK_K, BLOCK_N))
+                b_dq = (b_3d - ZP_BIAS).to(a.dtype) * scales_g[:, None, :]
+            b_fp = tl.reshape(b_dq, (BLOCK_K, BLOCK_N))
         else:
-            z = tl.full((BLOCK_K, BLOCK_N), ZP_BIAS, dtype=tl.int32)
+            # Single-group fast path (BLOCK_K <= GROUP_SIZE).
+            g_idx = (k_start * BLOCK_K) // GROUP_SIZE
 
-        # ---- Dequantize: (w - zero) * scale ----
-        b_fp = (b - z).to(a.dtype) * scales
+            scale_offset = g_idx * N + offs_sn
+            scale_mask = offs_sn < N
+            scales = tl.load(scales_ptr + scale_offset, mask=scale_mask, other=1.0)
+            scales = tl.broadcast_to(scales[None, :], (BLOCK_K, BLOCK_N))
+
+            if HAS_ZP:
+                zero_offset = g_idx * (N // 8) + offs_bn
+                zero_mask = offs_bn < N // 8
+                z_packed = tl.load(zeros_ptr + zero_offset, mask=zero_mask, other=0)
+                if FAST_UNPACK:
+                    z = (z_packed[:, None] >> shifts_row[None, :]) & 0xF
+                    z = tl.reshape(z, (BLOCK_N,))
+                else:
+                    z = tl.interleave(z_packed, z_packed)
+                    z = tl.interleave(z, z)
+                    z = tl.interleave(z, z)
+                    z = (z >> shifts_1d) & 0xF
+                z = tl.broadcast_to(z[None, :], (BLOCK_K, BLOCK_N))
+                b_fp = (b - z).to(a.dtype) * scales
+            else:
+                b_fp = (b - ZP_BIAS).to(a.dtype) * scales
 
         # ---- Accumulate ----
         accumulator += tl.dot(a, b_fp, out_dtype=tl.float32)
@@ -234,12 +278,16 @@ def triton_w4a16_gemm(
         is_gfx11 = on_gfx11()
 
         if is_gfx11:
+            # On gfx11 we want BLOCK_K=128 to amortize the per-iter
+            # overhead (A/B loads, int4 unpack, dequant). With small
+            # GPTQ groups (e.g. G=32) the kernel handles multiple
+            # quant groups per K tile via GROUPS_PER_TILE.
             if M <= 32:
-                BLOCK_M, BLOCK_N, BLOCK_K = 32, 32, 64
+                BLOCK_M, BLOCK_N, BLOCK_K = 32, 32, 128
             elif M <= 64:
-                BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32
+                BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 128
             else:
-                BLOCK_M, BLOCK_N, BLOCK_K = 128, 32, 64
+                BLOCK_M, BLOCK_N, BLOCK_K = 128, 32, 128
             num_warps = 4
             num_stages = 2
         elif on_gfx1x():
@@ -267,24 +315,36 @@ def triton_w4a16_gemm(
         else:
             BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 32
 
-    # The kernel loads scales/zeros for a single group per BLOCK_K tile
-    # (one g_idx per iteration). If BLOCK_K > group_size, rows at the tail
-    # of the tile dequantize with the wrong group's scales, silently
-    # corrupting the output. Clamp BLOCK_K to group_size to keep one
-    # scale group per tile.
-    if group_size < BLOCK_K:
-        BLOCK_K = group_size
+    # The kernel either uses BLOCK_K <= group_size (one scale-group per
+    # K tile, GROUPS_PER_TILE=1) or BLOCK_K = GROUPS_PER_TILE * group_size
+    # (multi-group). Pick GROUPS_PER_TILE accordingly; if the chosen
+    # BLOCK_K isn't a multiple of group_size, fall back to the legacy
+    # clamp (BLOCK_K = group_size). The multi-group fast path is gated
+    # to gfx11 + env var.
+    use_multigroup_w4a16 = (
+        is_gfx11
+        and envs.VLLM_GFX11_W4A16_LARGE_BLOCK_K
+        and group_size < BLOCK_K
+        and (BLOCK_K % group_size == 0)
+    )
+    if use_multigroup_w4a16:
+        groups_per_tile = BLOCK_K // group_size
+    else:
+        if group_size < BLOCK_K:
+            BLOCK_K = group_size
+        groups_per_tile = 1
 
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
 
     launch_kwargs: dict = dict(
-        group_size=group_size,
+        GROUP_SIZE=group_size,
         HAS_ZP=has_zp,
         ZP_BIAS=zp_bias,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
         FAST_UNPACK=is_gfx11 and envs.VLLM_GFX11_W4A16_FAST_UNPACK,
+        GROUPS_PER_TILE=groups_per_tile,
     )
     if num_warps is not None:
         launch_kwargs["num_warps"] = num_warps

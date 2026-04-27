@@ -87,6 +87,7 @@ if TYPE_CHECKING:
     VLLM_GFX11_DECODE_TILE32: bool = True
     VLLM_GFX11_DECODE_SEGMENTS_32: bool = True
     VLLM_GFX11_W4A16_FAST_UNPACK: bool = True
+    VLLM_GFX11_W4A16_LARGE_BLOCK_K: bool = True
     MAX_JOBS: str | None = None
     NVCC_THREADS: str | None = None
     VLLM_USE_PRECOMPILED: bool = False
@@ -544,6 +545,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # gfx11 W4A16 GEMM: replace 3x interleave int4 unpack with broadcast variant.
     "VLLM_GFX11_W4A16_FAST_UNPACK": lambda: (
         os.getenv("VLLM_GFX11_W4A16_FAST_UNPACK", "True").lower() in ("true", "1")
+    ),
+    # gfx11 W4A16 GEMM: BLOCK_K=128 with multi-group dequant inside the
+    # tile. Cuts the K-iter count 2-4x for small-group GPTQ (G=32/64)
+    # by amortizing per-iter overhead (loads, unpack, dequant) over
+    # more useful FLOPs. Only enabled when BLOCK_K is divisible by the
+    # quant group_size; otherwise falls back to single-group clamp.
+    "VLLM_GFX11_W4A16_LARGE_BLOCK_K": lambda: (
+        os.getenv("VLLM_GFX11_W4A16_LARGE_BLOCK_K", "True").lower() in ("true", "1")
     ),
     # Maximum number of compilation jobs to run in parallel.
     # By default this is the number of CPUs
