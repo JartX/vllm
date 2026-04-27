@@ -624,6 +624,12 @@ class TritonAttentionImpl(AttentionImpl):
                 vllm_config.attention_config.tq_max_kv_splits_for_cuda_graph
             )
 
+        self._on_gfx11 = False
+        if current_platform.is_rocm():
+            from vllm.platforms.rocm import on_gfx11
+
+            self._on_gfx11 = on_gfx11()
+
     def forward(
         self,
         layer: torch.nn.Module,
@@ -963,6 +969,37 @@ class TritonAttentionImpl(AttentionImpl):
                 return output
         # FP8 per-tensor / auto path (original flow).
         else:
+          
+            if (
+                self._on_gfx11
+                and attn_metadata.all_pure_first_prefill
+                and self.attn_type == AttentionType.DECODER
+                and self.alibi_slopes is None
+                and not self.use_alibi_sqrt
+                and self.sinks is None
+                and not self.logits_soft_cap
+                and attn_metadata.mm_prefix_range_tensor is None
+                and output_scale is None
+                and self.kv_sharing_target_layer_name is None
+                and key is not None
+                and value is not None
+                and num_actual_tokens > 0
+            ):
+                context_attention_fwd(
+                    q=query[:num_actual_tokens],
+                    k=key[:num_actual_tokens],
+                    v=value[:num_actual_tokens],
+                    o=output[:num_actual_tokens],
+                    b_start_loc=attn_metadata.query_start_loc,
+                    b_seq_len=attn_metadata.seq_lens,
+                    max_input_len=attn_metadata.max_query_len,
+                    is_causal=True,
+                    softmax_scale=self.scale,
+                    sliding_window_q=self.sliding_window[0],
+                    sliding_window_k=self.sliding_window[1],
+                )
+                return output
+
             key_cache, value_cache = kv_cache.unbind(1)
             if is_quantized_kv_cache(self.kv_cache_dtype):
                 if key_cache.dtype != self.fp8_dtype:

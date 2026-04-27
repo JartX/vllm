@@ -82,6 +82,8 @@ if TYPE_CHECKING:
     VLLM_MAIN_CUDA_VERSION: str = "13.0"
     VLLM_FLOAT32_MATMUL_PRECISION: Literal["highest", "high", "medium"] = "highest"
     VLLM_BATCH_INVARIANT: bool = False
+    VLLM_GFX11_QK_INT8_WMMA: bool = True
+    VLLM_GFX11_UNIFIED_QK_INT8_WMMA: bool = True
     MAX_JOBS: str | None = None
     NVCC_THREADS: str | None = None
     VLLM_USE_PRECOMPILED: bool = False
@@ -519,6 +521,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable batch-invariant mode: deterministic results regardless of
     # batch composition. Requires NVIDIA GPU with compute capability >= 9.0.
     "VLLM_BATCH_INVARIANT": lambda: bool(int(os.getenv("VLLM_BATCH_INVARIANT", "0"))),
+    # gfx11 int8-WMMA QK fast path for `context_attention_fwd` (prefill).
+    "VLLM_GFX11_QK_INT8_WMMA": lambda: (
+        os.getenv("VLLM_GFX11_QK_INT8_WMMA", "True").lower() in ("true", "1")
+    ),
+    # gfx11 int8-WMMA QK fast path for `unified_attention` with bf16 KV
+    # cache (chunked prefill / decode).
+    "VLLM_GFX11_UNIFIED_QK_INT8_WMMA": lambda: (
+        os.getenv("VLLM_GFX11_UNIFIED_QK_INT8_WMMA", "True").lower() in ("true", "1")
+    ),
     # Maximum number of compilation jobs to run in parallel.
     # By default this is the number of CPUs
     "MAX_JOBS": lambda: os.getenv("MAX_JOBS", None),

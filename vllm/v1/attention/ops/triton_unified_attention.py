@@ -119,6 +119,11 @@ def kernel_unified_attention(
     KV_QUANT_MODE: tl.constexpr = 0,
     # Use int8 WMMA/MFMA for the QK dot (requires KV_QUANT_MODE==2 and int8 cache)
     QK_INT8_WMMA: tl.constexpr = False,
+    # gfx11-only on-the-fly QK int8 WMMA: K cache is bf16/fp16 (any
+    # non-per-token-head mode), but per-tile we quantize K to int8 to
+    # exploit the 16x16x32 int8 WMMA on RDNA3. Mutually exclusive with
+    # QK_INT8_WMMA (which expects K already int8 in the cache).
+    QK_INT8_WMMA_OTF: tl.constexpr = False,
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
     # Chunked / block-local attention.  ``CHUNK_LOOKBACK >= 0`` enables
@@ -178,8 +183,10 @@ def kernel_unified_attention(
     )
 
     # Per-row symmetric int8 quantization of Q, reused across all K tiles.
-    # Enables int8 WMMA/MFMA for the QK dot when the K cache is also int8.
-    if QK_INT8_WMMA:
+    # Enables int8 WMMA/MFMA for the QK dot when the K cache is also int8
+    # (QK_INT8_WMMA) or when K is quantized on the fly per tile
+    # (QK_INT8_WMMA_OTF, gfx11 fast path for bf16/fp16 KV cache).
+    if QK_INT8_WMMA or QK_INT8_WMMA_OTF:
         Q_f32 = Q.to(tl.float32)
         q_absmax = tl.max(tl.abs(Q_f32), axis=1)
         q_scale = tl.maximum(q_absmax * (1.0 / 127.0), 1e-6)
@@ -307,6 +314,20 @@ def kernel_unified_attention(
             qk_i32 = tl.dot(Q_q, K, out_dtype=tl.int32)
             S += qk_i32.to(tl.float32) * (
                 scale * q_scale[:, None] * k_token_head_scales[None, :]
+            )
+        elif QK_INT8_WMMA_OTF:
+            # gfx11 on-the-fly QK int8 WMMA for bf16/fp16 KV cache.
+            # Per-token (per-column) symmetric int8 quant of K for this
+            # tile, then int8 dot. Q already int8-quantized once above.
+            K_f32 = K.to(tl.float32)
+            K_absmax = tl.max(tl.abs(K_f32), axis=0)
+            K_scale_otf = tl.maximum(K_absmax * (1.0 / 127.0), 1e-6)
+            K_i8 = tl.clamp(K_f32 * (1.0 / K_scale_otf)[None, :], -128.0, 127.0).to(
+                tl.int8
+            )
+            qk_i32 = tl.dot(Q_q, K_i8, out_dtype=tl.int32)
+            S += qk_i32.to(tl.float32) * (
+                scale * q_scale[:, None] * K_scale_otf[None, :]
             )
         elif USE_PER_TOKEN_HEAD_SCALES:
             # Per-token-head quant: fuse softmax_scale with per-head k_scale
@@ -666,6 +687,21 @@ def unified_attention(
         kv_quant_mode == KVQuantMode.INT8_PER_TOKEN_HEAD and current_platform.is_rocm()
     )
 
+    # gfx11 on-the-fly QK int8 WMMA for bf16/fp16 KV cache. Mutually
+    # exclusive with `use_rocm_int8_wmma_qk` (which expects int8 K in the
+    # cache via per-token-head quant). Gated by env var so users can A/B.
+    use_gfx11_int8_wmma_qk_otf = False
+    if (
+        current_platform.is_rocm()
+        and kv_quant_mode == KVQuantMode.NONE
+        and k.dtype in (torch.float16, torch.bfloat16)
+        and head_size % 16 == 0
+        and envs.VLLM_GFX11_UNIFIED_QK_INT8_WMMA
+    ):
+        from vllm.platforms.rocm import on_gfx11
+
+        use_gfx11_int8_wmma_qk_otf = on_gfx11()
+
     # Launch the 2D kernel if
     # 1. No intermediate tiled softmax buffers for the 3D kernel have been allocated, or
     # 2. The batch includes at least one prefill request, or
@@ -782,6 +818,13 @@ def unified_attention(
         # Enable the int8 WMMA/MFMA QK fast-path only for the 2D (prefill) path:
         # the 3D (decode) path has too few Q rows to benefit from the int8 dot.
         QK_INT8_WMMA=use_rocm_int8_wmma_qk and not use_3d,
+        # On-the-fly variant for bf16/fp16 KV (gfx11 only). Enabled for
+        # both 2D and 3D paths: even at decode (BLOCK_M=16, TILE_SIZE=16)
+        # the int8 WMMA's K-dim of 32 (vs. 16 for fp16) still halves the
+        # WMMA count along HEAD_SIZE_PADDED. Per-tile K quant overhead is
+        # one absmax over HEAD_SIZE; small enough to net positive in
+        # measured cases.
+        QK_INT8_WMMA_OTF=use_gfx11_int8_wmma_qk_otf,
         CHUNK_LOOKBACK=chunk_lookback,
         CHUNK_SIZE=chunk_size,
     )

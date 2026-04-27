@@ -208,11 +208,27 @@ def triton_w4a16_gemm(
     # Provide a dummy pointer when HAS_ZP=False (Triton requires a valid ptr)
     zeros_ptr = qzeros if has_zp else b_q
 
-    if current_platform.is_rocm():
-        from vllm.platforms.rocm import on_gfx1x
+    num_warps: int | None = None
+    num_stages: int | None = None
 
-        if on_gfx1x():
-            # Tuned for RDNA 3.5 (gfx1151, 40 CUs, 32-wide wavefronts).
+    is_gfx11 = False
+    if current_platform.is_rocm():
+        from vllm.platforms.rocm import on_gfx1x, on_gfx11
+
+        is_gfx11 = on_gfx11()
+
+        if is_gfx11:
+            if M <= 32:
+                BLOCK_M, BLOCK_N, BLOCK_K = 32, 32, 64
+            elif M <= 64:
+                BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32
+            else:
+                BLOCK_M, BLOCK_N, BLOCK_K = 128, 32, 64
+            num_warps = 4
+            num_stages = 2
+        elif on_gfx1x():
+            # gfx12 (RDNA4): keep previous tuning, no explicit warp/stage
+            # override yet.
             if M <= 32:
                 BLOCK_M, BLOCK_N, BLOCK_K = 32, 32, 64
             elif M <= 64:
@@ -245,6 +261,19 @@ def triton_w4a16_gemm(
 
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
 
+    launch_kwargs: dict = dict(
+        group_size=group_size,
+        HAS_ZP=has_zp,
+        ZP_BIAS=zp_bias,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+    )
+    if num_warps is not None:
+        launch_kwargs["num_warps"] = num_warps
+    if num_stages is not None:
+        launch_kwargs["num_stages"] = num_stages
+
     triton_w4a16_gemm_kernel[grid](
         a,
         b_q,
@@ -260,12 +289,7 @@ def triton_w4a16_gemm(
         b_q.stride(1),
         c.stride(0),
         c.stride(1),
-        group_size=group_size,
-        HAS_ZP=has_zp,
-        ZP_BIAS=zp_bias,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K,
+        **launch_kwargs,
     )
     return c
 
