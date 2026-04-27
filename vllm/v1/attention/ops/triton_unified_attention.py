@@ -702,14 +702,17 @@ def unified_attention(
         kv_quant_mode == KVQuantMode.INT8_PER_TOKEN_HEAD and current_platform.is_rocm()
     )
 
-    # gfx11 on-the-fly QK int8 WMMA for bf16/fp16 KV cache. Mutually
-    # exclusive with `use_rocm_int8_wmma_qk` (which expects int8 K in the
-    # cache via per-token-head quant). Gated by env var so users can A/B.
+    # gfx11 on-the-fly QK int8 WMMA for non-per-token-head KV. Covers:
+    #  - KV_QUANT_MODE.NONE        (bf16/fp16 cache)
+    #  - KV_QUANT_MODE.FP8_PER_TENSOR (fp8 cache; cast_kv_tile rescales
+    #    to Q's dtype before we quantize to int8 in the kernel).
+    # Mutually exclusive with `use_rocm_int8_wmma_qk` (which expects int8
+    # K in the cache via per-token-head quant). head_size % 16 covers
+    # the WMMA tile alignment. Gated by env var so users can A/B.
     use_gfx11_int8_wmma_qk_otf = False
     if (
         current_platform.is_rocm()
-        and kv_quant_mode == KVQuantMode.NONE
-        and k.dtype in (torch.float16, torch.bfloat16)
+        and kv_quant_mode in (KVQuantMode.NONE, KVQuantMode.FP8_PER_TENSOR)
         and head_size % 16 == 0
         and envs.VLLM_GFX11_UNIFIED_QK_INT8_WMMA
     ):
