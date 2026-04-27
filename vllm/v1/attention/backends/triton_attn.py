@@ -55,6 +55,10 @@ _CONTINUATION_DECODE_THRESHOLD = 128
 # constants
 MIN_LAUNCH_GRID_SIZE_2D = 128  # Minimum launch grid size of 2D kernel
 NUM_PAR_SOFTMAX_SEGMENTS = 16  # Number of parallel tiled softmax segments
+# gfx11 (RDNA3) override: 96 CUs need ~2.7x more programs than the default
+# 16 segments give for batch=1 long-context decode. Bumping to 32 doubles
+# launch parallelism in the 3D path. Allocates ~2x the segm_* buffers.
+NUM_PAR_SOFTMAX_SEGMENTS_GFX11 = 32
 
 
 @dataclass
@@ -212,7 +216,20 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
                 key=lambda x: abs(x - self.seq_threshold_3D),
             )
 
-        self.num_par_softmax_segments = NUM_PAR_SOFTMAX_SEGMENTS
+        # Bump segments on gfx11 to lift launch parallelism on 96-CU
+        # RDNA3 dGPUs at batch=1 long-context decode. Toggleable via env.
+        import vllm.envs as _envs
+
+        _use_gfx11_segments = False
+        if current_platform.is_rocm() and _envs.VLLM_GFX11_DECODE_SEGMENTS_32:
+            from vllm.platforms.rocm import on_gfx11
+
+            _use_gfx11_segments = on_gfx11()
+        self.num_par_softmax_segments = (
+            NUM_PAR_SOFTMAX_SEGMENTS_GFX11
+            if _use_gfx11_segments
+            else NUM_PAR_SOFTMAX_SEGMENTS
+        )
         headdim_padded = next_power_of_2(self.headdim)
         self.softmax_segm_output = torch.empty(
             (
@@ -969,7 +986,6 @@ class TritonAttentionImpl(AttentionImpl):
                 return output
         # FP8 per-tensor / auto path (original flow).
         else:
-          
             if (
                 self._on_gfx11
                 and attn_metadata.all_pure_first_prefill

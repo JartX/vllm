@@ -84,6 +84,9 @@ if TYPE_CHECKING:
     VLLM_BATCH_INVARIANT: bool = False
     VLLM_GFX11_QK_INT8_WMMA: bool = True
     VLLM_GFX11_UNIFIED_QK_INT8_WMMA: bool = True
+    VLLM_GFX11_DECODE_TILE32: bool = True
+    VLLM_GFX11_DECODE_SEGMENTS_32: bool = True
+    VLLM_GFX11_W4A16_FAST_UNPACK: bool = True
     MAX_JOBS: str | None = None
     NVCC_THREADS: str | None = None
     VLLM_USE_PRECOMPILED: bool = False
@@ -529,6 +532,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # cache (chunked prefill / decode).
     "VLLM_GFX11_UNIFIED_QK_INT8_WMMA": lambda: (
         os.getenv("VLLM_GFX11_UNIFIED_QK_INT8_WMMA", "True").lower() in ("true", "1")
+    ),
+    # gfx11 decode TILE_SIZE bump 16->32 in unified_attention.
+    "VLLM_GFX11_DECODE_TILE32": lambda: (
+        os.getenv("VLLM_GFX11_DECODE_TILE32", "True").lower() in ("true", "1")
+    ),
+    # gfx11 decode parallel softmax segments 16->32.
+    "VLLM_GFX11_DECODE_SEGMENTS_32": lambda: (
+        os.getenv("VLLM_GFX11_DECODE_SEGMENTS_32", "True").lower() in ("true", "1")
+    ),
+    # gfx11 W4A16 GEMM: replace 3x interleave int4 unpack with broadcast variant.
+    "VLLM_GFX11_W4A16_FAST_UNPACK": lambda: (
+        os.getenv("VLLM_GFX11_W4A16_FAST_UNPACK", "True").lower() in ("true", "1")
     ),
     # Maximum number of compilation jobs to run in parallel.
     # By default this is the number of CPUs

@@ -521,7 +521,7 @@ def _get_tile_size(
     element_size: int,
     is_prefill: bool,
 ) -> int:
-    """Select tile size with Gemma3-specific optimization."""
+    """Select tile size with Gemma3- and gfx11-specific optimizations."""
     if _is_gemma3_attention(head_size, sliding_window):
         # Gemma3: use 32 for decode (default is 16)
         return 32
@@ -529,6 +529,21 @@ def _get_tile_size(
     # Default behavior
     if is_prefill:
         return 32
+
+    # gfx11 decode: bump TILE_SIZE 16->32. At long contexts the per-tile
+    # fixed cost (mask compute, softmax math, K-quant absmax under
+    # QK_INT8_WMMA_OTF) dominates; doubling the tile halves the loop
+    # trip count without changing per-token K/V bandwidth.
+    if (
+        element_size >= 2
+        and envs.VLLM_GFX11_DECODE_TILE32
+        and current_platform.is_rocm()
+    ):
+        from vllm.platforms.rocm import on_gfx11
+
+        if on_gfx11():
+            return 32
+
     # Note: tile size must be at least 32 for fp8 (element_size == 1).
     return 16 if element_size >= 2 else 32
 

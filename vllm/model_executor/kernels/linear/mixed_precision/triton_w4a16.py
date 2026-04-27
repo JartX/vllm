@@ -21,6 +21,7 @@ Checkpoint layout from compressed_tensors_wNa16 create_weights:
 
 import torch
 
+import vllm.envs as envs
 from vllm.model_executor.layers.quantization.utils import replace_parameter
 from vllm.model_executor.parameter import BasevLLMParameter, permute_param_layout_
 from vllm.platforms import current_platform
@@ -65,6 +66,10 @@ def triton_w4a16_gemm_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    # gfx11 fast int4 unpack: replace 3x tl.interleave with a single
+    # broadcast `(b_packed[:,:,None] >> shifts_row) & 0xF` then reshape.
+    # Mathematically identical; usually fewer register shuffles on RDNA3.
+    FAST_UNPACK: tl.constexpr = False,
 ):
     """
     Fused W4A16 GEMM: C[M,N] = A[M,K] @ dequant(B)[K,N]
@@ -115,14 +120,21 @@ def triton_w4a16_gemm_kernel(
         b_packed = tl.load(b_ptrs, mask=mask_b, other=0)
 
         # ---- Unpack int4 weights → [BLOCK_K, BLOCK_N] ----
-        # tl.interleave(x, x) doubles the last dim by interleaving.
-        # Starting from [BLOCK_K, BLOCK_N//8], three interleaves give
-        # [BLOCK_K, BLOCK_N], where each int32 is replicated 8 times.
-        b = tl.interleave(b_packed, b_packed)
-        b = tl.interleave(b, b)
-        b = tl.interleave(b, b)
-        # Extract the correct 4-bit nibble for each output column
-        b = (b >> shifts) & 0xF
+        if FAST_UNPACK:
+            # Broadcast variant: shift each int32 by [0,4,...,28] in a
+            # 3D op then reshape. Same data layout as the interleave
+            # path (column j -> nibble (j%8)*4 of int32 j//8).
+            b = (b_packed[:, :, None] >> shifts_row[None, None, :]) & 0xF
+            b = tl.reshape(b, (BLOCK_K, BLOCK_N))
+        else:
+            # tl.interleave(x, x) doubles the last dim by interleaving.
+            # Starting from [BLOCK_K, BLOCK_N//8], three interleaves give
+            # [BLOCK_K, BLOCK_N], where each int32 is replicated 8 times.
+            b = tl.interleave(b_packed, b_packed)
+            b = tl.interleave(b, b)
+            b = tl.interleave(b, b)
+            # Extract the correct 4-bit nibble for each output column
+            b = (b >> shifts) & 0xF
 
         # ---- Compute scale/zero group row index ----
         g_idx = (k_start * BLOCK_K) // group_size
@@ -139,11 +151,15 @@ def triton_w4a16_gemm_kernel(
             zero_offset = g_idx * (N // 8) + offs_bn
             zero_mask = offs_bn < N // 8
             z_packed = tl.load(zeros_ptr + zero_offset, mask=zero_mask, other=0)
-            # Unpack to [BLOCK_N] using same interleave+shift pattern
-            z = tl.interleave(z_packed, z_packed)
-            z = tl.interleave(z, z)
-            z = tl.interleave(z, z)
-            z = (z >> shifts_1d) & 0xF
+            # Unpack to [BLOCK_N] using same pattern as B above.
+            if FAST_UNPACK:
+                z = (z_packed[:, None] >> shifts_row[None, :]) & 0xF
+                z = tl.reshape(z, (BLOCK_N,))
+            else:
+                z = tl.interleave(z_packed, z_packed)
+                z = tl.interleave(z, z)
+                z = tl.interleave(z, z)
+                z = (z >> shifts_1d) & 0xF
             z = tl.broadcast_to(z[None, :], (BLOCK_K, BLOCK_N))
         else:
             z = tl.full((BLOCK_K, BLOCK_N), ZP_BIAS, dtype=tl.int32)
@@ -268,6 +284,7 @@ def triton_w4a16_gemm(
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
+        FAST_UNPACK=is_gfx11 and envs.VLLM_GFX11_W4A16_FAST_UNPACK,
     )
     if num_warps is not None:
         launch_kwargs["num_warps"] = num_warps
