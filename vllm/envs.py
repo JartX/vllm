@@ -82,12 +82,6 @@ if TYPE_CHECKING:
     VLLM_MAIN_CUDA_VERSION: str = "13.0"
     VLLM_FLOAT32_MATMUL_PRECISION: Literal["highest", "high", "medium"] = "highest"
     VLLM_BATCH_INVARIANT: bool = False
-    VLLM_GFX11_QK_INT8_WMMA: bool = True
-    VLLM_GFX11_UNIFIED_QK_INT8_WMMA: bool = True
-    VLLM_GFX11_DECODE_TILE32: bool = True
-    VLLM_GFX11_DECODE_SEGMENTS_32: bool = True
-    VLLM_GFX11_W4A16_FAST_UNPACK: bool = True
-    VLLM_GFX11_W4A16_LARGE_BLOCK_K: bool = True
     MAX_JOBS: str | None = None
     NVCC_THREADS: str | None = None
     VLLM_USE_PRECOMPILED: bool = False
@@ -525,35 +519,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable batch-invariant mode: deterministic results regardless of
     # batch composition. Requires NVIDIA GPU with compute capability >= 9.0.
     "VLLM_BATCH_INVARIANT": lambda: bool(int(os.getenv("VLLM_BATCH_INVARIANT", "0"))),
-    # gfx11 int8-WMMA QK fast path for `context_attention_fwd` (prefill).
-    "VLLM_GFX11_QK_INT8_WMMA": lambda: (
-        os.getenv("VLLM_GFX11_QK_INT8_WMMA", "True").lower() in ("true", "1")
-    ),
-    # gfx11 int8-WMMA QK fast path for `unified_attention` with bf16 KV
-    # cache (chunked prefill / decode).
-    "VLLM_GFX11_UNIFIED_QK_INT8_WMMA": lambda: (
-        os.getenv("VLLM_GFX11_UNIFIED_QK_INT8_WMMA", "True").lower() in ("true", "1")
-    ),
-    # gfx11 decode TILE_SIZE bump 16->32 in unified_attention.
-    "VLLM_GFX11_DECODE_TILE32": lambda: (
-        os.getenv("VLLM_GFX11_DECODE_TILE32", "True").lower() in ("true", "1")
-    ),
-    # gfx11 decode parallel softmax segments 16->32.
-    "VLLM_GFX11_DECODE_SEGMENTS_32": lambda: (
-        os.getenv("VLLM_GFX11_DECODE_SEGMENTS_32", "True").lower() in ("true", "1")
-    ),
-    # gfx11 W4A16 GEMM: replace 3x interleave int4 unpack with broadcast variant.
-    "VLLM_GFX11_W4A16_FAST_UNPACK": lambda: (
-        os.getenv("VLLM_GFX11_W4A16_FAST_UNPACK", "True").lower() in ("true", "1")
-    ),
-    # gfx11 W4A16 GEMM: BLOCK_K=128 with multi-group dequant inside the
-    # tile. Cuts the K-iter count 2-4x for small-group GPTQ (G=32/64)
-    # by amortizing per-iter overhead (loads, unpack, dequant) over
-    # more useful FLOPs. Only enabled when BLOCK_K is divisible by the
-    # quant group_size; otherwise falls back to single-group clamp.
-    "VLLM_GFX11_W4A16_LARGE_BLOCK_K": lambda: (
-        os.getenv("VLLM_GFX11_W4A16_LARGE_BLOCK_K", "True").lower() in ("true", "1")
-    ),
     # Maximum number of compilation jobs to run in parallel.
     # By default this is the number of CPUs
     "MAX_JOBS": lambda: os.getenv("MAX_JOBS", None),
