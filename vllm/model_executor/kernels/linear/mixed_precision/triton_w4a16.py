@@ -916,12 +916,29 @@ class TritonW4A16LinearKernel(MPLinearKernel):
         [K//G, N//8] for both layouts (group-major access).
         """
 
+        import sys
+
         layout_kn = False
         if current_platform.is_rocm():
             from vllm.platforms.rocm import on_gfx11
 
             layout_kn = on_gfx11()
         layer._w4a16_layout_kn = layout_kn
+
+        # Loud one-shot diagnostic: this runs at model load (not in any
+        # torch.compile / CUDA-graph capture context) so it should always
+        # print. Use both logger.warning AND raw stderr to guarantee
+        # visibility.
+        if not _GFX11_KN_FIRST_CALL_LOGGED["done"]:
+            msg = (
+                f"[Triton W4A16] process_weights_after_loading: "
+                f"is_rocm={current_platform.is_rocm()} "
+                f"layout_kn={layout_kn} (gfx11={layout_kn}) "
+                f"→ {'NEW [K//8,N] split-K path' if layout_kn else 'OLD [K,N//8] path'}"
+            )
+            logger.warning(msg)
+            print(msg, file=sys.stderr, flush=True)
+            _GFX11_KN_FIRST_CALL_LOGGED["done"] = True
 
         if layout_kn:
             # ---- gfx11: transpose to [K//8, N] (exllama-style) ----
