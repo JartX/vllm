@@ -291,13 +291,13 @@ def triton_w4a16_gemv_kernel(
 
 
 @triton.jit
-def triton_w4a16_gemm_nk_kernel(
+def triton_w4a16_gemv_kn_kernel(
     # Pointers
-    a_ptr,  # [M, K] fp16/bf16 activations
-    b_ptr,  # [N, K//8] int32  -- N row-major, K packed within each N row
+    a_ptr,  # [M, K] fp16/bf16 activations (M small, decode path)
+    b_ptr,  # [K//8, N] int32 -- K packed at dim 0, N row-major at dim 1
     scales_ptr,  # [K//G, N] fp16/bf16
     zeros_ptr,  # [K//G, N//8] int32 (unused if HAS_ZP=False)
-    c_ptr,  # [M, N] fp16/bf16
+    c_ptr,  # [M, N] fp16/bf16  -- atomically accumulated across K splits
     # Dimensions
     M,
     N,
@@ -305,11 +305,131 @@ def triton_w4a16_gemm_nk_kernel(
     # Strides
     stride_am,
     stride_ak,
-    stride_bn,  # stride between N rows of B
-    stride_bk,  # stride within an N row (=1 for contiguous int32)
+    stride_bk,  # row stride of B (= N for contiguous [K//8, N])
+    stride_bn,  # col stride of B (= 1)
     stride_cm,
     stride_cn,
-    # Quantization parameters
+    # Quantization
+    group_size,
+    HAS_ZP: tl.constexpr,
+    ZP_BIAS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """
+    Decode GEMV for [K//8, N] layout with split-K + atomic_add.
+
+    Same structural pattern exllama's HIP kernel uses to dominate at
+    batch=1 on RDNA3. Three combined wins over the [K, N//8] WMMA path:
+
+    1. **Layout [K//8, N]**: each warp's load is a single contiguous
+       row of N int32 (32 lanes × 4 bytes = 128 B = 1 cache line).
+       Fully coalesced. Compare to [K, N//8]'s 16-byte fragments
+       across BLOCK_K cache lines (25-50% utilization).
+
+    2. **Split-K + atomic_add**: grid = (M, cdiv(N, BLOCK_N),
+       cdiv(K, BLOCK_K)). For typical Qwen layers at M=1 that's
+       1024+ programs (vs. 64 without split-K). RDNA3 needs many
+       active warps to hide global-memory latency — without split-K
+       the GPU sits idle waiting on memory.
+
+    3. **No tl.dot**: pure tl.sum K-reduction → scalar FMA, no WMMA
+       tile waste at small M. Bit-trick dequant + deferred scale
+       multiply (one per K-tile rather than one per K-position).
+
+    Caller MUST zero c_ptr before launch (atomic_add accumulates).
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    pid_k = tl.program_id(2)
+
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_zn = pid_n * (BLOCK_N // 8) + tl.arange(0, BLOCK_N // 8)
+
+    k_start = pid_k * BLOCK_K
+    offs_k = k_start + tl.arange(0, BLOCK_K)
+    offs_bk = (k_start // 8) + tl.arange(0, BLOCK_K // 8)
+    mask_k = offs_k < K
+
+    # A: [BLOCK_K]
+    a = tl.load(
+        a_ptr + pid_m * stride_am + offs_k * stride_ak,
+        mask=mask_k,
+        other=0.0,
+    )
+
+    # B: [BLOCK_K//8, BLOCK_N] int32 -- coalesced row-major load
+    b_ptrs = b_ptr + offs_bk[:, None] * stride_bk + offs_n[None, :] * stride_bn
+    mask_b = (offs_bk[:, None] < K // 8) & (offs_n[None, :] < N)
+    b_packed = tl.load(b_ptrs, mask=mask_b, other=0)
+
+    # Unpack along K: place 8 K-positions BETWEEN k_row and n_col so the
+    # subsequent reshape gives contiguous K. Avoids a tl.permute.
+    shifts = tl.arange(0, 8) * 4  # [8]
+    b3d = (b_packed[:, None, :] >> shifts[None, :, None]) & 0xF
+    # b3d[k_row, shift, n] = K-value at k_row*8 + shift for n
+    b = tl.reshape(b3d, (BLOCK_K, BLOCK_N))
+
+    # Single group per BLOCK_K tile (caller clamps BLOCK_K to group_size)
+    g_idx = k_start // group_size
+    scales = tl.load(
+        scales_ptr + g_idx * N + offs_n, mask=offs_n < N, other=1.0
+    )
+
+    if HAS_ZP:
+        z_packed = tl.load(
+            zeros_ptr + g_idx * (N // 8) + offs_zn,
+            mask=offs_zn < N // 8,
+            other=0,
+        )
+        z = (z_packed[:, None] >> shifts[None, :]) & 0xF
+        z = tl.reshape(z, (BLOCK_N,))
+    else:
+        z = tl.full((BLOCK_N,), ZP_BIAS, dtype=tl.int32)
+
+    # Bit-trick dequant
+    if a.dtype == tl.float16:
+        b_fp = ((b | 0x6400).to(tl.int16)).to(tl.float16, bitcast=True)
+        z_fp = ((z | 0x6400).to(tl.int16)).to(tl.float16, bitcast=True)
+        b_minus_z = b_fp - z_fp[None, :]
+    elif a.dtype == tl.bfloat16:
+        b_fp = ((b | 0x4300).to(tl.int16)).to(tl.bfloat16, bitcast=True)
+        z_fp = ((z | 0x4300).to(tl.int16)).to(tl.bfloat16, bitcast=True)
+        b_minus_z = b_fp - z_fp[None, :]
+    else:
+        b_minus_z = (b - z[None, :]).to(a.dtype)
+
+    # GEMV K-reduction (no tl.dot)
+    prod = a[:, None] * b_minus_z  # [BLOCK_K, BLOCK_N]
+    partial = tl.sum(prod, axis=0) * scales  # [BLOCK_N]
+
+    # Atomic add this K-split's contribution to global output
+    c_ptrs = c_ptr + pid_m * stride_cm + offs_n * stride_cn
+    tl.atomic_add(
+        c_ptrs, partial.to(c_ptr.type.element_ty), mask=offs_n < N
+    )
+
+
+@triton.jit
+def triton_w4a16_gemm_kn_kernel(
+    # Pointers
+    a_ptr,  # [M, K] fp16/bf16
+    b_ptr,  # [K//8, N] int32
+    scales_ptr,  # [K//G, N]
+    zeros_ptr,  # [K//G, N//8]
+    c_ptr,  # [M, N]
+    # Dimensions
+    M,
+    N,
+    K,
+    # Strides
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    # Quantization
     group_size,
     HAS_ZP: tl.constexpr,
     ZP_BIAS: tl.constexpr,
@@ -318,13 +438,10 @@ def triton_w4a16_gemm_nk_kernel(
     BLOCK_K: tl.constexpr,
 ):
     """
-    GEMM kernel for [N, K//8] weight layout (skips the K-N repack).
+    Prefill GEMM for [K//8, N] layout. Uses tl.dot (WMMA on RDNA3).
 
-    Each B row is one output's K-packed weights — contiguous K/8 int32s.
-    A tile load reads BLOCK_N rows × BLOCK_K/8 int32 = BLOCK_N full
-    cache lines, vs. the [K, N//8] kernel which fragments a tile across
-    BLOCK_K cache lines with poor utilization. This is the structural
-    win that lets exllama beat the [K, N//8] WMMA kernel at decode.
+    No split-K: at M>=16 the M*N grid already saturates the GPU,
+    and atomic_add cost outweighs the parallelism gain.
     """
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -333,9 +450,7 @@ def triton_w4a16_gemm_nk_kernel(
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_zn = pid_n * (BLOCK_N // 8) + tl.arange(0, BLOCK_N // 8)
 
-    # Each int32 of B packs 8 consecutive K-values at shifts [0,4,...,28]
-    shifts_row = tl.arange(0, 8) * 4
-
+    shifts = tl.arange(0, 8) * 4
     accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
     for k_start in range(0, tl.cdiv(K, BLOCK_K)):
@@ -349,30 +464,27 @@ def triton_w4a16_gemm_nk_kernel(
             a_ptrs, mask=(offs_m[:, None] < M) & mask_k[None, :], other=0.0
         )
 
-        # B: [BLOCK_N, BLOCK_K//8] int32 -- contiguous K-row per N
-        b_ptrs = b_ptr + offs_n[:, None] * stride_bn + offs_bk[None, :] * stride_bk
-        mask_b = (offs_n[:, None] < N) & (offs_bk[None, :] < K // 8)
+        # B: [BLOCK_K//8, BLOCK_N] int32  -- coalesced row-major load
+        b_ptrs = b_ptr + offs_bk[:, None] * stride_bk + offs_n[None, :] * stride_bn
+        mask_b = (offs_bk[:, None] < K // 8) & (offs_n[None, :] < N)
         b_packed = tl.load(b_ptrs, mask=mask_b, other=0)
 
-        # Unpack int4 weights along K → [BLOCK_N, BLOCK_K]
-        b = (b_packed[:, :, None] >> shifts_row[None, None, :]) & 0xF
-        b = tl.reshape(b, (BLOCK_N, BLOCK_K))
+        # Unpack to [BLOCK_K, BLOCK_N] (K dim contiguous after reshape)
+        b3d = (b_packed[:, None, :] >> shifts[None, :, None]) & 0xF
+        b = tl.reshape(b3d, (BLOCK_K, BLOCK_N))
 
         g_idx = (k_start * BLOCK_K) // group_size
-
-        # Scales [BLOCK_N] from [K//G, N]
         scales = tl.load(
             scales_ptr + g_idx * N + offs_n, mask=offs_n < N, other=1.0
         )
 
-        # Zeros [BLOCK_N] from [K//G, N//8]
         if HAS_ZP:
             z_packed = tl.load(
                 zeros_ptr + g_idx * (N // 8) + offs_zn,
                 mask=offs_zn < N // 8,
                 other=0,
             )
-            z = (z_packed[:, None] >> shifts_row[None, :]) & 0xF
+            z = (z_packed[:, None] >> shifts[None, :]) & 0xF
             z = tl.reshape(z, (BLOCK_N,))
         else:
             z = tl.full((BLOCK_N,), ZP_BIAS, dtype=tl.int32)
@@ -381,17 +493,16 @@ def triton_w4a16_gemm_nk_kernel(
         if a.dtype == tl.float16:
             b_fp = ((b | 0x6400).to(tl.int16)).to(tl.float16, bitcast=True)
             z_fp = ((z | 0x6400).to(tl.int16)).to(tl.float16, bitcast=True)
-            b_minus_z = b_fp - z_fp[:, None]
+            b_minus_z = b_fp - z_fp[None, :]
         elif a.dtype == tl.bfloat16:
             b_fp = ((b | 0x4300).to(tl.int16)).to(tl.bfloat16, bitcast=True)
             z_fp = ((z | 0x4300).to(tl.int16)).to(tl.bfloat16, bitcast=True)
-            b_minus_z = b_fp - z_fp[:, None]
+            b_minus_z = b_fp - z_fp[None, :]
         else:
-            b_minus_z = (b - z[:, None]).to(a.dtype)
+            b_minus_z = (b - z[None, :]).to(a.dtype)
 
-        # Apply scale per N row, then transpose for tl.dot
-        b_dequant = b_minus_z * scales[:, None]  # [BLOCK_N, BLOCK_K]
-        accumulator += tl.dot(a, tl.trans(b_dequant), out_dtype=tl.float32)
+        b_dequant = b_minus_z * scales[None, :]  # [BLOCK_K, BLOCK_N]
+        accumulator += tl.dot(a, b_dequant, out_dtype=tl.float32)
 
     c = accumulator.to(c_ptr.type.element_ty)
     c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
@@ -399,137 +510,30 @@ def triton_w4a16_gemm_nk_kernel(
     tl.store(c_ptrs, c, mask=mask_c)
 
 
-@triton.jit
-def triton_w4a16_gemv_nk_kernel(
-    # Pointers
-    a_ptr,  # [M, K] fp16/bf16 (M small)
-    b_ptr,  # [N, K//8] int32
-    scales_ptr,  # [K//G, N]
-    zeros_ptr,  # [K//G, N//8]
-    c_ptr,  # [M, N]
-    # Dimensions
-    M,
-    N,
-    K,
-    # Strides
-    stride_am,
-    stride_ak,
-    stride_bn,
-    stride_bk,
-    stride_cm,
-    stride_cn,
-    # Quantization parameters
-    group_size,
-    HAS_ZP: tl.constexpr,
-    ZP_BIAS: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-):
-    """
-    GEMV kernel for [N, K//8] layout — decode path (M<=16).
-
-    Combines two structural fixes vs. the WMMA kernel:
-      1. No `tl.dot` → no WMMA tile waste at small M.
-      2. [N, K//8] layout → contiguous per-output-column reads, full
-         cache-line utilization, ~4× better effective BW than the
-         [K, N//8] layout's strided 16-byte fragments.
-
-    Grid: (M, cdiv(N, BLOCK_N)) — one program per (row, N-tile).
-    """
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_zn = pid_n * (BLOCK_N // 8) + tl.arange(0, BLOCK_N // 8)
-    shifts_row = tl.arange(0, 8) * 4
-
-    accumulator = tl.zeros((BLOCK_N,), dtype=tl.float32)
-
-    for k_start in range(0, tl.cdiv(K, BLOCK_K)):
-        offs_k = k_start * BLOCK_K + tl.arange(0, BLOCK_K)
-        offs_bk = k_start * (BLOCK_K // 8) + tl.arange(0, BLOCK_K // 8)
-        mask_k = offs_k < K
-
-        # A: [BLOCK_K]
-        a = tl.load(
-            a_ptr + pid_m * stride_am + offs_k * stride_ak,
-            mask=mask_k,
-            other=0.0,
-        )
-
-        # B: [BLOCK_N, BLOCK_K//8] int32 -- one full K-slice per N row
-        b_ptrs = b_ptr + offs_n[:, None] * stride_bn + offs_bk[None, :] * stride_bk
-        mask_b = (offs_n[:, None] < N) & (offs_bk[None, :] < K // 8)
-        b_packed = tl.load(b_ptrs, mask=mask_b, other=0)
-
-        # Unpack int4 along K → [BLOCK_N, BLOCK_K]
-        b = (b_packed[:, :, None] >> shifts_row[None, None, :]) & 0xF
-        b = tl.reshape(b, (BLOCK_N, BLOCK_K))
-
-        g_idx = (k_start * BLOCK_K) // group_size
-
-        scales = tl.load(
-            scales_ptr + g_idx * N + offs_n, mask=offs_n < N, other=1.0
-        )
-
-        if HAS_ZP:
-            z_packed = tl.load(
-                zeros_ptr + g_idx * (N // 8) + offs_zn,
-                mask=offs_zn < N // 8,
-                other=0,
-            )
-            z = (z_packed[:, None] >> shifts_row[None, :]) & 0xF
-            z = tl.reshape(z, (BLOCK_N,))
-        else:
-            z = tl.full((BLOCK_N,), ZP_BIAS, dtype=tl.int32)
-
-        # Bit-trick dequant
-        if a.dtype == tl.float16:
-            b_fp = ((b | 0x6400).to(tl.int16)).to(tl.float16, bitcast=True)
-            z_fp = ((z | 0x6400).to(tl.int16)).to(tl.float16, bitcast=True)
-            b_minus_z = b_fp - z_fp[:, None]  # [BLOCK_N, BLOCK_K]
-        elif a.dtype == tl.bfloat16:
-            b_fp = ((b | 0x4300).to(tl.int16)).to(tl.bfloat16, bitcast=True)
-            z_fp = ((z | 0x4300).to(tl.int16)).to(tl.bfloat16, bitcast=True)
-            b_minus_z = b_fp - z_fp[:, None]
-        else:
-            b_minus_z = (b - z[:, None]).to(a.dtype)
-
-        # GEMV K-reduction: a [BLOCK_K] · b_minus_z [BLOCK_N, BLOCK_K]
-        # No tl.dot → no WMMA. Defer scales until after the K-sum so
-        # we multiply by scales BLOCK_N times instead of BLOCK_K*BLOCK_N.
-        prod = a[None, :] * b_minus_z
-        partial = tl.sum(prod, axis=1) * scales
-        accumulator += partial.to(tl.float32)
-
-    c_ptrs = c_ptr + pid_m * stride_cm + offs_n * stride_cn
-    tl.store(c_ptrs, accumulator.to(c_ptr.type.element_ty), mask=offs_n < N)
-
-
-def triton_w4a16_gemm_nk(
+def triton_w4a16_gemm_kn(
     a: torch.Tensor,  # [M, K] fp16/bf16
-    b_q: torch.Tensor,  # [N, K//8] int32  -- N row-major (skipped repack)
+    b_q: torch.Tensor,  # [K//8, N] int32 -- exllama-style layout
     scales: torch.Tensor,  # [K//G, N]
     qzeros: torch.Tensor | None,  # [K//G, N//8] or None
     group_size: int,
     zp_bias: int = 8,
 ) -> torch.Tensor:
     """
-    W4A16 GEMM with [N, K//8] weight layout.
+    W4A16 GEMM with [K//8, N] weight layout (the layout exllama uses).
 
-    Used on gfx11 (RDNA3/3.5) where the original GPTQ-style layout gives
-    per-output contiguous reads and matches the access pattern that lets
-    exllama beat the [K, N//8] kernel at decode.
+    Routes to a split-K GEMV kernel for M<=16 (decode) and a regular
+    GEMM kernel for M>16 (prefill). Used on gfx11 (RDNA3/3.5) where
+    coalesced N-row reads close the gap with exllama.
     """
     assert a.is_contiguous(), "Activation matrix must be contiguous"
     assert b_q.is_contiguous(), "Weight matrix must be contiguous"
     assert scales.is_contiguous(), "Scales must be contiguous"
 
     M, K = a.shape
-    N = b_q.shape[0]
+    N = b_q.shape[1]
 
-    assert b_q.shape == (N, K // 8), (
-        f"b_q shape mismatch: {b_q.shape} vs ({N}, {K // 8})"
+    assert b_q.shape == (K // 8, N), (
+        f"b_q shape mismatch: {b_q.shape} vs ({K // 8}, {N})"
     )
     assert scales.shape == (K // group_size, N), (
         f"scales shape mismatch: {scales.shape} vs ({K // group_size}, {N})"
@@ -539,20 +543,20 @@ def triton_w4a16_gemm_nk(
             f"qzeros shape mismatch: {qzeros.shape}"
         )
 
-    c = torch.empty((M, N), dtype=a.dtype, device=a.device)
-
     has_zp = qzeros is not None
     zeros_ptr = qzeros if has_zp else b_q
 
-    # ---- Decode path: M small, GEMV (no WMMA) ----
+    # ---- Decode path: split-K GEMV with atomic_add ----
     if M <= 16:
-        BLOCK_N = 64
-        BLOCK_K = 128
-        if group_size < BLOCK_K:
-            BLOCK_K = group_size
+        BLOCK_N = 32  # one wave32 per program, fully coalesced load
+        BLOCK_K = group_size  # one group per K-tile, no per-position scale
 
-        grid = (M, triton.cdiv(N, BLOCK_N))
-        triton_w4a16_gemv_nk_kernel[grid](
+        # Output must be zeroed since the kernel uses atomic_add to
+        # accumulate partial K-split results.
+        c = torch.zeros((M, N), dtype=a.dtype, device=a.device)
+
+        grid = (M, triton.cdiv(N, BLOCK_N), triton.cdiv(K, BLOCK_K))
+        triton_w4a16_gemv_kn_kernel[grid](
             a,
             b_q,
             scales,
@@ -572,12 +576,14 @@ def triton_w4a16_gemm_nk(
             ZP_BIAS=zp_bias,
             BLOCK_N=BLOCK_N,
             BLOCK_K=BLOCK_K,
-            num_warps=2,
+            num_warps=1,
             num_stages=2,
         )
         return c
 
-    # ---- Prefill path: M large, GEMM with tl.dot ----
+    # ---- Prefill path: regular GEMM, no split-K ----
+    c = torch.empty((M, N), dtype=a.dtype, device=a.device)
+
     if M <= 32:
         BLOCK_M, BLOCK_N, BLOCK_K = 32, 64, 64
     elif M <= 64:
@@ -589,7 +595,7 @@ def triton_w4a16_gemm_nk(
         BLOCK_K = group_size
 
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
-    triton_w4a16_gemm_nk_kernel[grid](
+    triton_w4a16_gemm_kn_kernel[grid](
         a,
         b_q,
         scales,
