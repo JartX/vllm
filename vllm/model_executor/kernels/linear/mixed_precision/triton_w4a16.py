@@ -317,98 +317,105 @@ def triton_w4a16_gemv_kn_kernel(
     stride_csplit,  # = M * N (one full output plane per K-split)
     stride_cm,
     stride_cn,
-    # Quantization
-    group_size,
+    # Quantization (GROUP_SIZE constexpr → enables compile-time
+    # GROUPS_PER_TILE; one Triton compile per (group_size, BLOCK_K) pair)
+    GROUP_SIZE: tl.constexpr,
     HAS_ZP: tl.constexpr,
     ZP_BIAS: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
     """
-    Decode GEMV for [K//8, N] layout with split-K via temp buffer.
+    Decode GEMV for [K//8, N] layout with split-K + multi-group inner.
 
-    Each K-split program writes its partial sum to a UNIQUE slice of
-    c_ptr[pid_k, m, n_tile] (no atomic). Caller does torch.sum over
-    pid_k afterwards. Avoids tl.atomic_add latency on AMD, which can
-    dominate at high contention (128+ K-splits per output cell).
+    BLOCK_K can span MULTIPLE quant groups (BLOCK_K % GROUP_SIZE == 0).
+    The inner static loop processes one group per iteration so scales/
+    zeros are correct, but the OUTER per-program work amortizes setup
+    over GROUPS_PER_TILE × BLOCK_N × GROUP_SIZE FMAs — typically 8x
+    more than the prior single-group kernel and on par with exllama's
+    hand-tuned 128×128 tile.
 
-    Three structural wins over the [K, N//8] WMMA path:
-      1. Layout [K//8, N] → coalesced N-row reads (1 cache line/warp)
-      2. Split-K parallelism → 1024+ programs at M=1 (vs. 64)
-      3. No tl.dot → no WMMA tile waste at small M
+    Each K-split writes a unique slice c_ptr[pid_k, m, n_tile]; the
+    caller reduces over the K-split dim with torch.sum (no atomics).
     """
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
     pid_k = tl.program_id(2)
 
+    GROUPS_PER_TILE: tl.constexpr = BLOCK_K // GROUP_SIZE
+
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_zn = pid_n * (BLOCK_N // 8) + tl.arange(0, BLOCK_N // 8)
-
-    k_start = pid_k * BLOCK_K
-    offs_k = k_start + tl.arange(0, BLOCK_K)
-    offs_bk = (k_start // 8) + tl.arange(0, BLOCK_K // 8)
-    mask_k = offs_k < K
-
-    # A: [BLOCK_K]
-    a = tl.load(
-        a_ptr + pid_m * stride_am + offs_k * stride_ak,
-        mask=mask_k,
-        other=0.0,
-    )
-
-    # B: [BLOCK_K//8, BLOCK_N] int32 -- coalesced row-major load
-    b_ptrs = b_ptr + offs_bk[:, None] * stride_bk + offs_n[None, :] * stride_bn
-    mask_b = (offs_bk[:, None] < K // 8) & (offs_n[None, :] < N)
-    b_packed = tl.load(b_ptrs, mask=mask_b, other=0)
-
-    # Unpack along K: place 8 K-positions BETWEEN k_row and n_col so the
-    # subsequent reshape gives contiguous K. Avoids a tl.permute.
     shifts = tl.arange(0, 8) * 4  # [8]
-    b3d = (b_packed[:, None, :] >> shifts[None, :, None]) & 0xF
-    # b3d[k_row, shift, n] = K-value at k_row*8 + shift for n
-    b = tl.reshape(b3d, (BLOCK_K, BLOCK_N))
 
-    # Single group per BLOCK_K tile (caller clamps BLOCK_K to group_size)
-    g_idx = k_start // group_size
-    scales = tl.load(
-        scales_ptr + g_idx * N + offs_n, mask=offs_n < N, other=1.0
-    )
+    accumulator = tl.zeros((BLOCK_N,), dtype=tl.float32)
 
-    if HAS_ZP:
-        z_packed = tl.load(
-            zeros_ptr + g_idx * (N // 8) + offs_zn,
-            mask=offs_zn < N // 8,
-            other=0,
+    # Inner loop over groups within this K-tile (unrolled at compile time)
+    for g_local in tl.static_range(GROUPS_PER_TILE):
+        k_g_start = pid_k * BLOCK_K + g_local * GROUP_SIZE
+        offs_k = k_g_start + tl.arange(0, GROUP_SIZE)
+        offs_bk = (k_g_start // 8) + tl.arange(0, GROUP_SIZE // 8)
+        mask_k = offs_k < K
+
+        # A: [GROUP_SIZE]
+        a = tl.load(
+            a_ptr + pid_m * stride_am + offs_k * stride_ak,
+            mask=mask_k,
+            other=0.0,
         )
-        z = (z_packed[:, None] >> shifts[None, :]) & 0xF
-        z = tl.reshape(z, (BLOCK_N,))
-    else:
-        z = tl.full((BLOCK_N,), ZP_BIAS, dtype=tl.int32)
 
-    # Bit-trick dequant
-    if a.dtype == tl.float16:
-        b_fp = ((b | 0x6400).to(tl.int16)).to(tl.float16, bitcast=True)
-        z_fp = ((z | 0x6400).to(tl.int16)).to(tl.float16, bitcast=True)
-        b_minus_z = b_fp - z_fp[None, :]
-    elif a.dtype == tl.bfloat16:
-        b_fp = ((b | 0x4300).to(tl.int16)).to(tl.bfloat16, bitcast=True)
-        z_fp = ((z | 0x4300).to(tl.int16)).to(tl.bfloat16, bitcast=True)
-        b_minus_z = b_fp - z_fp[None, :]
-    else:
-        b_minus_z = (b - z[None, :]).to(a.dtype)
+        # B: [GROUP_SIZE//8, BLOCK_N] int32 -- coalesced N-row reads
+        b_ptrs = b_ptr + offs_bk[:, None] * stride_bk + offs_n[None, :] * stride_bn
+        mask_b = (offs_bk[:, None] < K // 8) & (offs_n[None, :] < N)
+        b_packed = tl.load(b_ptrs, mask=mask_b, other=0)
 
-    # GEMV K-reduction (no tl.dot)
-    prod = a[:, None] * b_minus_z  # [BLOCK_K, BLOCK_N]
-    partial = tl.sum(prod, axis=0) * scales  # [BLOCK_N]
+        # Unpack to [GROUP_SIZE, BLOCK_N] without permute (8-shift dim
+        # placed BETWEEN k_row and n_col so reshape flattens correctly).
+        b3d = (b_packed[:, None, :] >> shifts[None, :, None]) & 0xF
+        b = tl.reshape(b3d, (GROUP_SIZE, BLOCK_N))
 
-    # Plain store to a unique slice [pid_k, m, n] -- no atomic, no contention
+        # Scales/zeros for this group
+        g_idx = k_g_start // GROUP_SIZE
+        scales = tl.load(
+            scales_ptr + g_idx * N + offs_n, mask=offs_n < N, other=1.0
+        )
+
+        if HAS_ZP:
+            z_packed = tl.load(
+                zeros_ptr + g_idx * (N // 8) + offs_zn,
+                mask=offs_zn < N // 8,
+                other=0,
+            )
+            z = (z_packed[:, None] >> shifts[None, :]) & 0xF
+            z = tl.reshape(z, (BLOCK_N,))
+        else:
+            z = tl.full((BLOCK_N,), ZP_BIAS, dtype=tl.int32)
+
+        # Bit-trick dequant
+        if a.dtype == tl.float16:
+            b_fp = ((b | 0x6400).to(tl.int16)).to(tl.float16, bitcast=True)
+            z_fp = ((z | 0x6400).to(tl.int16)).to(tl.float16, bitcast=True)
+            b_minus_z = b_fp - z_fp[None, :]
+        elif a.dtype == tl.bfloat16:
+            b_fp = ((b | 0x4300).to(tl.int16)).to(tl.bfloat16, bitcast=True)
+            z_fp = ((z | 0x4300).to(tl.int16)).to(tl.bfloat16, bitcast=True)
+            b_minus_z = b_fp - z_fp[None, :]
+        else:
+            b_minus_z = (b - z[None, :]).to(a.dtype)
+
+        # GEMV reduction within this group
+        prod = a[:, None] * b_minus_z  # [GROUP_SIZE, BLOCK_N]
+        partial_g = tl.sum(prod, axis=0) * scales  # [BLOCK_N]
+        accumulator += partial_g.to(tl.float32)
+
+    # Plain store to a unique slice [pid_k, m, n_tile] — no atomic
     c_ptrs = (
         c_ptr
         + pid_k * stride_csplit
         + pid_m * stride_cm
         + offs_n * stride_cn
     )
-    tl.store(c_ptrs, partial.to(tl.float32), mask=offs_n < N)
+    tl.store(c_ptrs, accumulator, mask=offs_n < N)
 
 
 @triton.jit
@@ -547,36 +554,27 @@ def triton_w4a16_gemm_kn(
     has_zp = qzeros is not None
     zeros_ptr = qzeros if has_zp else b_q
 
-    # ---- Decode path: split-K GEMV via temp buffer + torch.sum ----
+    # ---- Decode path: split-K multi-group GEMV ----
     if M <= 16:
-        BLOCK_N = 32  # one wave32 per program, fully coalesced load
-        BLOCK_K = group_size  # one group per K-tile, no per-position scale
+        # BLOCK_K spans multiple groups for amortization. For G=32 and
+        # BLOCK_K=128 each program does 4 inner-group iterations, lifting
+        # per-program FMAs from ~1k to ~8k — closer to exllama's 16k tile.
+        BLOCK_N = 64
+        BLOCK_K = max(128, group_size)
+        # Round BLOCK_K to a multiple of group_size and clamp to K
+        BLOCK_K = (BLOCK_K // group_size) * group_size
+        BLOCK_K = min(BLOCK_K, K)
+        # Avoid degenerate single-group tile if K < BLOCK_K
+        if BLOCK_K == 0:
+            BLOCK_K = group_size
 
         K_SPLITS = triton.cdiv(K, BLOCK_K)
 
-        # Per-K-split partial sums in fp32. Each program writes a unique
-        # slice c_temp[pid_k, m, n_tile] (no atomic, no contention). A
-        # final torch.sum reduces along the K-split dim. Cost: K_SPLITS
-        # extra MB of temp (~2 MB for typical Qwen layers), one cheap
-        # reduction kernel call. Buys: zero atomic latency on AMD,
-        # which Triton's tl.atomic_add appears to inflate for fp32+fp16.
+        # Per-K-split partial sums in fp32. Plain stores to unique slots,
+        # no atomics. torch.sum reduces along the K-split dim.
         c_temp = torch.empty(
             (K_SPLITS, M, N), dtype=torch.float32, device=a.device
         )
-
-        if not _GFX11_KN_FIRST_CALL_LOGGED["done"]:
-            logger.info(
-                "[Triton W4A16 KN] gfx11 split-K GEMV active: "
-                "M=%d N=%d K=%d G=%d K_SPLITS=%d BLOCK_N=%d BLOCK_K=%d",
-                M,
-                N,
-                K,
-                group_size,
-                K_SPLITS,
-                BLOCK_N,
-                BLOCK_K,
-            )
-            _GFX11_KN_FIRST_CALL_LOGGED["done"] = True
 
         grid = (M, triton.cdiv(N, BLOCK_N), K_SPLITS)
         triton_w4a16_gemv_kn_kernel[grid](
@@ -595,12 +593,12 @@ def triton_w4a16_gemm_kn(
             c_temp.stride(0),
             c_temp.stride(1),
             c_temp.stride(2),
-            group_size=group_size,
+            GROUP_SIZE=group_size,
             HAS_ZP=has_zp,
             ZP_BIAS=zp_bias,
             BLOCK_N=BLOCK_N,
             BLOCK_K=BLOCK_K,
-            num_warps=1,
+            num_warps=2,
             num_stages=2,
         )
         # Sum across K-splits → [M, N] fp32 → cast to activation dtype
