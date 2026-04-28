@@ -21,6 +21,7 @@ Checkpoint layout from compressed_tensors_wNa16 create_weights:
 
 import torch
 
+from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils import replace_parameter
 from vllm.model_executor.parameter import BasevLLMParameter, permute_param_layout_
 from vllm.platforms import current_platform
@@ -28,6 +29,12 @@ from vllm.scalar_type import scalar_types
 from vllm.triton_utils import tl, triton
 
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
+
+logger = init_logger(__name__)
+
+# One-shot diagnostic so we can verify the gfx11 KN GEMV path is being
+# entered. Logged on first call from any layer; cleared after.
+_GFX11_KN_FIRST_CALL_LOGGED = {"done": False}
 
 TRITON_W4A16_SUPPORTED_GROUP_SIZES = [-1, 32, 64, 128, 256]
 TRITON_W4A16_SUPPORTED_QUANT_TYPES = [
@@ -297,7 +304,7 @@ def triton_w4a16_gemv_kn_kernel(
     b_ptr,  # [K//8, N] int32 -- K packed at dim 0, N row-major at dim 1
     scales_ptr,  # [K//G, N] fp16/bf16
     zeros_ptr,  # [K//G, N//8] int32 (unused if HAS_ZP=False)
-    c_ptr,  # [M, N] fp16/bf16  -- atomically accumulated across K splits
+    c_ptr,  # [K_SPLITS, M, N] fp32 -- partial sums, one slice per K-split
     # Dimensions
     M,
     N,
@@ -307,6 +314,7 @@ def triton_w4a16_gemv_kn_kernel(
     stride_ak,
     stride_bk,  # row stride of B (= N for contiguous [K//8, N])
     stride_bn,  # col stride of B (= 1)
+    stride_csplit,  # = M * N (one full output plane per K-split)
     stride_cm,
     stride_cn,
     # Quantization
@@ -317,27 +325,17 @@ def triton_w4a16_gemv_kn_kernel(
     BLOCK_K: tl.constexpr,
 ):
     """
-    Decode GEMV for [K//8, N] layout with split-K + atomic_add.
+    Decode GEMV for [K//8, N] layout with split-K via temp buffer.
 
-    Same structural pattern exllama's HIP kernel uses to dominate at
-    batch=1 on RDNA3. Three combined wins over the [K, N//8] WMMA path:
+    Each K-split program writes its partial sum to a UNIQUE slice of
+    c_ptr[pid_k, m, n_tile] (no atomic). Caller does torch.sum over
+    pid_k afterwards. Avoids tl.atomic_add latency on AMD, which can
+    dominate at high contention (128+ K-splits per output cell).
 
-    1. **Layout [K//8, N]**: each warp's load is a single contiguous
-       row of N int32 (32 lanes × 4 bytes = 128 B = 1 cache line).
-       Fully coalesced. Compare to [K, N//8]'s 16-byte fragments
-       across BLOCK_K cache lines (25-50% utilization).
-
-    2. **Split-K + atomic_add**: grid = (M, cdiv(N, BLOCK_N),
-       cdiv(K, BLOCK_K)). For typical Qwen layers at M=1 that's
-       1024+ programs (vs. 64 without split-K). RDNA3 needs many
-       active warps to hide global-memory latency — without split-K
-       the GPU sits idle waiting on memory.
-
-    3. **No tl.dot**: pure tl.sum K-reduction → scalar FMA, no WMMA
-       tile waste at small M. Bit-trick dequant + deferred scale
-       multiply (one per K-tile rather than one per K-position).
-
-    Caller MUST zero c_ptr before launch (atomic_add accumulates).
+    Three structural wins over the [K, N//8] WMMA path:
+      1. Layout [K//8, N] → coalesced N-row reads (1 cache line/warp)
+      2. Split-K parallelism → 1024+ programs at M=1 (vs. 64)
+      3. No tl.dot → no WMMA tile waste at small M
     """
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -403,11 +401,14 @@ def triton_w4a16_gemv_kn_kernel(
     prod = a[:, None] * b_minus_z  # [BLOCK_K, BLOCK_N]
     partial = tl.sum(prod, axis=0) * scales  # [BLOCK_N]
 
-    # Atomic add this K-split's contribution to global output
-    c_ptrs = c_ptr + pid_m * stride_cm + offs_n * stride_cn
-    tl.atomic_add(
-        c_ptrs, partial.to(c_ptr.type.element_ty), mask=offs_n < N
+    # Plain store to a unique slice [pid_k, m, n] -- no atomic, no contention
+    c_ptrs = (
+        c_ptr
+        + pid_k * stride_csplit
+        + pid_m * stride_cm
+        + offs_n * stride_cn
     )
+    tl.store(c_ptrs, partial.to(tl.float32), mask=offs_n < N)
 
 
 @triton.jit
@@ -546,25 +547,44 @@ def triton_w4a16_gemm_kn(
     has_zp = qzeros is not None
     zeros_ptr = qzeros if has_zp else b_q
 
-    # ---- Decode path: split-K GEMV with atomic_add ----
+    # ---- Decode path: split-K GEMV via temp buffer + torch.sum ----
     if M <= 16:
         BLOCK_N = 32  # one wave32 per program, fully coalesced load
         BLOCK_K = group_size  # one group per K-tile, no per-position scale
 
-        # Atomic_add on fp16/bf16 is not universally supported across
-        # AMD targets in current Triton. Accumulate in fp32 (always
-        # supported), then cast once at the end. Cost: 2x temp memory
-        # (a few MB, negligible) and one cast — vastly cheaper than
-        # losing split-K parallelism.
-        c_fp32 = torch.zeros((M, N), dtype=torch.float32, device=a.device)
+        K_SPLITS = triton.cdiv(K, BLOCK_K)
 
-        grid = (M, triton.cdiv(N, BLOCK_N), triton.cdiv(K, BLOCK_K))
+        # Per-K-split partial sums in fp32. Each program writes a unique
+        # slice c_temp[pid_k, m, n_tile] (no atomic, no contention). A
+        # final torch.sum reduces along the K-split dim. Cost: K_SPLITS
+        # extra MB of temp (~2 MB for typical Qwen layers), one cheap
+        # reduction kernel call. Buys: zero atomic latency on AMD,
+        # which Triton's tl.atomic_add appears to inflate for fp32+fp16.
+        c_temp = torch.empty(
+            (K_SPLITS, M, N), dtype=torch.float32, device=a.device
+        )
+
+        if not _GFX11_KN_FIRST_CALL_LOGGED["done"]:
+            logger.info(
+                "[Triton W4A16 KN] gfx11 split-K GEMV active: "
+                "M=%d N=%d K=%d G=%d K_SPLITS=%d BLOCK_N=%d BLOCK_K=%d",
+                M,
+                N,
+                K,
+                group_size,
+                K_SPLITS,
+                BLOCK_N,
+                BLOCK_K,
+            )
+            _GFX11_KN_FIRST_CALL_LOGGED["done"] = True
+
+        grid = (M, triton.cdiv(N, BLOCK_N), K_SPLITS)
         triton_w4a16_gemv_kn_kernel[grid](
             a,
             b_q,
             scales,
             zeros_ptr,
-            c_fp32,
+            c_temp,
             M,
             N,
             K,
@@ -572,8 +592,9 @@ def triton_w4a16_gemm_kn(
             a.stride(1),
             b_q.stride(0),
             b_q.stride(1),
-            c_fp32.stride(0),
-            c_fp32.stride(1),
+            c_temp.stride(0),
+            c_temp.stride(1),
+            c_temp.stride(2),
             group_size=group_size,
             HAS_ZP=has_zp,
             ZP_BIAS=zp_bias,
@@ -582,7 +603,8 @@ def triton_w4a16_gemm_kn(
             num_warps=1,
             num_stages=2,
         )
-        return c_fp32.to(a.dtype)
+        # Sum across K-splits → [M, N] fp32 → cast to activation dtype
+        return c_temp.sum(dim=0).to(a.dtype)
 
     # ---- Prefill path: regular GEMM, no split-K ----
     c = torch.empty((M, N), dtype=a.dtype, device=a.device)
