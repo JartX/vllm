@@ -262,20 +262,28 @@ def triton_w4a16_gemv_kernel(
             z = tl.full((BLOCK_N,), ZP_BIAS, dtype=tl.int32)
 
         # ---- Bit-trick dequant (see GEMM kernel for derivation) ----
+        # Defer the scale multiply: scales are constant across the
+        # entire K tile (one group), so applying them per-K-position
+        # wastes BLOCK_K-1 multiplies per output. Reduce the unscaled
+        # product first, scale once per K tile.
         if a.dtype == tl.float16:
-            b_fp16 = ((b | 0x6400).to(tl.int16)).to(tl.float16, bitcast=True)
-            z_fp16 = ((z | 0x6400).to(tl.int16)).to(tl.float16, bitcast=True)
-            b_dequant = (b_fp16 - z_fp16[None, :]) * scales[None, :]
+            b_fp = ((b | 0x6400).to(tl.int16)).to(tl.float16, bitcast=True)
+            z_fp = ((z | 0x6400).to(tl.int16)).to(tl.float16, bitcast=True)
+            b_minus_z = b_fp - z_fp[None, :]
         elif a.dtype == tl.bfloat16:
-            b_bf16 = ((b | 0x4300).to(tl.int16)).to(tl.bfloat16, bitcast=True)
-            z_bf16 = ((z | 0x4300).to(tl.int16)).to(tl.bfloat16, bitcast=True)
-            b_dequant = (b_bf16 - z_bf16[None, :]) * scales[None, :]
+            b_fp = ((b | 0x4300).to(tl.int16)).to(tl.bfloat16, bitcast=True)
+            z_fp = ((z | 0x4300).to(tl.int16)).to(tl.bfloat16, bitcast=True)
+            b_minus_z = b_fp - z_fp[None, :]
         else:
-            b_dequant = ((b - z[None, :]).to(a.dtype)) * scales[None, :]
+            b_minus_z = (b - z[None, :]).to(a.dtype)
 
         # ---- GEMV reduction along K — no `tl.dot`, no WMMA ----
-        prod = a[:, None].to(tl.float32) * b_dequant.to(tl.float32)
-        accumulator += tl.sum(prod, axis=0)
+        # Inner mul stays in act dtype so AMD can fuse with v_pk_fma_f16
+        # (half2). Apply scales once per K tile, then promote to fp32
+        # for the cross-tile accumulator.
+        prod = a[:, None] * b_minus_z
+        partial = tl.sum(prod, axis=0) * scales
+        accumulator += partial.to(tl.float32)
 
     # ---- Store output [BLOCK_N] ----
     c_ptrs = c_ptr + pid_m * stride_cm + offs_n * stride_cn
@@ -339,14 +347,22 @@ def triton_w4a16_gemm(
         is_gfx11 = on_gfx11()
 
         # ---- gfx11 small-M decode path: bypass WMMA via GEMV kernel ----
-        # tl.dot on RDNA3 forces a 16-row WMMA tile. At M<=8 most of those
-        # rows are zero-padded, so the WMMA kernel computes 8/16..15/16
-        # discarded work per cycle. The GEMV kernel uses `tl.sum` instead
-        # of `tl.dot`, lowering to scalar FMA — same shape as exllama's
-        # HIP kernel at batch=1. Restricted to gfx11 (RDNA3/3.5) where
-        # the WMMA tile waste is most pronounced; gfx12/MI3xx keep WMMA.
-        if is_gfx11 and M <= 8:
-            BLOCK_N_GEMV = 64
+        # tl.dot on RDNA3 forces a 16-row WMMA tile. At M<=16 most of
+        # those rows are zero-padded, so the WMMA kernel computes
+        # 0/16..15/16 discarded work per cycle. The GEMV kernel uses
+        # `tl.sum` over an elementwise product instead of `tl.dot`,
+        # lowering to scalar FMA — same shape as exllama's HIP kernel
+        # at batch=1. Restricted to gfx11 (RDNA3/3.5) where the WMMA
+        # tile waste is most pronounced.
+        #
+        # Tile choice: M=1 decode is occupancy-bound — RDNA3 needs many
+        # active warps to hide global-memory latency. Use BLOCK_N=32
+        # with num_warps=1 (one wave32 per program, 1 lane per output)
+        # so we get ~N/32 programs. For typical Qwen3.5 dims that's
+        # 160..1728 warps, vs 64 with BLOCK_N=64 num_warps=2 — well
+        # past the ~96-CU saturation point so memory latency hides.
+        if is_gfx11 and M <= 16:
+            BLOCK_N_GEMV = 32
             BLOCK_K_GEMV = 128
             if group_size < BLOCK_K_GEMV:
                 BLOCK_K_GEMV = group_size
@@ -372,8 +388,8 @@ def triton_w4a16_gemm(
                 ZP_BIAS=zp_bias,
                 BLOCK_N=BLOCK_N_GEMV,
                 BLOCK_K=BLOCK_K_GEMV,
-                num_warps=2,
-                num_stages=2,
+                num_warps=1,
+                num_stages=3,
             )
             return c
 
