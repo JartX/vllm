@@ -172,6 +172,116 @@ def triton_w4a16_gemm_kernel(
     tl.store(c_ptrs, c, mask=mask_c)
 
 
+@triton.jit
+def triton_w4a16_gemv_kernel(
+    # Pointers
+    a_ptr,  # [M, K]  fp16/bf16 activations (M small, typically 1..8)
+    b_ptr,  # [K, N//8]  int32 packed 4-bit weights
+    scales_ptr,  # [K//G, N]  fp16/bf16 scales
+    zeros_ptr,  # [K//G, N//8]  int32 packed zeros (unused if HAS_ZP=False)
+    c_ptr,  # [M, N]  fp16/bf16 output
+    # Dimensions
+    M,
+    N,
+    K,
+    # Strides
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    # Quantization parameters
+    group_size,
+    HAS_ZP: tl.constexpr,
+    ZP_BIAS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """
+    GEMV W4A16 kernel for small M (decode path).
+
+    The GEMM kernel uses `tl.dot`, which on RDNA3 lowers to WMMA with a
+    minimum M tile of 16. At M=1..8 most of those rows are masked-zero
+    padding, so 8/16..15/16 of the WMMA cycles compute discarded zeros.
+    This kernel uses an explicit elementwise multiply + `tl.sum`
+    K-reduction — Triton lowers it to scalar FMA with no WMMA, the
+    same shape as exllama's HIP kernel for batch=1.
+
+    Grid: (M, cdiv(N, BLOCK_N)) — one program per (row, N-tile).
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_bn = pid_n * (BLOCK_N // 8) + tl.arange(0, BLOCK_N // 8)
+    shifts_row = tl.arange(0, 8) * 4  # [8]
+
+    accumulator = tl.zeros((BLOCK_N,), dtype=tl.float32)
+
+    for k_start in range(0, tl.cdiv(K, BLOCK_K)):
+        offs_k = k_start * BLOCK_K + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < K
+
+        # ---- Load activations: [BLOCK_K] (single M row per program) ----
+        a = tl.load(
+            a_ptr + pid_m * stride_am + offs_k * stride_ak,
+            mask=mask_k,
+            other=0.0,
+        )
+
+        # ---- Load packed weights: [BLOCK_K, BLOCK_N//8] int32 ----
+        b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn
+        mask_b = mask_k[:, None] & (offs_bn[None, :] < N // 8)
+        b_packed = tl.load(b_ptrs, mask=mask_b, other=0)
+
+        # ---- Unpack int4 weights → [BLOCK_K, BLOCK_N] ----
+        b = (b_packed[:, :, None] >> shifts_row[None, None, :]) & 0xF
+        b = tl.reshape(b, (BLOCK_K, BLOCK_N))
+
+        # ---- Group index for scales/zeros ----
+        g_idx = (k_start * BLOCK_K) // group_size
+
+        # ---- Scales: [BLOCK_N] ----
+        scales = tl.load(
+            scales_ptr + g_idx * N + offs_n,
+            mask=offs_n < N,
+            other=1.0,
+        )
+
+        # ---- Zeros: [BLOCK_N] ----
+        if HAS_ZP:
+            z_packed = tl.load(
+                zeros_ptr + g_idx * (N // 8) + offs_bn,
+                mask=offs_bn < N // 8,
+                other=0,
+            )
+            z = (z_packed[:, None] >> shifts_row[None, :]) & 0xF
+            z = tl.reshape(z, (BLOCK_N,))
+        else:
+            z = tl.full((BLOCK_N,), ZP_BIAS, dtype=tl.int32)
+
+        # ---- Bit-trick dequant (see GEMM kernel for derivation) ----
+        if a.dtype == tl.float16:
+            b_fp16 = ((b | 0x6400).to(tl.int16)).to(tl.float16, bitcast=True)
+            z_fp16 = ((z | 0x6400).to(tl.int16)).to(tl.float16, bitcast=True)
+            b_dequant = (b_fp16 - z_fp16[None, :]) * scales[None, :]
+        elif a.dtype == tl.bfloat16:
+            b_bf16 = ((b | 0x4300).to(tl.int16)).to(tl.bfloat16, bitcast=True)
+            z_bf16 = ((z | 0x4300).to(tl.int16)).to(tl.bfloat16, bitcast=True)
+            b_dequant = (b_bf16 - z_bf16[None, :]) * scales[None, :]
+        else:
+            b_dequant = ((b - z[None, :]).to(a.dtype)) * scales[None, :]
+
+        # ---- GEMV reduction along K — no `tl.dot`, no WMMA ----
+        prod = a[:, None].to(tl.float32) * b_dequant.to(tl.float32)
+        accumulator += tl.sum(prod, axis=0)
+
+    # ---- Store output [BLOCK_N] ----
+    c_ptrs = c_ptr + pid_m * stride_cm + offs_n * stride_cn
+    tl.store(c_ptrs, accumulator.to(c_ptr.type.element_ty), mask=offs_n < N)
+
+
 def triton_w4a16_gemm(
     a: torch.Tensor,  # [M, K] fp16/bf16
     b_q: torch.Tensor,  # [K, N//8] int32
@@ -227,6 +337,45 @@ def triton_w4a16_gemm(
         from vllm.platforms.rocm import on_gfx1x, on_gfx11
 
         is_gfx11 = on_gfx11()
+
+        # ---- gfx11 small-M decode path: bypass WMMA via GEMV kernel ----
+        # tl.dot on RDNA3 forces a 16-row WMMA tile. At M<=8 most of those
+        # rows are zero-padded, so the WMMA kernel computes 8/16..15/16
+        # discarded work per cycle. The GEMV kernel uses `tl.sum` instead
+        # of `tl.dot`, lowering to scalar FMA — same shape as exllama's
+        # HIP kernel at batch=1. Restricted to gfx11 (RDNA3/3.5) where
+        # the WMMA tile waste is most pronounced; gfx12/MI3xx keep WMMA.
+        if is_gfx11 and M <= 8:
+            BLOCK_N_GEMV = 64
+            BLOCK_K_GEMV = 128
+            if group_size < BLOCK_K_GEMV:
+                BLOCK_K_GEMV = group_size
+
+            grid_gemv = (M, triton.cdiv(N, BLOCK_N_GEMV))
+            triton_w4a16_gemv_kernel[grid_gemv](
+                a,
+                b_q,
+                scales,
+                zeros_ptr,
+                c,
+                M,
+                N,
+                K,
+                a.stride(0),
+                a.stride(1),
+                b_q.stride(0),
+                b_q.stride(1),
+                c.stride(0),
+                c.stride(1),
+                group_size=group_size,
+                HAS_ZP=has_zp,
+                ZP_BIAS=zp_bias,
+                BLOCK_N=BLOCK_N_GEMV,
+                BLOCK_K=BLOCK_K_GEMV,
+                num_warps=2,
+                num_stages=2,
+            )
+            return c
 
         if is_gfx11:
             # WMMA forces a 16-row M tile minimum. With BLOCK_M=32 and
