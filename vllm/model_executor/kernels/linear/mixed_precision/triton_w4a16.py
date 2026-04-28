@@ -551,9 +551,12 @@ def triton_w4a16_gemm_kn(
         BLOCK_N = 32  # one wave32 per program, fully coalesced load
         BLOCK_K = group_size  # one group per K-tile, no per-position scale
 
-        # Output must be zeroed since the kernel uses atomic_add to
-        # accumulate partial K-split results.
-        c = torch.zeros((M, N), dtype=a.dtype, device=a.device)
+        # Atomic_add on fp16/bf16 is not universally supported across
+        # AMD targets in current Triton. Accumulate in fp32 (always
+        # supported), then cast once at the end. Cost: 2x temp memory
+        # (a few MB, negligible) and one cast — vastly cheaper than
+        # losing split-K parallelism.
+        c_fp32 = torch.zeros((M, N), dtype=torch.float32, device=a.device)
 
         grid = (M, triton.cdiv(N, BLOCK_N), triton.cdiv(K, BLOCK_K))
         triton_w4a16_gemv_kn_kernel[grid](
@@ -561,7 +564,7 @@ def triton_w4a16_gemm_kn(
             b_q,
             scales,
             zeros_ptr,
-            c,
+            c_fp32,
             M,
             N,
             K,
@@ -569,8 +572,8 @@ def triton_w4a16_gemm_kn(
             a.stride(1),
             b_q.stride(0),
             b_q.stride(1),
-            c.stride(0),
-            c.stride(1),
+            c_fp32.stride(0),
+            c_fp32.stride(1),
             group_size=group_size,
             HAS_ZP=has_zp,
             ZP_BIAS=zp_bias,
@@ -579,7 +582,7 @@ def triton_w4a16_gemm_kn(
             num_warps=1,
             num_stages=2,
         )
-        return c
+        return c_fp32.to(a.dtype)
 
     # ---- Prefill path: regular GEMM, no split-K ----
     c = torch.empty((M, N), dtype=a.dtype, device=a.device)
