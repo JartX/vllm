@@ -37,116 +37,6 @@ TRITON_W4A16_SUPPORTED_QUANT_TYPES = [
 
 
 @triton.jit
-def triton_w4a16_gemm_kernel_decode(
-    # Pointers
-    a_ptr,  # [M, K]  fp16/bf16 activations (M small: 1..8 typically)
-    b_ptr,  # [K, N//8]  int32 packed 4-bit weights (N is the packed dim)
-    scales_ptr,  # [K//G, N]  fp16/bf16 scales
-    zeros_ptr,  # [K//G, N//8]  int32 packed zeros (unused when HAS_ZP=False)
-    c_ptr,  # [M, N]  fp16/bf16 output
-    # Dimensions
-    M,
-    N,
-    K,
-    # Strides
-    stride_am,
-    stride_ak,
-    stride_bk,
-    stride_bn,
-    stride_cm,
-    stride_cn,
-    # Quantization parameters
-    group_size,
-    HAS_ZP: tl.constexpr,
-    ZP_BIAS: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-):
-    """W4A16 GEMM specialized for tiny M (decode batch ≤ 8).
-
-    Avoids ``tl.dot`` (WMMA), which forces a 16-row M tile and burns
-    ~15/16 of the cycles on masked-zero rows when M=1. Instead uses
-    ``tl.sum(a[:, :, None] * b[None, :, :], axis=1)`` — Triton lowers
-    this to per-thread fma ops, the same pattern the hand-tuned exllama
-    HIP kernel uses (each thread computes a partial output element).
-
-    Same packing convention and dequant math as ``triton_w4a16_gemm_kernel``;
-    only the matmul reduction differs.
-    """
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_bn = pid_n * (BLOCK_N // 8) + tl.arange(0, BLOCK_N // 8)
-
-    shifts_row = tl.arange(0, 8) * 4
-    shifts_1d_2d = tl.broadcast_to(shifts_row[None, :], (BLOCK_N // 8, 8))
-    shifts_1d = tl.reshape(shifts_1d_2d, (BLOCK_N,))
-    shifts = tl.broadcast_to(shifts_1d[None, :], (BLOCK_K, BLOCK_N))
-
-    offs_sn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-
-    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-
-    for k_start in range(0, tl.cdiv(K, BLOCK_K)):
-        offs_k = k_start * BLOCK_K + tl.arange(0, BLOCK_K)
-        mask_k = offs_k < K
-
-        # Load A: [BLOCK_M, BLOCK_K]
-        a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
-        mask_a = (offs_m[:, None] < M) & mask_k[None, :]
-        a = tl.load(a_ptrs, mask=mask_a, other=0.0)
-
-        # Load packed B: [BLOCK_K, BLOCK_N//8]
-        b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn
-        mask_b = mask_k[:, None] & (offs_bn[None, :] < N // 8)
-        b_packed = tl.load(b_ptrs, mask=mask_b, other=0)
-
-        # Unpack int4 -> [BLOCK_K, BLOCK_N]
-        b = tl.interleave(b_packed, b_packed)
-        b = tl.interleave(b, b)
-        b = tl.interleave(b, b)
-        b = (b >> shifts) & 0xF
-
-        # Per-tile group scale/zero
-        g_idx = (k_start * BLOCK_K) // group_size
-        scale_offset = g_idx * N + offs_sn
-        scale_mask = offs_sn < N
-        scales = tl.load(scales_ptr + scale_offset, mask=scale_mask, other=1.0)
-        scales = tl.broadcast_to(scales[None, :], (BLOCK_K, BLOCK_N))
-
-        if HAS_ZP:
-            zero_offset = g_idx * (N // 8) + offs_bn
-            zero_mask = offs_bn < N // 8
-            z_packed = tl.load(zeros_ptr + zero_offset, mask=zero_mask, other=0)
-            z = tl.interleave(z_packed, z_packed)
-            z = tl.interleave(z, z)
-            z = tl.interleave(z, z)
-            z = (z >> shifts_1d) & 0xF
-            z = tl.broadcast_to(z[None, :], (BLOCK_K, BLOCK_N))
-        else:
-            z = tl.full((BLOCK_K, BLOCK_N), ZP_BIAS, dtype=tl.int32)
-
-        # Dequantize
-        b_fp = (b - z).to(a.dtype) * scales
-
-        # Non-WMMA reduction: tl.sum of broadcast multiply.
-        # a:    (BLOCK_M, BLOCK_K) -> (BLOCK_M, BLOCK_K, 1)
-        # b_fp: (BLOCK_K, BLOCK_N) -> (1, BLOCK_K, BLOCK_N)
-        # product: (BLOCK_M, BLOCK_K, BLOCK_N), sum over K -> (BLOCK_M, BLOCK_N)
-        a_3d = a.to(tl.float32)[:, :, None]
-        b_3d = b_fp.to(tl.float32)[None, :, :]
-        accumulator += tl.sum(a_3d * b_3d, axis=1)
-
-    c = accumulator.to(c_ptr.type.element_ty)
-    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
-    mask_c = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-    tl.store(c_ptrs, c, mask=mask_c)
-
-
-@triton.jit
 def triton_w4a16_gemm_kernel(
     # Pointers
     a_ptr,  # [M, K]  fp16/bf16 activations
@@ -225,14 +115,12 @@ def triton_w4a16_gemm_kernel(
         b_packed = tl.load(b_ptrs, mask=mask_b, other=0)
 
         # ---- Unpack int4 weights → [BLOCK_K, BLOCK_N] ----
-        # tl.interleave(x, x) doubles the last dim by interleaving.
-        # Starting from [BLOCK_K, BLOCK_N//8], three interleaves give
-        # [BLOCK_K, BLOCK_N], where each int32 is replicated 8 times.
-        b = tl.interleave(b_packed, b_packed)
-        b = tl.interleave(b, b)
-        b = tl.interleave(b, b)
-        # Extract the correct 4-bit nibble for each output column
-        b = (b >> shifts) & 0xF
+        # Broadcast variant: shift each int32 by [0,4,...,28] in a 3D
+        # op then reshape. Same data layout as the interleave path
+        # (column j -> nibble (j%8)*4 of int32 j//8). Fewer register
+        # shuffles than the 3x tl.interleave chain on RDNA3.
+        b = (b_packed[:, :, None] >> shifts_row[None, None, :]) & 0xF
+        b = tl.reshape(b, (BLOCK_K, BLOCK_N))
 
         # ---- Compute scale/zero group row index ----
         g_idx = (k_start * BLOCK_K) // group_size
@@ -249,17 +137,31 @@ def triton_w4a16_gemm_kernel(
             zero_offset = g_idx * (N // 8) + offs_bn
             zero_mask = offs_bn < N // 8
             z_packed = tl.load(zeros_ptr + zero_offset, mask=zero_mask, other=0)
-            # Unpack to [BLOCK_N] using same interleave+shift pattern
-            z = tl.interleave(z_packed, z_packed)
-            z = tl.interleave(z, z)
-            z = tl.interleave(z, z)
-            z = (z >> shifts_1d) & 0xF
+            # Unpack to [BLOCK_N] via broadcast (same trick as B)
+            z = (z_packed[:, None] >> shifts_row[None, :]) & 0xF
+            z = tl.reshape(z, (BLOCK_N,))
             z = tl.broadcast_to(z[None, :], (BLOCK_K, BLOCK_N))
         else:
             z = tl.full((BLOCK_K, BLOCK_N), ZP_BIAS, dtype=tl.int32)
 
-        # ---- Dequantize: (w - zero) * scale ----
-        b_fp = (b - z).to(a.dtype) * scales
+        # ---- Dequantize via bit-trick (avoids slow int32→fp16 cast) ----
+        # The int4 nibble n (0..15) is encoded as fp16(1024 + n) by ORing
+        # 0x6400 (= bit pattern of fp16(1024.0)) with the nibble in the
+        # low 4 bits, then bitcasting via int16. This skips the explicit
+        # int→float conversion that takes multiple instructions on RDNA3.
+        # The 1024 offset cancels in the (b - z) subtraction.
+        if a.dtype == tl.float16:
+            b_fp16 = ((b | 0x6400).to(tl.int16)).to(tl.float16, bitcast=True)
+            z_fp16 = ((z | 0x6400).to(tl.int16)).to(tl.float16, bitcast=True)
+            b_fp = (b_fp16 - z_fp16) * scales
+        elif a.dtype == tl.bfloat16:
+            # bf16 magic constant: 0x4480 = bf16(1024.0). Same trick.
+            b_bf16 = ((b | 0x4480).to(tl.int16)).to(tl.bfloat16, bitcast=True)
+            z_bf16 = ((z | 0x4480).to(tl.int16)).to(tl.bfloat16, bitcast=True)
+            b_fp = (b_bf16 - z_bf16) * scales
+        else:
+            # Fallback: explicit cast.
+            b_fp = (b - z).to(a.dtype) * scales
 
         # ---- Accumulate ----
         accumulator += tl.dot(a, b_fp, out_dtype=tl.float32)
@@ -321,32 +223,17 @@ def triton_w4a16_gemm(
     num_warps: int | None = None
     num_stages: int | None = None
 
-    # gfx11 (RDNA3) decode fast path: M <= 8 uses a non-WMMA kernel that
-    # reduces with `tl.sum(a * b)` instead of `tl.dot`. The HIP exllama
-    # kernel does the same — for tiny M, WMMA's 16-row M tile burns
-    # most of the cycles on masked-zero rows.
     is_gfx11 = False
-    use_decode_kernel = False
     if current_platform.is_rocm():
         from vllm.platforms.rocm import on_gfx1x, on_gfx11
 
         is_gfx11 = on_gfx11()
 
         if is_gfx11:
-            if M <= 8:
-                # Tiny M: non-WMMA kernel. BLOCK_M is the next pow2 of
-                # M up to 8 (Triton needs constexpr powers of 2).
-                use_decode_kernel = True
-                if M == 1:
-                    BLOCK_M = 1
-                elif M <= 2:
-                    BLOCK_M = 2
-                elif M <= 4:
-                    BLOCK_M = 4
-                else:
-                    BLOCK_M = 8
-                BLOCK_N, BLOCK_K = 64, 64
-            elif M <= 16:
+            # WMMA forces a 16-row M tile minimum. With BLOCK_M=32 and
+            # M=1 we burn 31/32 of the WMMA cycles on masked-zero rows.
+            # Drop to BLOCK_M=16 for M<=16 to halve that waste.
+            if M <= 16:
                 BLOCK_M, BLOCK_N, BLOCK_K = 16, 64, 64
             elif M <= 32:
                 BLOCK_M, BLOCK_N, BLOCK_K = 32, 32, 64
@@ -404,12 +291,7 @@ def triton_w4a16_gemm(
     if num_stages is not None:
         launch_kwargs["num_stages"] = num_stages
 
-    kernel = (
-        triton_w4a16_gemm_kernel_decode
-        if use_decode_kernel
-        else triton_w4a16_gemm_kernel
-    )
-    kernel[grid](
+    triton_w4a16_gemm_kernel[grid](
         a,
         b_q,
         scales,
