@@ -86,14 +86,9 @@ def triton_w4a16_gemm_kernel(
     # b/zeros are stored with N packed: N//8 int32 columns per K row
     offs_bn = pid_n * (BLOCK_N // 8) + tl.arange(0, BLOCK_N // 8)
 
-    # GPTQ sequential shifts tiled across BLOCK_N:
-    #   [0,4,8,...,28] repeating for every group of 8 N-values.
-    # Build 1D shifts_1d of length BLOCK_N: column j gets shift (j % 8) * 4.
+    # GPTQ sequential shifts: each int32 packs 8 nibbles at offsets
+    # [0, 4, 8, ..., 28]. The unpack uses a 3D broadcast against this.
     shifts_row = tl.arange(0, 8) * 4  # [8]
-    shifts_1d_2d = tl.broadcast_to(shifts_row[None, :], (BLOCK_N // 8, 8))
-    shifts_1d = tl.reshape(shifts_1d_2d, (BLOCK_N,))  # [BLOCK_N]
-    # Broadcast to [BLOCK_K, BLOCK_N] for weight unpacking
-    shifts = tl.broadcast_to(shifts_1d[None, :], (BLOCK_K, BLOCK_N))
 
     # Scales column offsets: full N-width (one scale per output neuron)
     offs_sn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -145,19 +140,23 @@ def triton_w4a16_gemm_kernel(
             z = tl.full((BLOCK_K, BLOCK_N), ZP_BIAS, dtype=tl.int32)
 
         # ---- Dequantize via bit-trick (avoids slow int32→fp16 cast) ----
-        # The int4 nibble n (0..15) is encoded as fp16(1024 + n) by ORing
-        # 0x6400 (= bit pattern of fp16(1024.0)) with the nibble in the
-        # low 4 bits, then bitcasting via int16. This skips the explicit
-        # int→float conversion that takes multiple instructions on RDNA3.
-        # The 1024 offset cancels in the (b - z) subtraction.
+        # The int4 nibble n (0..15) is encoded as float(C + n) by ORing
+        # the bit pattern of float(C) with the nibble in the low 4 bits,
+        # then bitcasting via int16. This skips the explicit int→float
+        # conversion that takes multiple instructions on RDNA3. The C
+        # offset cancels in the (b - z) subtraction.
+        #
+        # For fp16 (10-bit mantissa), need exp such that LSB of mantissa
+        # is worth 1: exp = 25 (=15+10) → C = 1024, magic = 0x6400.
+        # For bf16 (7-bit mantissa), need exp such that LSB worth 1:
+        # exp = 134 (=127+7) → C = 128, magic = 0x4300.
         if a.dtype == tl.float16:
             b_fp16 = ((b | 0x6400).to(tl.int16)).to(tl.float16, bitcast=True)
             z_fp16 = ((z | 0x6400).to(tl.int16)).to(tl.float16, bitcast=True)
             b_fp = (b_fp16 - z_fp16) * scales
         elif a.dtype == tl.bfloat16:
-            # bf16 magic constant: 0x4480 = bf16(1024.0). Same trick.
-            b_bf16 = ((b | 0x4480).to(tl.int16)).to(tl.bfloat16, bitcast=True)
-            z_bf16 = ((z | 0x4480).to(tl.int16)).to(tl.bfloat16, bitcast=True)
+            b_bf16 = ((b | 0x4300).to(tl.int16)).to(tl.bfloat16, bitcast=True)
+            z_bf16 = ((z | 0x4300).to(tl.int16)).to(tl.bfloat16, bitcast=True)
             b_fp = (b_bf16 - z_bf16) * scales
         else:
             # Fallback: explicit cast.
