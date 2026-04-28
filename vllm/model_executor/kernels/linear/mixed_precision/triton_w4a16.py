@@ -290,6 +290,332 @@ def triton_w4a16_gemv_kernel(
     tl.store(c_ptrs, accumulator.to(c_ptr.type.element_ty), mask=offs_n < N)
 
 
+@triton.jit
+def triton_w4a16_gemm_nk_kernel(
+    # Pointers
+    a_ptr,  # [M, K] fp16/bf16 activations
+    b_ptr,  # [N, K//8] int32  -- N row-major, K packed within each N row
+    scales_ptr,  # [K//G, N] fp16/bf16
+    zeros_ptr,  # [K//G, N//8] int32 (unused if HAS_ZP=False)
+    c_ptr,  # [M, N] fp16/bf16
+    # Dimensions
+    M,
+    N,
+    K,
+    # Strides
+    stride_am,
+    stride_ak,
+    stride_bn,  # stride between N rows of B
+    stride_bk,  # stride within an N row (=1 for contiguous int32)
+    stride_cm,
+    stride_cn,
+    # Quantization parameters
+    group_size,
+    HAS_ZP: tl.constexpr,
+    ZP_BIAS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """
+    GEMM kernel for [N, K//8] weight layout (skips the K-N repack).
+
+    Each B row is one output's K-packed weights — contiguous K/8 int32s.
+    A tile load reads BLOCK_N rows × BLOCK_K/8 int32 = BLOCK_N full
+    cache lines, vs. the [K, N//8] kernel which fragments a tile across
+    BLOCK_K cache lines with poor utilization. This is the structural
+    win that lets exllama beat the [K, N//8] WMMA kernel at decode.
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_zn = pid_n * (BLOCK_N // 8) + tl.arange(0, BLOCK_N // 8)
+
+    # Each int32 of B packs 8 consecutive K-values at shifts [0,4,...,28]
+    shifts_row = tl.arange(0, 8) * 4
+
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k_start in range(0, tl.cdiv(K, BLOCK_K)):
+        offs_k = k_start * BLOCK_K + tl.arange(0, BLOCK_K)
+        offs_bk = k_start * (BLOCK_K // 8) + tl.arange(0, BLOCK_K // 8)
+        mask_k = offs_k < K
+
+        # A: [BLOCK_M, BLOCK_K]
+        a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+        a = tl.load(
+            a_ptrs, mask=(offs_m[:, None] < M) & mask_k[None, :], other=0.0
+        )
+
+        # B: [BLOCK_N, BLOCK_K//8] int32 -- contiguous K-row per N
+        b_ptrs = b_ptr + offs_n[:, None] * stride_bn + offs_bk[None, :] * stride_bk
+        mask_b = (offs_n[:, None] < N) & (offs_bk[None, :] < K // 8)
+        b_packed = tl.load(b_ptrs, mask=mask_b, other=0)
+
+        # Unpack int4 weights along K → [BLOCK_N, BLOCK_K]
+        b = (b_packed[:, :, None] >> shifts_row[None, None, :]) & 0xF
+        b = tl.reshape(b, (BLOCK_N, BLOCK_K))
+
+        g_idx = (k_start * BLOCK_K) // group_size
+
+        # Scales [BLOCK_N] from [K//G, N]
+        scales = tl.load(
+            scales_ptr + g_idx * N + offs_n, mask=offs_n < N, other=1.0
+        )
+
+        # Zeros [BLOCK_N] from [K//G, N//8]
+        if HAS_ZP:
+            z_packed = tl.load(
+                zeros_ptr + g_idx * (N // 8) + offs_zn,
+                mask=offs_zn < N // 8,
+                other=0,
+            )
+            z = (z_packed[:, None] >> shifts_row[None, :]) & 0xF
+            z = tl.reshape(z, (BLOCK_N,))
+        else:
+            z = tl.full((BLOCK_N,), ZP_BIAS, dtype=tl.int32)
+
+        # Bit-trick dequant
+        if a.dtype == tl.float16:
+            b_fp = ((b | 0x6400).to(tl.int16)).to(tl.float16, bitcast=True)
+            z_fp = ((z | 0x6400).to(tl.int16)).to(tl.float16, bitcast=True)
+            b_minus_z = b_fp - z_fp[:, None]
+        elif a.dtype == tl.bfloat16:
+            b_fp = ((b | 0x4300).to(tl.int16)).to(tl.bfloat16, bitcast=True)
+            z_fp = ((z | 0x4300).to(tl.int16)).to(tl.bfloat16, bitcast=True)
+            b_minus_z = b_fp - z_fp[:, None]
+        else:
+            b_minus_z = (b - z[:, None]).to(a.dtype)
+
+        # Apply scale per N row, then transpose for tl.dot
+        b_dequant = b_minus_z * scales[:, None]  # [BLOCK_N, BLOCK_K]
+        accumulator += tl.dot(a, tl.trans(b_dequant), out_dtype=tl.float32)
+
+    c = accumulator.to(c_ptr.type.element_ty)
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    mask_c = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, c, mask=mask_c)
+
+
+@triton.jit
+def triton_w4a16_gemv_nk_kernel(
+    # Pointers
+    a_ptr,  # [M, K] fp16/bf16 (M small)
+    b_ptr,  # [N, K//8] int32
+    scales_ptr,  # [K//G, N]
+    zeros_ptr,  # [K//G, N//8]
+    c_ptr,  # [M, N]
+    # Dimensions
+    M,
+    N,
+    K,
+    # Strides
+    stride_am,
+    stride_ak,
+    stride_bn,
+    stride_bk,
+    stride_cm,
+    stride_cn,
+    # Quantization parameters
+    group_size,
+    HAS_ZP: tl.constexpr,
+    ZP_BIAS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """
+    GEMV kernel for [N, K//8] layout — decode path (M<=16).
+
+    Combines two structural fixes vs. the WMMA kernel:
+      1. No `tl.dot` → no WMMA tile waste at small M.
+      2. [N, K//8] layout → contiguous per-output-column reads, full
+         cache-line utilization, ~4× better effective BW than the
+         [K, N//8] layout's strided 16-byte fragments.
+
+    Grid: (M, cdiv(N, BLOCK_N)) — one program per (row, N-tile).
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_zn = pid_n * (BLOCK_N // 8) + tl.arange(0, BLOCK_N // 8)
+    shifts_row = tl.arange(0, 8) * 4
+
+    accumulator = tl.zeros((BLOCK_N,), dtype=tl.float32)
+
+    for k_start in range(0, tl.cdiv(K, BLOCK_K)):
+        offs_k = k_start * BLOCK_K + tl.arange(0, BLOCK_K)
+        offs_bk = k_start * (BLOCK_K // 8) + tl.arange(0, BLOCK_K // 8)
+        mask_k = offs_k < K
+
+        # A: [BLOCK_K]
+        a = tl.load(
+            a_ptr + pid_m * stride_am + offs_k * stride_ak,
+            mask=mask_k,
+            other=0.0,
+        )
+
+        # B: [BLOCK_N, BLOCK_K//8] int32 -- one full K-slice per N row
+        b_ptrs = b_ptr + offs_n[:, None] * stride_bn + offs_bk[None, :] * stride_bk
+        mask_b = (offs_n[:, None] < N) & (offs_bk[None, :] < K // 8)
+        b_packed = tl.load(b_ptrs, mask=mask_b, other=0)
+
+        # Unpack int4 along K → [BLOCK_N, BLOCK_K]
+        b = (b_packed[:, :, None] >> shifts_row[None, None, :]) & 0xF
+        b = tl.reshape(b, (BLOCK_N, BLOCK_K))
+
+        g_idx = (k_start * BLOCK_K) // group_size
+
+        scales = tl.load(
+            scales_ptr + g_idx * N + offs_n, mask=offs_n < N, other=1.0
+        )
+
+        if HAS_ZP:
+            z_packed = tl.load(
+                zeros_ptr + g_idx * (N // 8) + offs_zn,
+                mask=offs_zn < N // 8,
+                other=0,
+            )
+            z = (z_packed[:, None] >> shifts_row[None, :]) & 0xF
+            z = tl.reshape(z, (BLOCK_N,))
+        else:
+            z = tl.full((BLOCK_N,), ZP_BIAS, dtype=tl.int32)
+
+        # Bit-trick dequant
+        if a.dtype == tl.float16:
+            b_fp = ((b | 0x6400).to(tl.int16)).to(tl.float16, bitcast=True)
+            z_fp = ((z | 0x6400).to(tl.int16)).to(tl.float16, bitcast=True)
+            b_minus_z = b_fp - z_fp[:, None]  # [BLOCK_N, BLOCK_K]
+        elif a.dtype == tl.bfloat16:
+            b_fp = ((b | 0x4300).to(tl.int16)).to(tl.bfloat16, bitcast=True)
+            z_fp = ((z | 0x4300).to(tl.int16)).to(tl.bfloat16, bitcast=True)
+            b_minus_z = b_fp - z_fp[:, None]
+        else:
+            b_minus_z = (b - z[:, None]).to(a.dtype)
+
+        # GEMV K-reduction: a [BLOCK_K] · b_minus_z [BLOCK_N, BLOCK_K]
+        # No tl.dot → no WMMA. Defer scales until after the K-sum so
+        # we multiply by scales BLOCK_N times instead of BLOCK_K*BLOCK_N.
+        prod = a[None, :] * b_minus_z
+        partial = tl.sum(prod, axis=1) * scales
+        accumulator += partial.to(tl.float32)
+
+    c_ptrs = c_ptr + pid_m * stride_cm + offs_n * stride_cn
+    tl.store(c_ptrs, accumulator.to(c_ptr.type.element_ty), mask=offs_n < N)
+
+
+def triton_w4a16_gemm_nk(
+    a: torch.Tensor,  # [M, K] fp16/bf16
+    b_q: torch.Tensor,  # [N, K//8] int32  -- N row-major (skipped repack)
+    scales: torch.Tensor,  # [K//G, N]
+    qzeros: torch.Tensor | None,  # [K//G, N//8] or None
+    group_size: int,
+    zp_bias: int = 8,
+) -> torch.Tensor:
+    """
+    W4A16 GEMM with [N, K//8] weight layout.
+
+    Used on gfx11 (RDNA3/3.5) where the original GPTQ-style layout gives
+    per-output contiguous reads and matches the access pattern that lets
+    exllama beat the [K, N//8] kernel at decode.
+    """
+    assert a.is_contiguous(), "Activation matrix must be contiguous"
+    assert b_q.is_contiguous(), "Weight matrix must be contiguous"
+    assert scales.is_contiguous(), "Scales must be contiguous"
+
+    M, K = a.shape
+    N = b_q.shape[0]
+
+    assert b_q.shape == (N, K // 8), (
+        f"b_q shape mismatch: {b_q.shape} vs ({N}, {K // 8})"
+    )
+    assert scales.shape == (K // group_size, N), (
+        f"scales shape mismatch: {scales.shape} vs ({K // group_size}, {N})"
+    )
+    if qzeros is not None:
+        assert qzeros.shape == (K // group_size, N // 8), (
+            f"qzeros shape mismatch: {qzeros.shape}"
+        )
+
+    c = torch.empty((M, N), dtype=a.dtype, device=a.device)
+
+    has_zp = qzeros is not None
+    zeros_ptr = qzeros if has_zp else b_q
+
+    # ---- Decode path: M small, GEMV (no WMMA) ----
+    if M <= 16:
+        BLOCK_N = 64
+        BLOCK_K = 128
+        if group_size < BLOCK_K:
+            BLOCK_K = group_size
+
+        grid = (M, triton.cdiv(N, BLOCK_N))
+        triton_w4a16_gemv_nk_kernel[grid](
+            a,
+            b_q,
+            scales,
+            zeros_ptr,
+            c,
+            M,
+            N,
+            K,
+            a.stride(0),
+            a.stride(1),
+            b_q.stride(0),
+            b_q.stride(1),
+            c.stride(0),
+            c.stride(1),
+            group_size=group_size,
+            HAS_ZP=has_zp,
+            ZP_BIAS=zp_bias,
+            BLOCK_N=BLOCK_N,
+            BLOCK_K=BLOCK_K,
+            num_warps=2,
+            num_stages=2,
+        )
+        return c
+
+    # ---- Prefill path: M large, GEMM with tl.dot ----
+    if M <= 32:
+        BLOCK_M, BLOCK_N, BLOCK_K = 32, 64, 64
+    elif M <= 64:
+        BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32
+    else:
+        BLOCK_M, BLOCK_N, BLOCK_K = 128, 32, 64
+
+    if group_size < BLOCK_K:
+        BLOCK_K = group_size
+
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+    triton_w4a16_gemm_nk_kernel[grid](
+        a,
+        b_q,
+        scales,
+        zeros_ptr,
+        c,
+        M,
+        N,
+        K,
+        a.stride(0),
+        a.stride(1),
+        b_q.stride(0),
+        b_q.stride(1),
+        c.stride(0),
+        c.stride(1),
+        group_size=group_size,
+        HAS_ZP=has_zp,
+        ZP_BIAS=zp_bias,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        num_warps=4,
+        num_stages=2,
+    )
+    return c
+
+
 def triton_w4a16_gemm(
     a: torch.Tensor,  # [M, K] fp16/bf16
     b_q: torch.Tensor,  # [K, N//8] int32
@@ -549,49 +875,52 @@ class TritonW4A16LinearKernel(MPLinearKernel):
           weight_scale:      [N, K//G]  fp16    input_dim=1, output_dim=0
           weight_zero_point: [N//8, K//G] int32  output_dim=0, packed_dim=0
 
-        Kernel needs:
-          qweight: [K, N//8]  int32   (transpose weight_packed)
-          scales:  [K//G, N]  fp16    (transpose weight_scale)
-          qzeros:  [K//G, N//8] int32 (transpose weight_zero_point)
+        On gfx11 (RDNA3/3.5) we keep weights in the checkpoint's
+        [N, K//8] layout — per-output-row contiguity is what makes
+        exllama fast at decode. On other platforms we repack to
+        [K, N//8] for the original WMMA GEMM kernel.
+
+        Scales / zeros are still transposed to [K//G, N] and
+        [K//G, N//8] for both layouts (group-major access).
         """
 
-        # ---- Transform qweight: [N, K//8] → [K//8, N] → back to [K, N//8] ----
-        # permute_param_layout_(x, input_dim=0, output_dim=1) rearranges so that
-        # the input(K) dimension is at physical dim 0 and output(N) at dim 1.
-        # Checkpoint has input_dim=1, output_dim=0, packed_dim=1 (K is packed).
-        # After permute we get [K//8, N] (K packed at dim 0, N at dim 1).
-        # The kernel wants [K, N//8] (K at dim 0, N packed at dim 1), so we
-        # then transpose: [K//8, N].T = [N, K//8] — that's not right.
-        #
-        # Actually we need to change WHAT is packed:
-        #   Original packing: K packed into K//8 (8 K-values per int32)
-        #   Kernel packing:   N packed into N//8 (8 N-values per int32)
-        # These require a full repack, not just a transpose.
-        #
-        # Simple approach: unpack → transpose the full [N, K] → repack as [K, N//8].
-        # This is done CPU-side at load time (one-time cost).
-        def repack_w_q(x: BasevLLMParameter) -> BasevLLMParameter:
-            # x.data is [N, K//8] int32, K packed (GPTQ checkpoint format)
-            # Step 1: bring to [N, K//8] with output(N) at dim 0
-            permute_param_layout_(x, input_dim=1, output_dim=0, packed_dim=1)
-            w = x.data  # [N, K//8] int32
+        layout_nk = False
+        if current_platform.is_rocm():
+            from vllm.platforms.rocm import on_gfx11
 
-            N_dim, K8 = w.shape
-            K_dim = K8 * 8
-            # Step 2: unpack to [N, K] int32 (vectorized)
-            shifts = torch.arange(8, device=w.device, dtype=torch.int32) * 4
-            w_unpacked = ((w.unsqueeze(-1) >> shifts) & 0xF).reshape(N_dim, K_dim)
-            # Step 3: transpose to [K, N] int32
-            w_KN = w_unpacked.t().contiguous()
-            # Step 4: repack N into N//8 int32 values → [K, N//8] (vectorized)
-            N8 = N_dim // 8
-            w_repacked = torch.sum(
-                (w_KN.view(K_dim, N8, 8) & 0xF) << shifts,
-                dim=2,
-                dtype=torch.int32,
-            )
-            x.data = w_repacked.contiguous()
-            return x
+            layout_nk = on_gfx11()
+        layer._w4a16_layout_nk = layout_nk
+
+        if layout_nk:
+            # ---- gfx11: keep [N, K//8] as the kernel layout ----
+            def repack_w_q(x: BasevLLMParameter) -> BasevLLMParameter:
+                # x.data is [N, K//8] int32, K packed. Just normalize
+                # the parameter metadata; no data-layout change needed.
+                permute_param_layout_(x, input_dim=1, output_dim=0, packed_dim=1)
+                x.data = x.data.contiguous()
+                return x
+        else:
+            # ---- Other platforms: full repack to [K, N//8] ----
+            # Original packing: K packed into K//8 (8 K-values per int32)
+            # Kernel packing:   N packed into N//8 (8 N-values per int32)
+            # Requires a full unpack→transpose→repack (CPU-side, one-time).
+            def repack_w_q(x: BasevLLMParameter) -> BasevLLMParameter:
+                permute_param_layout_(x, input_dim=1, output_dim=0, packed_dim=1)
+                w = x.data  # [N, K//8] int32
+
+                N_dim, K8 = w.shape
+                K_dim = K8 * 8
+                shifts = torch.arange(8, device=w.device, dtype=torch.int32) * 4
+                w_unpacked = ((w.unsqueeze(-1) >> shifts) & 0xF).reshape(N_dim, K_dim)
+                w_KN = w_unpacked.t().contiguous()
+                N8 = N_dim // 8
+                w_repacked = torch.sum(
+                    (w_KN.view(K_dim, N8, 8) & 0xF) << shifts,
+                    dim=2,
+                    dtype=torch.int32,
+                )
+                x.data = w_repacked.contiguous()
+                return x
 
         def repack_w_s(x: BasevLLMParameter) -> BasevLLMParameter:
             # x.data is [N, K//G] fp16, bring to [K//G, N]
@@ -628,14 +957,24 @@ class TritonW4A16LinearKernel(MPLinearKernel):
         # For symmetric types (uint4b8), use the scalar bias; no zeros tensor
         zp_bias = c.weight_type.bias if c.weight_type.has_bias() else 0
 
-        output = triton_w4a16_gemm(
-            a=x_2d,
-            b_q=w_q,
-            scales=w_s,
-            qzeros=w_zp,
-            group_size=group_size,
-            zp_bias=zp_bias,
-        )
+        if getattr(layer, "_w4a16_layout_nk", False):
+            output = triton_w4a16_gemm_nk(
+                a=x_2d,
+                b_q=w_q,
+                scales=w_s,
+                qzeros=w_zp,
+                group_size=group_size,
+                zp_bias=zp_bias,
+            )
+        else:
+            output = triton_w4a16_gemm(
+                a=x_2d,
+                b_q=w_q,
+                scales=w_s,
+                qzeros=w_zp,
+                group_size=group_size,
+                zp_bias=zp_bias,
+            )
 
         if bias is not None:
             output.add_(bias)
