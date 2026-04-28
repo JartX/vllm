@@ -881,29 +881,32 @@ class TritonW4A16LinearKernel(MPLinearKernel):
           weight_scale:      [N, K//G]  fp16    input_dim=1, output_dim=0
           weight_zero_point: [N//8, K//G] int32  output_dim=0, packed_dim=0
 
-        On gfx11 (RDNA3/3.5) we keep weights in the checkpoint's
-        [N, K//8] layout — per-output-row contiguity is what makes
-        exllama fast at decode. On other platforms we repack to
-        [K, N//8] for the original WMMA GEMM kernel.
+        On gfx11 (RDNA3/3.5) we transpose to [K//8, N] — the same
+        layout exllama's HIP kernel uses. With N row-major, a 32-lane
+        warp loads one full cache line per cycle (32 * 4 B = 128 B,
+        fully coalesced). On other platforms we keep the [K, N//8]
+        repack for the original WMMA GEMM kernel.
 
         Scales / zeros are still transposed to [K//G, N] and
         [K//G, N//8] for both layouts (group-major access).
         """
 
-        layout_nk = False
+        layout_kn = False
         if current_platform.is_rocm():
             from vllm.platforms.rocm import on_gfx11
 
-            layout_nk = on_gfx11()
-        layer._w4a16_layout_nk = layout_nk
+            layout_kn = on_gfx11()
+        layer._w4a16_layout_kn = layout_kn
 
-        if layout_nk:
-            # ---- gfx11: keep [N, K//8] as the kernel layout ----
+        if layout_kn:
+            # ---- gfx11: transpose to [K//8, N] (exllama-style) ----
             def repack_w_q(x: BasevLLMParameter) -> BasevLLMParameter:
-                # x.data is [N, K//8] int32, K packed. Just normalize
-                # the parameter metadata; no data-layout change needed.
+                # Checkpoint is [N, K//8] with K packed at dim 1.
+                # Transpose to [K//8, N] keeps K packed (now at dim 0)
+                # and puts N as a contiguous row-major dim. No bit-level
+                # repack needed — each int32 still stores 8 K-values.
                 permute_param_layout_(x, input_dim=1, output_dim=0, packed_dim=1)
-                x.data = x.data.contiguous()
+                x.data = x.data.t().contiguous()
                 return x
         else:
             # ---- Other platforms: full repack to [K, N//8] ----
@@ -963,8 +966,8 @@ class TritonW4A16LinearKernel(MPLinearKernel):
         # For symmetric types (uint4b8), use the scalar bias; no zeros tensor
         zp_bias = c.weight_type.bias if c.weight_type.has_bias() else 0
 
-        if getattr(layer, "_w4a16_layout_nk", False):
-            output = triton_w4a16_gemm_nk(
+        if getattr(layer, "_w4a16_layout_kn", False):
+            output = triton_w4a16_gemm_kn(
                 a=x_2d,
                 b_q=w_q,
                 scales=w_s,
