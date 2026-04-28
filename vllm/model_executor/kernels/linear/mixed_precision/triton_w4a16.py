@@ -86,14 +86,9 @@ def triton_w4a16_gemm_kernel(
     # b/zeros are stored with N packed: N//8 int32 columns per K row
     offs_bn = pid_n * (BLOCK_N // 8) + tl.arange(0, BLOCK_N // 8)
 
-    # GPTQ sequential shifts tiled across BLOCK_N:
-    #   [0,4,8,...,28] repeating for every group of 8 N-values.
-    # Build 1D shifts_1d of length BLOCK_N: column j gets shift (j % 8) * 4.
+    # GPTQ sequential shifts: each int32 packs 8 nibbles at offsets
+    # [0, 4, 8, ..., 28]. The unpack uses a 3D broadcast against this.
     shifts_row = tl.arange(0, 8) * 4  # [8]
-    shifts_1d_2d = tl.broadcast_to(shifts_row[None, :], (BLOCK_N // 8, 8))
-    shifts_1d = tl.reshape(shifts_1d_2d, (BLOCK_N,))  # [BLOCK_N]
-    # Broadcast to [BLOCK_K, BLOCK_N] for weight unpacking
-    shifts = tl.broadcast_to(shifts_1d[None, :], (BLOCK_K, BLOCK_N))
 
     # Scales column offsets: full N-width (one scale per output neuron)
     offs_sn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -115,14 +110,12 @@ def triton_w4a16_gemm_kernel(
         b_packed = tl.load(b_ptrs, mask=mask_b, other=0)
 
         # ---- Unpack int4 weights → [BLOCK_K, BLOCK_N] ----
-        # tl.interleave(x, x) doubles the last dim by interleaving.
-        # Starting from [BLOCK_K, BLOCK_N//8], three interleaves give
-        # [BLOCK_K, BLOCK_N], where each int32 is replicated 8 times.
-        b = tl.interleave(b_packed, b_packed)
-        b = tl.interleave(b, b)
-        b = tl.interleave(b, b)
-        # Extract the correct 4-bit nibble for each output column
-        b = (b >> shifts) & 0xF
+        # Broadcast variant: shift each int32 by [0,4,...,28] in a 3D
+        # op then reshape. Same data layout as the interleave path
+        # (column j -> nibble (j%8)*4 of int32 j//8). Fewer register
+        # shuffles than the 3x tl.interleave chain on RDNA3.
+        b = (b_packed[:, :, None] >> shifts_row[None, None, :]) & 0xF
+        b = tl.reshape(b, (BLOCK_K, BLOCK_N))
 
         # ---- Compute scale/zero group row index ----
         g_idx = (k_start * BLOCK_K) // group_size
@@ -139,17 +132,35 @@ def triton_w4a16_gemm_kernel(
             zero_offset = g_idx * (N // 8) + offs_bn
             zero_mask = offs_bn < N // 8
             z_packed = tl.load(zeros_ptr + zero_offset, mask=zero_mask, other=0)
-            # Unpack to [BLOCK_N] using same interleave+shift pattern
-            z = tl.interleave(z_packed, z_packed)
-            z = tl.interleave(z, z)
-            z = tl.interleave(z, z)
-            z = (z >> shifts_1d) & 0xF
+            # Unpack to [BLOCK_N] via broadcast (same trick as B)
+            z = (z_packed[:, None] >> shifts_row[None, :]) & 0xF
+            z = tl.reshape(z, (BLOCK_N,))
             z = tl.broadcast_to(z[None, :], (BLOCK_K, BLOCK_N))
         else:
             z = tl.full((BLOCK_K, BLOCK_N), ZP_BIAS, dtype=tl.int32)
 
-        # ---- Dequantize: (w - zero) * scale ----
-        b_fp = (b - z).to(a.dtype) * scales
+        # ---- Dequantize via bit-trick (avoids slow int32→fp16 cast) ----
+        # The int4 nibble n (0..15) is encoded as float(C + n) by ORing
+        # the bit pattern of float(C) with the nibble in the low 4 bits,
+        # then bitcasting via int16. This skips the explicit int→float
+        # conversion that takes multiple instructions on RDNA3. The C
+        # offset cancels in the (b - z) subtraction.
+        #
+        # For fp16 (10-bit mantissa), need exp such that LSB of mantissa
+        # is worth 1: exp = 25 (=15+10) → C = 1024, magic = 0x6400.
+        # For bf16 (7-bit mantissa), need exp such that LSB worth 1:
+        # exp = 134 (=127+7) → C = 128, magic = 0x4300.
+        if a.dtype == tl.float16:
+            b_fp16 = ((b | 0x6400).to(tl.int16)).to(tl.float16, bitcast=True)
+            z_fp16 = ((z | 0x6400).to(tl.int16)).to(tl.float16, bitcast=True)
+            b_fp = (b_fp16 - z_fp16) * scales
+        elif a.dtype == tl.bfloat16:
+            b_bf16 = ((b | 0x4300).to(tl.int16)).to(tl.bfloat16, bitcast=True)
+            z_bf16 = ((z | 0x4300).to(tl.int16)).to(tl.bfloat16, bitcast=True)
+            b_fp = (b_bf16 - z_bf16) * scales
+        else:
+            # Fallback: explicit cast.
+            b_fp = (b - z).to(a.dtype) * scales
 
         # ---- Accumulate ----
         accumulator += tl.dot(a, b_fp, out_dtype=tl.float32)
@@ -208,11 +219,32 @@ def triton_w4a16_gemm(
     # Provide a dummy pointer when HAS_ZP=False (Triton requires a valid ptr)
     zeros_ptr = qzeros if has_zp else b_q
 
-    if current_platform.is_rocm():
-        from vllm.platforms.rocm import on_gfx1x
+    num_warps: int | None = None
+    num_stages: int | None = None
 
-        if on_gfx1x():
-            # Tuned for RDNA 3.5 (gfx1151, 40 CUs, 32-wide wavefronts).
+    is_gfx11 = False
+    if current_platform.is_rocm():
+        from vllm.platforms.rocm import on_gfx1x, on_gfx11
+
+        is_gfx11 = on_gfx11()
+
+        if is_gfx11:
+            # WMMA forces a 16-row M tile minimum. With BLOCK_M=32 and
+            # M=1 we burn 31/32 of the WMMA cycles on masked-zero rows.
+            # Drop to BLOCK_M=16 for M<=16 to halve that waste.
+            if M <= 16:
+                BLOCK_M, BLOCK_N, BLOCK_K = 16, 64, 64
+            elif M <= 32:
+                BLOCK_M, BLOCK_N, BLOCK_K = 32, 32, 64
+            elif M <= 64:
+                BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32
+            else:
+                BLOCK_M, BLOCK_N, BLOCK_K = 128, 32, 64
+            num_warps = 4
+            num_stages = 2
+        elif on_gfx1x():
+            # gfx12 (RDNA4): keep previous tuning, no explicit warp/stage
+            # override yet.
             if M <= 32:
                 BLOCK_M, BLOCK_N, BLOCK_K = 32, 32, 64
             elif M <= 64:
@@ -245,6 +277,19 @@ def triton_w4a16_gemm(
 
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
 
+    launch_kwargs: dict = dict(
+        group_size=group_size,
+        HAS_ZP=has_zp,
+        ZP_BIAS=zp_bias,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+    )
+    if num_warps is not None:
+        launch_kwargs["num_warps"] = num_warps
+    if num_stages is not None:
+        launch_kwargs["num_stages"] = num_stages
+
     triton_w4a16_gemm_kernel[grid](
         a,
         b_q,
@@ -260,12 +305,7 @@ def triton_w4a16_gemm(
         b_q.stride(1),
         c.stride(0),
         c.stride(1),
-        group_size=group_size,
-        HAS_ZP=has_zp,
-        ZP_BIAS=zp_bias,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K,
+        **launch_kwargs,
     )
     return c
 
