@@ -40,12 +40,13 @@
 namespace vllm {
 namespace gptq_rdna3 {
 
-#define BLOCK_KN_SIZE 128
-// 128 threads per block (4 waves on RDNA3 wave32, 2 waves on wave64 / NVIDIA).
-// Each thread is responsible for 4 consecutive N columns, so a block covers
-// THREADS_X*4 = 512 N columns — matches BLOCK_KN_SIZE*4 in the grid.x stride.
-// Using 32 threads here would silently skip 3/4 of every block's N range.
-#define THREADS_X 128
+// BLOCK_KN_SIZE = 256 (was 128 in exllama). Each block now covers 256 K
+// elements and THREADS_X*4 = 1024 N columns. For Qwen-class K=4096 this
+// halves gridDim.z (32 → 16) and therefore halves the atomic count per
+// output position vs the exllama default. THREADS_X=256 = 8 waves on RDNA3
+// wave32; with ~32 wave slots per CU we still fit 4 blocks per CU at peak.
+#define BLOCK_KN_SIZE 256
+#define THREADS_X 256
 
 // ---------------------------------------------------------------------------
 // Per-dtype helpers. We avoid heavy template metaprogramming and just provide
@@ -233,6 +234,12 @@ __global__ void gemm_q4_kernel_rdna3(const T* __restrict__ a,
   // of {1,2,4,8,16,32,64,128,...}). For group_size in {16, 8, 4, ...} the
   // inner loop would cross a group boundary between j-iterations; we require
   // group_size >= 32 here, mirroring exllama's assumption.
+  //
+  // Software pipelining: we issue all 4 vectorized weight loads up front
+  // before any dequant/FMA depends on them. This gives the AMDGPU backend
+  // freedom to schedule the global_loads early and overlap their latency
+  // with dequant + v_pk_fma_f16 of earlier iterations. Cost: 4×int4 = 16
+  // VGPRs in flight per thread, plenty of headroom on RDNA3.
   int k = offset_k;
   while (k < end_k) {
     if (k == nextgroup) {
@@ -241,25 +248,29 @@ __global__ void gemm_q4_kernel_rdna3(const T* __restrict__ a,
       refresh_group(group);
     }
 
+    // Prefetch all four j-iterations' weight words. The compiler emits 4
+    // global_load_b128 instructions back-to-back; the dependent dequant +
+    // FMA work below hides their latency.
+    int4 b_w[4];
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
-      // One vectorized 16-byte load: 4 packed weight words for our 4 columns.
-      const int4* b_ptr4 = (const int4*)b_ptr;
-      int4 load_int4 = *b_ptr4;
+      b_w[j] = *(const int4*)(b_ptr + j * size_n);
+    }
+    b_ptr += 4 * size_n;
 
-      // Per-j K offset within the LDS-resident A tile. j=0 covers K[k..k+7],
-      // j=1 covers K[k+8..k+15], etc. The outer `k` advances by 32 (= 4*8).
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
       const int a_off = (k - offset_k) + 8 * j;
 
       if constexpr (std::is_same<T, half>::value) {
         half2 dq[4][4];
-        dequant_4bit_8_fp16((uint32_t)load_int4.x, dq[0], z1z16_h[0],
+        dequant_4bit_8_fp16((uint32_t)b_w[j].x, dq[0], z1z16_h[0],
                             y1y16_h[0]);
-        dequant_4bit_8_fp16((uint32_t)load_int4.y, dq[1], z1z16_h[1],
+        dequant_4bit_8_fp16((uint32_t)b_w[j].y, dq[1], z1z16_h[1],
                             y1y16_h[1]);
-        dequant_4bit_8_fp16((uint32_t)load_int4.z, dq[2], z1z16_h[2],
+        dequant_4bit_8_fp16((uint32_t)b_w[j].z, dq[2], z1z16_h[2],
                             y1y16_h[2]);
-        dequant_4bit_8_fp16((uint32_t)load_int4.w, dq[3], z1z16_h[3],
+        dequant_4bit_8_fp16((uint32_t)b_w[j].w, dq[3], z1z16_h[3],
                             y1y16_h[3]);
 
 #pragma unroll
@@ -273,10 +284,10 @@ __global__ void gemm_q4_kernel_rdna3(const T* __restrict__ a,
         }
       } else {
         bf162_t dq[4][4];
-        dequant_4bit_8_bf16((uint32_t)load_int4.x, dq[0], z_b[0], y_b[0]);
-        dequant_4bit_8_bf16((uint32_t)load_int4.y, dq[1], z_b[1], y_b[1]);
-        dequant_4bit_8_bf16((uint32_t)load_int4.z, dq[2], z_b[2], y_b[2]);
-        dequant_4bit_8_bf16((uint32_t)load_int4.w, dq[3], z_b[3], y_b[3]);
+        dequant_4bit_8_bf16((uint32_t)b_w[j].x, dq[0], z_b[0], y_b[0]);
+        dequant_4bit_8_bf16((uint32_t)b_w[j].y, dq[1], z_b[1], y_b[1]);
+        dequant_4bit_8_bf16((uint32_t)b_w[j].z, dq[2], z_b[2], y_b[2]);
+        dequant_4bit_8_bf16((uint32_t)b_w[j].w, dq[3], z_b[3], y_b[3]);
 
 #pragma unroll
         for (int m = 0; m < M_COUNT; ++m) {
@@ -288,8 +299,6 @@ __global__ void gemm_q4_kernel_rdna3(const T* __restrict__ a,
           block_c[m][3] += dot22_8_f(dq[3], a_ptr);
         }
       }
-
-      b_ptr += size_n;
     }
     k += 32;  // 4 weight words * 8 nibbles = 32 K elements
   }
