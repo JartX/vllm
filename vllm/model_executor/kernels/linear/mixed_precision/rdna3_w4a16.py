@@ -3,16 +3,16 @@
 """W4A16 GPTQ kernel for AMD RDNA3 (gfx1100) — fp16 + bf16.
 
 Drop-in replacement for ExllamaLinearKernel on RDNA3 that adds native bf16
-support. The HIP kernels live in ``csrc/quantization/gptq/q_gemm_rdna3.cu``
-(scalar dot-product, decode + small-batch path) and
-``csrc/quantization/gptq/q_gemm_rdna3_wmma.cu`` (matrix-instruction path
-for prefill / M >= 16). They are exposed as separate torch ops:
-``gptq_gemm_rdna3`` and ``gptq_gemm_rdna3_wmma``. Keeping them in separate
-TUs is intentional — an earlier monolithic version where both kernels
-shared a TU caused hipcc to miscompile the M=1 scalar path even when the
-WMMA template was never instantiated for that case.
+support. Two HIP kernels:
 
-This wrapper picks the right op at forward time based on M.
+  * ``csrc/quantization/gptq/q_gemm_rdna3.cu`` — scalar dot-product, used
+    for decode (M=1) and small batches. Exposed as
+    ``torch.ops._C.gptq_gemm_rdna3``.
+  * ``csrc/quantization/gptq/q_gemm_rdna3_wmma.cu`` — matrix-instruction
+    path (v_wmma_f32_16x16x16_*_w32) used for prefill (M >= 16). Exposed
+    as ``torch.ops._C.gptq_gemm_rdna3_wmma``. Optional: if the C++
+    extension wasn't built with this op, we silently keep using the
+    scalar path for all M.
 
 Registered ahead of TritonW4A16LinearKernel for the ROCm-RDNA3 path; falls
 through to the Triton kernel on non-RDNA3 ROCm devices (e.g. CDNA/MI300).
@@ -31,16 +31,6 @@ from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
 
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
-
-# Cache dispatch decisions at import time. Querying os.environ and
-# hasattr(torch.ops._C, ...) on every forward adds ~100 µs each — over a
-# 30-token response with 32 layers × ~4 linears, that's ~400 ms of pure
-# Python overhead. The env var is read once; if you need to toggle it,
-# restart the worker. The hasattr check is also evaluated once because the
-# extension is loaded at import and won't change at runtime.
-_WMMA_DISABLED = os.environ.get("VLLM_RDNA3_DISABLE_WMMA", "") == "1"
-_WMMA_OP = getattr(torch.ops._C, "gptq_gemm_rdna3_wmma", None) if not _WMMA_DISABLED else None
-_SCALAR_OP = torch.ops._C.gptq_gemm_rdna3
 
 
 class RDNA3W4A16LinearKernel(MPLinearKernel):
@@ -195,6 +185,22 @@ class RDNA3W4A16LinearKernel(MPLinearKernel):
 
     # ----- Forward --------------------------------------------------------
 
+    # Sentinel: dispatch cache hasn't been populated yet on this instance.
+    # We resolve torch.ops._C.gptq_gemm_rdna3_wmma lazily on the FIRST
+    # apply_weights call (rather than at module import) because vLLM's
+    # kernel registry imports this module before the C++ extension is
+    # guaranteed to be fully attribute-registered. Touching torch.ops._C
+    # at import time can fail and silently cause vLLM to drop this kernel
+    # from the registry, falling back to TritonW4A16LinearKernel — which
+    # is dramatically slower on RDNA3 (was the cause of an earlier 55→8
+    # tk/s decode regression).
+    _wmma_op = "_uninitialized"
+
+    def _resolve_wmma_op(self):
+        if os.environ.get("VLLM_RDNA3_DISABLE_WMMA", "") == "1":
+            return None
+        return getattr(torch.ops._C, "gptq_gemm_rdna3_wmma", None)
+
     def apply_weights(
         self,
         layer: torch.nn.Module,
@@ -216,16 +222,25 @@ class RDNA3W4A16LinearKernel(MPLinearKernel):
         assert w_zp is not None, "Zero points are required by RDNA3 W4A16"
         assert w_g_idx is not None, "g_idx tensor (possibly empty) required"
 
-        # Dispatch: WMMA for M >= 16 (prefill / batched), scalar otherwise
-        # (decode). N, K are guaranteed multiples of 16 in any modern GPTQ
-        # checkpoint, so we don't re-check them per call. The cached
-        # _WMMA_OP is None when the env disables WMMA or the C++ ext lacks
-        # the op, falling through to scalar.
-        m = x_2d.size(0)
-        if _WMMA_OP is not None and m >= 16:
-            output = _WMMA_OP(x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format)
+        # Dispatch:
+        #   * M >= 16 → WMMA matrix-instruction path (prefill / batched).
+        #   * Else   → scalar dot-product (decode + small batch).
+        # WMMA op is resolved once per instance (lazy) and cached. The
+        # `m >= 16` check is the only per-call cost beyond the original
+        # decode path.
+        wmma_op = self._wmma_op
+        if wmma_op == "_uninitialized":
+            wmma_op = self._resolve_wmma_op()
+            type(self)._wmma_op = wmma_op  # cache on the class — shared
+
+        if wmma_op is not None and x_2d.size(0) >= 16:
+            output = wmma_op(
+                x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format
+            )
         else:
-            output = _SCALAR_OP(x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format)
+            output = ops.gptq_gemm_rdna3(
+                x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format
+            )
 
         if bias is not None:
             output.add_(bias)
