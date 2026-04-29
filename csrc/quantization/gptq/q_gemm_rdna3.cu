@@ -53,6 +53,22 @@ namespace gptq_rdna3 {
 // overloaded inline functions; the kernel below selects via `if constexpr`.
 // ---------------------------------------------------------------------------
 
+// Type-generic zero — both half and bf16_t in HIP/ROCm have a converting
+// constructor from float, but going through __float2half_rn / __float2bfloat16
+// is the unambiguously correct path on every ROCm version.
+template <typename T>
+__forceinline__ __device__ T tzero();
+
+template <>
+__forceinline__ __device__ half tzero<half>() {
+  return __float2half_rn(0.0f);
+}
+
+template <>
+__forceinline__ __device__ bf16_t tzero<bf16_t>() {
+  return __float2bfloat16(0.0f);
+}
+
 __forceinline__ __device__ float dot22_8_f(half2 (&dq)[4], const half* a_ptr) {
   half2 result = {};
   const half2* a2_ptr = (const half2*)a_ptr;
@@ -155,21 +171,35 @@ __global__ void gemm_q4_kernel_rdna3(const T* __restrict__ a,
   const int end_k = min(offset_k + BLOCK_KN_SIZE, size_k);
   const int n = offset_n + t * 4;
 
-  __shared__ T block_a[M_COUNT][BLOCK_KN_SIZE];
+  // LDS layout: [M_COUNT][BLOCK_KN_SIZE + LDS_PAD]. The PAD=8 elements per M
+  // row break the natural 256-element/512-byte alignment that would otherwise
+  // collide on the same LDS bank when a thread reads block_a[0..M_COUNT-1][k]
+  // (same k, different m). Row stride becomes 264 elements * 2B = 528B = 132
+  // 4-byte banks, so m-stride hits banks (m*132)%32 = (m*4)%32 — distinct for
+  // all M_COUNT ≤ 8. Cost: 16B LDS per block, irrelevant.
+  constexpr int LDS_PAD = 8;
+  __shared__ T block_a[M_COUNT][BLOCK_KN_SIZE + LDS_PAD];
 
-  // Stage A: each thread loads 1 K element per row into LDS (with optional
+  // Stage A: each thread loads 1 K element per M row into LDS (with optional
   // act-order permutation). THREADS_X == BLOCK_KN_SIZE so this is a 1:1 map.
+  // For M_COUNT > 1 with size_m not a multiple of M_COUNT, slots past size_m
+  // are zero-padded so the dot product contribution is 0 (we then skip the
+  // atomic write for those rows below).
   static_assert(BLOCK_KN_SIZE == THREADS_X,
                 "BLOCK_KN_SIZE must equal THREADS_X (1 K element per thread)");
   if (offset_k + t < end_k) {
 #pragma unroll
     for (int m = 0; m < M_COUNT; ++m) {
-      const T* a_row = a + (offset_m + m) * size_k;
       T av;
-      if (b_q_perm)
-        av = a_row[b_q_perm[offset_k + t]];
-      else
-        av = a_row[offset_k + t];
+      if (offset_m + m < size_m) {
+        const T* a_row = a + (offset_m + m) * size_k;
+        if (b_q_perm)
+          av = a_row[b_q_perm[offset_k + t]];
+        else
+          av = a_row[offset_k + t];
+      } else {
+        av = tzero<T>();  // zero-pad invalid M rows
+      }
       block_a[m][t] = av;
     }
   }
@@ -309,6 +339,7 @@ __global__ void gemm_q4_kernel_rdna3(const T* __restrict__ a,
   // memset + cast pass that we'd otherwise need.
 #pragma unroll
   for (int m = 0; m < M_COUNT; ++m) {
+    if (offset_m + m >= size_m) continue;  // skip padding rows past size_m
     T* out = c + (offset_m + m) * size_n + n;
     if constexpr (std::is_same<T, half>::value) {
       half2 r01 = __halves2half2(__float2half_rn(block_c[m][0]),
@@ -334,22 +365,12 @@ __global__ void gemm_q4_kernel_rdna3(const T* __restrict__ a,
 // Launcher.
 // ---------------------------------------------------------------------------
 
-template <typename T>
-void launch_gemm_q4(const T* a, const uint32_t* b_q_weight,
-                    const uint32_t* b_qzeros, const T* b_scales,
-                    const int* b_q_perm, T* c, int size_m, int size_n,
-                    int size_k, int groups, bool use_v2_format,
-                    cudaStream_t stream) {
-  const int zero_offset = use_v2_format ? 0 : 1;
-
-  // Caller is responsible for zero-initializing c (we ask for torch::zeros
-  // at the entry point so PyTorch handles the memset on the same stream).
-
-  // For decode (M small) we use M_COUNT=1; we could template on larger
-  // M_COUNTs later for prefill, but the Triton path can keep handling those
-  // until we have a measurable win.
-  constexpr int M_COUNT = 1;
-
+template <typename T, int M_COUNT>
+void launch_gemm_q4_for_mcount(const T* a, const uint32_t* b_q_weight,
+                               const uint32_t* b_qzeros, const T* b_scales,
+                               const int* b_q_perm, T* c, int size_m,
+                               int size_n, int size_k, int groups,
+                               int zero_offset, cudaStream_t stream) {
   dim3 block(THREADS_X);
   dim3 grid((size_n + BLOCK_KN_SIZE * 4 - 1) / (BLOCK_KN_SIZE * 4),
             (size_m + M_COUNT - 1) / M_COUNT,
@@ -358,6 +379,47 @@ void launch_gemm_q4(const T* a, const uint32_t* b_q_weight,
   gemm_q4_kernel_rdna3<T, M_COUNT><<<grid, block, 0, stream>>>(
       a, b_q_weight, b_qzeros, b_scales, c, size_m, size_n, size_k, groups,
       zero_offset, b_q_perm);
+}
+
+// Dispatch to the largest M_COUNT template that doesn't waste more than
+// half a tile. Caps at 8: above that, the WMMA-prefill kernel (M >= 16) is
+// the right tool, not bigger M_COUNT in the scalar dot-product path.
+//
+// Tile-waste table:
+//   M=1   -> M_COUNT=1   (no waste)
+//   M=2,3 -> M_COUNT=2   (M=3 wastes 1/2 of last tile)
+//   M=4-7 -> M_COUNT=4   (worst case M=5: wastes 3/4 of last tile)
+//   M=8-15-> M_COUNT=8   (worst case M=9: wastes 7/8 of last tile)
+// "Wasted" rows are zero-padded in LDS and skip the atomic write, so they
+// only burn instructions on the last block, never affect correctness.
+template <typename T>
+void launch_gemm_q4(const T* a, const uint32_t* b_q_weight,
+                    const uint32_t* b_qzeros, const T* b_scales,
+                    const int* b_q_perm, T* c, int size_m, int size_n,
+                    int size_k, int groups, bool use_v2_format,
+                    cudaStream_t stream) {
+  const int zero_offset = use_v2_format ? 0 : 1;
+
+  if (size_m == 1) {
+    launch_gemm_q4_for_mcount<T, 1>(a, b_q_weight, b_qzeros, b_scales,
+                                    b_q_perm, c, size_m, size_n, size_k,
+                                    groups, zero_offset, stream);
+  } else if (size_m <= 3) {
+    launch_gemm_q4_for_mcount<T, 2>(a, b_q_weight, b_qzeros, b_scales,
+                                    b_q_perm, c, size_m, size_n, size_k,
+                                    groups, zero_offset, stream);
+  } else if (size_m <= 7) {
+    launch_gemm_q4_for_mcount<T, 4>(a, b_q_weight, b_qzeros, b_scales,
+                                    b_q_perm, c, size_m, size_n, size_k,
+                                    groups, zero_offset, stream);
+  } else {
+    // M_COUNT=8 covers M up to 15 here; M >= 16 should ideally take the
+    // WMMA path, but if it falls through we still produce correct output —
+    // just leaving 3-5× of throughput on the table for prefill workloads.
+    launch_gemm_q4_for_mcount<T, 8>(a, b_q_weight, b_qzeros, b_scales,
+                                    b_q_perm, c, size_m, size_n, size_k,
+                                    groups, zero_offset, stream);
+  }
 }
 
 }  // namespace gptq_rdna3
