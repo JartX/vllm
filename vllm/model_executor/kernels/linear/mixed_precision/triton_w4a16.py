@@ -410,14 +410,11 @@ def triton_w4a16_gemv_kn_kernel(
         partial_g = tl.sum(prod, axis=0) * scales  # [BLOCK_N] fp16
         accumulator += partial_g.to(tl.float32)
 
-    # Plain store to a unique slice [pid_k, m, n_tile] — no atomic
-    c_ptrs = (
-        c_ptr
-        + pid_k * stride_csplit
-        + pid_m * stride_cm
-        + offs_n * stride_cn
-    )
-    tl.store(c_ptrs, accumulator, mask=offs_n < N)
+    # Atomic add this K-split's contribution to the fp32 output.
+    # fp32 atomic_add is hardware-supported on RDNA3 (v_global_atomic_add_f32),
+    # so contention is sub-cycle per cell and we save the torch.sum kernel.
+    c_ptrs = c_ptr + pid_m * stride_cm + offs_n * stride_cn
+    tl.atomic_add(c_ptrs, accumulator, mask=offs_n < N)
 
 
 @triton.jit
@@ -558,25 +555,26 @@ def triton_w4a16_gemm_kn(
 
     # ---- Decode path: split-K multi-group GEMV ----
     if M <= 16:
-        # BLOCK_K spans multiple groups for amortization. For G=32 and
-        # BLOCK_K=128 each program does 4 inner-group iterations, lifting
-        # per-program FMAs from ~1k to ~8k — closer to exllama's 16k tile.
-        BLOCK_N = 64
+        # Match exllama's per-program work density:
+        #   exllama: 256 programs × 128 threads × 4 N-cols × 128 K = 64k FMAs/prog
+        #   ours:    1024 programs × 128 lanes × 1 N-col × 128 K = 16k FMAs/prog
+        # 4× fewer FMAs/prog than exllama but 4× more programs total — still
+        # better setup-overhead amortization than the prior 64×32 tile (8k
+        # FMAs/prog). Larger tiles risk register spills; this is the sweet
+        # spot for RDNA3 wave32 with 4 warps.
+        BLOCK_N = 128
         BLOCK_K = max(128, group_size)
-        # Round BLOCK_K to a multiple of group_size and clamp to K
-        BLOCK_K = (BLOCK_K // group_size) * group_size
+        BLOCK_K = (BLOCK_K // group_size) * group_size  # multiple of G
         BLOCK_K = min(BLOCK_K, K)
-        # Avoid degenerate single-group tile if K < BLOCK_K
         if BLOCK_K == 0:
             BLOCK_K = group_size
 
         K_SPLITS = triton.cdiv(K, BLOCK_K)
 
-        # Per-K-split partial sums in fp32. Plain stores to unique slots,
-        # no atomics. torch.sum reduces along the K-split dim.
-        c_temp = torch.empty(
-            (K_SPLITS, M, N), dtype=torch.float32, device=a.device
-        )
+        # Use atomic_add directly to fp32 output instead of temp buffer
+        # + torch.sum. fp32 atomic_add is well-supported on RDNA3 and
+        # eliminates one kernel launch per matmul (~5-10 µs saved).
+        c_fp32 = torch.zeros((M, N), dtype=torch.float32, device=a.device)
 
         grid = (M, triton.cdiv(N, BLOCK_N), K_SPLITS)
         triton_w4a16_gemv_kn_kernel[grid](
@@ -584,7 +582,7 @@ def triton_w4a16_gemm_kn(
             b_q,
             scales,
             zeros_ptr,
-            c_temp,
+            c_fp32,
             M,
             N,
             K,
@@ -592,19 +590,18 @@ def triton_w4a16_gemm_kn(
             a.stride(1),
             b_q.stride(0),
             b_q.stride(1),
-            c_temp.stride(0),
-            c_temp.stride(1),
-            c_temp.stride(2),
+            0,  # stride_csplit unused (we atomic_add to single output plane)
+            c_fp32.stride(0),
+            c_fp32.stride(1),
             GROUP_SIZE=group_size,
             HAS_ZP=has_zp,
             ZP_BIAS=zp_bias,
             BLOCK_N=BLOCK_N,
             BLOCK_K=BLOCK_K,
-            num_warps=2,
+            num_warps=4,
             num_stages=2,
         )
-        # Sum across K-splits → [M, N] fp32 → cast to activation dtype
-        return c_temp.sum(dim=0).to(a.dtype)
+        return c_fp32.to(a.dtype)
 
     # ---- Prefill path: regular GEMM, no split-K ----
     c = torch.empty((M, N), dtype=a.dtype, device=a.device)
