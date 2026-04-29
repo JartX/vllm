@@ -248,36 +248,6 @@ torch::Tensor gptq_gemm_rdna3(torch::Tensor a, torch::Tensor b_q_weight,
                               torch::Tensor b_qzeros, torch::Tensor b_scales,
                               torch::Tensor b_g_idx, bool use_v2_format);
 
-// W4A16 GPTQ WMMA prefill kernel for RDNA3 (gfx1100). Uses
-// v_wmma_f32_16x16x16_{f16,bf16} matrix instructions. Requires M >= 16,
-// N % 16 == 0, K % 16 == 0. Lives in its own translation unit to keep the
-// scalar dot-product kernel above unaffected by hipcc TU-level interactions.
-torch::Tensor gptq_gemm_rdna3_wmma(torch::Tensor a, torch::Tensor b_q_weight,
-                                   torch::Tensor b_qzeros,
-                                   torch::Tensor b_scales,
-                                   torch::Tensor b_g_idx,
-                                   bool use_v2_format);
-
-// Diagnostic-only WMMA fragment-layout probe (RDNA3). Takes raw fp16 A[16,16]
-// and B[16,16], runs one WMMA under hypothesis `mode`, returns fp32 [32,8]
-// dump of c_acc[lane][i].
-torch::Tensor gptq_gemm_rdna3_wmma_probe(torch::Tensor a, torch::Tensor b,
-                                         int64_t mode);
-
-// Diagnostic-only: runs the full gemm_q4_wmma path (dequant + LDS + WMMA)
-// for a single 16x16 output tile, dumps c_acc per lane to fp32 [32,8].
-torch::Tensor gptq_gemm_rdna3_wmma_dump(torch::Tensor a,
-                                        torch::Tensor b_q_weight,
-                                        torch::Tensor b_qzeros,
-                                        torch::Tensor b_scales,
-                                        bool use_v2_format);
-
-// Diagnostic-only: runs dequant + LDS-write only, dumps b_lds [16,16] fp16.
-torch::Tensor gptq_gemm_rdna3_wmma_lds_check(torch::Tensor b_q_weight,
-                                             torch::Tensor b_qzeros,
-                                             torch::Tensor b_scales,
-                                             bool use_v2_format);
-
 void static_scaled_fp8_quant(
     torch::Tensor& out, torch::Tensor const& input, torch::Tensor const& scale,
     std::optional<std::tuple<int64_t, int64_t>> group_shape = std::nullopt);

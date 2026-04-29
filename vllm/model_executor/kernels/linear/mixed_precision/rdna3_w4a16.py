@@ -3,22 +3,12 @@
 """W4A16 GPTQ kernel for AMD RDNA3 (gfx1100) — fp16 + bf16.
 
 Drop-in replacement for ExllamaLinearKernel on RDNA3 that adds native bf16
-support. Two HIP kernels:
-
-  * ``csrc/quantization/gptq/q_gemm_rdna3.cu`` — scalar dot-product, used
-    for decode (M=1) and small batches. Exposed as
-    ``torch.ops._C.gptq_gemm_rdna3``.
-  * ``csrc/quantization/gptq/q_gemm_rdna3_wmma.cu`` — matrix-instruction
-    path (v_wmma_f32_16x16x16_*_w32) used for prefill (M >= 16). Exposed
-    as ``torch.ops._C.gptq_gemm_rdna3_wmma``. Optional: if the C++
-    extension wasn't built with this op, we silently keep using the
-    scalar path for all M.
+support. The HIP kernel lives in ``csrc/quantization/gptq/q_gemm_rdna3.cu``
+and is exposed via ``torch.ops._C.gptq_gemm_rdna3``.
 
 Registered ahead of TritonW4A16LinearKernel for the ROCm-RDNA3 path; falls
 through to the Triton kernel on non-RDNA3 ROCm devices (e.g. CDNA/MI300).
 """
-
-import os
 
 import torch
 
@@ -31,23 +21,6 @@ from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
 
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
-
-
-def _resolve_wmma_op():
-    """Resolve the WMMA op once. Called from process_weights_after_loading,
-    BEFORE vLLM/Dynamo traces the forward pass (so the result is captured
-    as a constant during torch.compile rather than triggering an untrace
-    able setattr inside apply_weights)."""
-    if os.environ.get("VLLM_RDNA3_DISABLE_WMMA", "") == "1":
-        return None
-    return getattr(torch.ops._C, "gptq_gemm_rdna3_wmma", None)
-
-
-# Module-level cache: shared across all instances. Populated on first
-# process_weights_after_loading call. Sentinel "_uninitialized" → not yet
-# resolved. None → resolved and either env-disabled or the op doesn't
-# exist (use scalar). Op → use WMMA for M >= 16.
-_WMMA_OP_CACHE: object = "_uninitialized"
 
 
 class RDNA3W4A16LinearKernel(MPLinearKernel):
@@ -128,17 +101,6 @@ class RDNA3W4A16LinearKernel(MPLinearKernel):
     # ----- Weight prep (identical layout/shuffle as ExllamaLinearKernel) -----
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
-        # Resolve and cache the WMMA op exactly once across the process.
-        # This runs at model load time, BEFORE torch.compile / Dynamo
-        # touches apply_weights. We deliberately use a module-level cache
-        # (not setattr on self or the class) so that apply_weights only
-        # READS a captured Python local — Dynamo handles that fine, but
-        # any setattr on the class inside the traced fwd path makes it
-        # unsupported and crashes the worker.
-        global _WMMA_OP_CACHE
-        if _WMMA_OP_CACHE == "_uninitialized":
-            _WMMA_OP_CACHE = _resolve_wmma_op()
-
         c = self.config
         device = getattr(layer, self.w_q_name).device
 
@@ -234,21 +196,9 @@ class RDNA3W4A16LinearKernel(MPLinearKernel):
         assert w_zp is not None, "Zero points are required by RDNA3 W4A16"
         assert w_g_idx is not None, "g_idx tensor (possibly empty) required"
 
-        # Dispatch:
-        #   * M >= 16 with WMMA op available → WMMA matrix-instruction
-        #     path (prefill / batched).
-        #   * Else → scalar dot-product (decode + small batch).
-        # _WMMA_OP_CACHE is populated in process_weights_after_loading
-        # so this is a constant by the time torch.compile traces fwd.
-        wmma_op = _WMMA_OP_CACHE
-        if wmma_op is not None and x_2d.size(0) >= 16:
-            output = wmma_op(
-                x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format
-            )
-        else:
-            output = ops.gptq_gemm_rdna3(
-                x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format
-            )
+        output = ops.gptq_gemm_rdna3(
+            x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format
+        )
 
         if bias is not None:
             output.add_(bias)

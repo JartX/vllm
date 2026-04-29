@@ -778,27 +778,6 @@ if hasattr(torch.ops._C, "gptq_gemm_rdna3"):
         )
 
 
-# WMMA prefill op (M >= 16 path on RDNA3). Same signature as the scalar op.
-# We only register the fake (no Python wrapper function) because the kernel
-# is invoked directly via torch.ops._C.gptq_gemm_rdna3_wmma in
-# RDNA3W4A16LinearKernel.apply_weights — a wrapper would just add Python
-# overhead per dispatch.
-if hasattr(torch.ops._C, "gptq_gemm_rdna3_wmma"):
-
-    @register_fake("_C::gptq_gemm_rdna3_wmma")
-    def _gptq_gemm_rdna3_wmma_fake(
-        a: torch.Tensor,
-        b_q_weight: torch.Tensor,
-        b_qzeros: torch.Tensor,
-        b_scales: torch.Tensor,
-        b_g_idx: torch.Tensor,
-        use_v2_format: bool,
-    ) -> torch.Tensor:
-        return torch.empty(
-            (a.size(0), b_q_weight.size(1)), dtype=a.dtype, device=a.device
-        )
-
-
 if hasattr(torch.ops._C, "allspark_w8a16_gemm"):
 
     @register_fake("_C::allspark_w8a16_gemm")

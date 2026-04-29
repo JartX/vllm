@@ -162,13 +162,6 @@ __forceinline__ __device__ void dequant_4bit_8_bf16(uint32_t qa,
   dq[3] = __hfma2(q3.b2, y_prep, z_prep);
 }
 
-// NOTE: the *_precise dequant variants (subtract-first, used by the WMMA
-// kernel for numerical accuracy with non-power-of-2 scales) live in
-// q_gemm_rdna3_wmma.cu's anonymous namespace, NOT here. They are kept out
-// of this shared header because hipcc's TU-level optimizer makes different
-// register/scheduling decisions when this header grows, which previously
-// caused a measurable scalar-kernel decode regression.
-
 }  // namespace gptq_rdna3
 }  // namespace vllm
 

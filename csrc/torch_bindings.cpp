@@ -429,33 +429,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor b_scales, Tensor b_g_idx, bool use_v2_format) -> Tensor");
   ops.impl("gptq_gemm_rdna3", torch::kCUDA, &gptq_gemm_rdna3);
 
-  // RDNA3 WMMA prefill kernel (M >= 16). Same weight format as
-  // gptq_gemm_rdna3 (gptq_shuffle layout). Lives in its own TU.
-  ops.def(
-      "gptq_gemm_rdna3_wmma(Tensor a, Tensor b_q_weight, Tensor b_qzeros, "
-      "Tensor b_scales, Tensor b_g_idx, bool use_v2_format) -> Tensor");
-  ops.impl("gptq_gemm_rdna3_wmma", torch::kCUDA, &gptq_gemm_rdna3_wmma);
-
-  // Diagnostic-only fragment-layout probe for the WMMA kernel.
-  ops.def(
-      "gptq_gemm_rdna3_wmma_probe(Tensor a, Tensor b, int mode) -> Tensor");
-  ops.impl("gptq_gemm_rdna3_wmma_probe", torch::kCUDA,
-           &gptq_gemm_rdna3_wmma_probe);
-
-  // Diagnostic-only c_acc dump from the full gemm_q4_wmma path.
-  ops.def(
-      "gptq_gemm_rdna3_wmma_dump(Tensor a, Tensor b_q_weight, Tensor b_qzeros, "
-      "Tensor b_scales, bool use_v2_format) -> Tensor");
-  ops.impl("gptq_gemm_rdna3_wmma_dump", torch::kCUDA,
-           &gptq_gemm_rdna3_wmma_dump);
-
-  // Diagnostic-only LDS-content dump (dequant + LDS-write only).
-  ops.def(
-      "gptq_gemm_rdna3_wmma_lds_check(Tensor b_q_weight, Tensor b_qzeros, "
-      "Tensor b_scales, bool use_v2_format) -> Tensor");
-  ops.impl("gptq_gemm_rdna3_wmma_lds_check", torch::kCUDA,
-           &gptq_gemm_rdna3_wmma_lds_check);
-
   // Compute FP8 quantized tensor for given scaling factor.
   // Supports per-tensor, per-channel, per-token, and arbitrary 2D group
   // scaling. Optional group_m/group_n specify the group shape explicitly;
