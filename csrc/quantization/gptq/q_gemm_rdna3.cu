@@ -20,6 +20,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 
 #include <torch/all.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -440,9 +441,38 @@ void launch_gemm_q4(const T* a, const uint32_t* b_q_weight,
 // Output:
 //   c         [M, N]            same dtype as a
 
+#if defined(USE_ROCM)
+// Forward declaration of the WMMA prefill entry. Defined in
+// q_gemm_rdna3_wmma.cu (separate TU so the WMMA builtins are kept localised;
+// cross-TU call resolved at link time, no codegen interaction).
+torch::Tensor gptq_gemm_rdna3_wmma(torch::Tensor a, torch::Tensor b_q_weight,
+                                   torch::Tensor b_qzeros,
+                                   torch::Tensor b_scales,
+                                   torch::Tensor b_g_idx,
+                                   bool use_v2_format);
+#endif
+
 torch::Tensor gptq_gemm_rdna3(torch::Tensor a, torch::Tensor b_q_weight,
                               torch::Tensor b_qzeros, torch::Tensor b_scales,
                               torch::Tensor b_g_idx, bool use_v2_format) {
+#if defined(USE_ROCM)
+  // Dispatch to the WMMA kernel for prefill / batched (M >= 16). The scalar
+  // path below has lower latency at M=1 (decode) but is throughput-bound for
+  // larger M; v_wmma_f32_16x16x16 wins decisively beyond the 16-row tile.
+  // The branch lives in C++ rather than in Python apply_weights to keep the
+  // torch.compile'd graph branch-free (an `if x.size(0) >= 16` inside the
+  // traced fwd previously caused a 7x decode regression — see git log).
+  static const bool kWmmaDisabled = []() {
+    const char* env = std::getenv("VLLM_RDNA3_DISABLE_WMMA");
+    return env != nullptr && env[0] == '1' && env[1] == '\0';
+  }();
+  if (!kWmmaDisabled && a.dim() == 2 && b_q_weight.dim() == 2 &&
+      a.size(0) >= 16 && a.size(1) % 16 == 0 &&
+      b_q_weight.size(1) % 16 == 0) {
+    return gptq_gemm_rdna3_wmma(a, b_q_weight, b_qzeros, b_scales, b_g_idx,
+                                use_v2_format);
+  }
+#endif
   TORCH_CHECK(a.is_cuda(), "a must be a CUDA/HIP tensor");
   TORCH_CHECK(b_q_weight.is_cuda(), "b_q_weight must be a CUDA/HIP tensor");
   TORCH_CHECK(b_qzeros.is_cuda(), "b_qzeros must be a CUDA/HIP tensor");
