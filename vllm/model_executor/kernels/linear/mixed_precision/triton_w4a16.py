@@ -346,7 +346,21 @@ def triton_w4a16_gemv_kn_kernel(
 
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_zn = pid_n * (BLOCK_N // 8) + tl.arange(0, BLOCK_N // 8)
-    shifts = tl.arange(0, 8) * 4  # [8]
+
+    # Shifts for unpacking weights — half2-shuffled layout. After
+    # process_weights' bit shuffle, K positions alternate even/odd
+    # between lower and upper halves of the int32:
+    #   K=0 @ bit 0,   K=1 @ bit 16
+    #   K=2 @ bit 4,   K=3 @ bit 20
+    #   K=4 @ bit 8,   K=5 @ bit 24
+    #   K=6 @ bit 12,  K=7 @ bit 28
+    # Formula: shift[k] = (k % 2) * 16 + (k // 2) * 4.
+    k8 = tl.arange(0, 8)
+    w_shifts = (k8 % 2) * 16 + (k8 // 2) * 4
+
+    # Shifts for unpacking zeros — standard sequential GPTQ format,
+    # zeros are NOT shuffled (only weights are).
+    z_shifts = k8 * 4
 
     accumulator = tl.zeros((BLOCK_N,), dtype=tl.float32)
 
@@ -377,9 +391,10 @@ def triton_w4a16_gemv_kn_kernel(
         mask_b = (offs_bk[:, None] < K // 8) & (offs_n[None, :] < N)
         b_packed = tl.load(b_ptrs, mask=mask_b, other=0)
 
-        # Unpack to [GROUP_SIZE, BLOCK_N] without permute (8-shift dim
-        # placed BETWEEN k_row and n_col so reshape flattens correctly).
-        b3d = (b_packed[:, None, :] >> shifts[None, :, None]) & 0xF
+        # Unpack to [GROUP_SIZE, BLOCK_N] using the half2-shuffled shifts
+        # (b_packed has bits reordered at load time; w_shifts indexes the
+        # K positions in their post-shuffle locations).
+        b3d = (b_packed[:, None, :] >> w_shifts[None, :, None]) & 0xF
         b = tl.reshape(b3d, (GROUP_SIZE, BLOCK_N))
 
         # Scales/zeros for this group (cast scales to fp16 to match)
@@ -395,7 +410,8 @@ def triton_w4a16_gemv_kn_kernel(
                 mask=offs_zn < N // 8,
                 other=0,
             )
-            z = (z_packed[:, None] >> shifts[None, :]) & 0xF
+            # Zeros are NOT shuffled — use sequential GPTQ shifts
+            z = (z_packed[:, None] >> z_shifts[None, :]) & 0xF
             z = tl.reshape(z, (BLOCK_N,))
         else:
             z = tl.full((BLOCK_N,), ZP_BIAS, dtype=tl.int32)
@@ -457,7 +473,12 @@ def triton_w4a16_gemm_kn_kernel(
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_zn = pid_n * (BLOCK_N // 8) + tl.arange(0, BLOCK_N // 8)
 
-    shifts = tl.arange(0, 8) * 4
+    # Same half2-shuffle convention as the GEMV kernel: weights have
+    # been bit-shuffled at load time to even/odd-interleaved layout.
+    k8 = tl.arange(0, 8)
+    w_shifts = (k8 % 2) * 16 + (k8 // 2) * 4
+    z_shifts = k8 * 4  # zeros are not shuffled
+
     accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
     for k_start in range(0, tl.cdiv(K, BLOCK_K)):
@@ -476,8 +497,8 @@ def triton_w4a16_gemm_kn_kernel(
         mask_b = (offs_bk[:, None] < K // 8) & (offs_n[None, :] < N)
         b_packed = tl.load(b_ptrs, mask=mask_b, other=0)
 
-        # Unpack to [BLOCK_K, BLOCK_N] (K dim contiguous after reshape)
-        b3d = (b_packed[:, None, :] >> shifts[None, :, None]) & 0xF
+        # Unpack to [BLOCK_K, BLOCK_N] using shuffled-layout shifts
+        b3d = (b_packed[:, None, :] >> w_shifts[None, :, None]) & 0xF
         b = tl.reshape(b3d, (BLOCK_K, BLOCK_N))
 
         g_idx = (k_start * BLOCK_K) // group_size
@@ -491,7 +512,7 @@ def triton_w4a16_gemm_kn_kernel(
                 mask=offs_zn < N // 8,
                 other=0,
             )
-            z = (z_packed[:, None] >> shifts[None, :]) & 0xF
+            z = (z_packed[:, None] >> z_shifts[None, :]) & 0xF
             z = tl.reshape(z, (BLOCK_N,))
         else:
             z = tl.full((BLOCK_N,), ZP_BIAS, dtype=tl.int32)
@@ -951,14 +972,45 @@ class TritonW4A16LinearKernel(MPLinearKernel):
             _GFX11_KN_FIRST_CALL_LOGGED["done"] = True
 
         if layout_kn:
-            # ---- gfx11: transpose to [K//8, N] (exllama-style) ----
+            # ---- gfx11: transpose to [K//8, N] + shuffle for half2 ----
             def repack_w_q(x: BasevLLMParameter) -> BasevLLMParameter:
-                # Checkpoint is [N, K//8] with K packed at dim 1.
-                # Transpose to [K//8, N] keeps K packed (now at dim 0)
-                # and puts N as a contiguous row-major dim. No bit-level
-                # repack needed — each int32 still stores 8 K-values.
+                # Step 1: transpose to [K//8, N] (exllama-style)
                 permute_param_layout_(x, input_dim=1, output_dim=0, packed_dim=1)
-                x.data = x.data.t().contiguous()
+                w = x.data.t().contiguous()  # [K//8, N] int32
+
+                # Step 2: bit-shuffle each int32 from sequential GPTQ
+                # packing to even/odd-interleaved layout. After shuffle,
+                # nibbles are at:
+                #   q[0] @ [0:4]    q[1] @ [16:20]
+                #   q[2] @ [4:8]    q[3] @ [20:24]
+                #   q[4] @ [8:12]   q[5] @ [24:28]
+                #   q[6] @ [12:16]  q[7] @ [28:32]
+                # That is exactly the layout that lets the kernel use
+                # `(qa & 0x000F000F) | 0x64006400` to produce a half2 of
+                # (1024+q_even, 1024+q_odd) in a single bit-or — the same
+                # trick exllama's HIP kernel uses for v_pk_fma_f16.
+                # Use signed-int-friendly masks — torch int32 doesn't
+                # accept 0xF0000000 directly (overflows int range).
+                MASK_E2 = 0x00000F00
+                MASK_E4 = 0x000F0000
+                MASK_E6 = 0x0F000000
+                MASK_O1 = 0x000000F0
+                MASK_O3 = 0x0000F000
+                MASK_O5 = 0x00F00000
+                # Top nibble: extract via right-shift then re-place
+                top_nibble = (w >> 28) & 0xF  # q[7]
+
+                e0 = w & 0x0000000F
+                e2 = (w & MASK_E2) >> 4
+                e4 = (w & MASK_E4) >> 8
+                e6 = (w & MASK_E6) >> 12
+                o1 = (w & MASK_O1) << 12
+                o3 = (w & MASK_O3) << 8
+                o5 = (w & MASK_O5) << 4
+                o7 = top_nibble << 28
+
+                w_shuffled = e0 | e2 | e4 | e6 | o1 | o3 | o5 | o7
+                x.data = w_shuffled.contiguous()
                 return x
         else:
             # ---- Other platforms: full repack to [K, N//8] ----
