@@ -248,6 +248,31 @@ torch::Tensor gptq_gemm_rdna3(torch::Tensor a, torch::Tensor b_q_weight,
                               torch::Tensor b_qzeros, torch::Tensor b_scales,
                               torch::Tensor b_g_idx, bool use_v2_format);
 
+// W4A16 GPTQ WMMA prefill kernel for RDNA3 (gfx1100). Uses
+// v_wmma_f32_16x16x16_{f16,bf16} matrix instructions. Lives in its own
+// translation unit. NOTE: currently registered but NOT invoked from Python —
+// kept compiled into _C.so to bisect a decode regression observed when this
+// TU was first integrated.
+torch::Tensor gptq_gemm_rdna3_wmma(torch::Tensor a, torch::Tensor b_q_weight,
+                                   torch::Tensor b_qzeros,
+                                   torch::Tensor b_scales,
+                                   torch::Tensor b_g_idx,
+                                   bool use_v2_format);
+
+torch::Tensor gptq_gemm_rdna3_wmma_probe(torch::Tensor a, torch::Tensor b,
+                                         int64_t mode);
+
+torch::Tensor gptq_gemm_rdna3_wmma_dump(torch::Tensor a,
+                                        torch::Tensor b_q_weight,
+                                        torch::Tensor b_qzeros,
+                                        torch::Tensor b_scales,
+                                        bool use_v2_format);
+
+torch::Tensor gptq_gemm_rdna3_wmma_lds_check(torch::Tensor b_q_weight,
+                                             torch::Tensor b_qzeros,
+                                             torch::Tensor b_scales,
+                                             bool use_v2_format);
+
 void static_scaled_fp8_quant(
     torch::Tensor& out, torch::Tensor const& input, torch::Tensor const& scale,
     std::optional<std::tuple<int64_t, int64_t>> group_shape = std::nullopt);
