@@ -358,11 +358,19 @@ def triton_w4a16_gemv_kn_kernel(
         mask_k = offs_k < K
 
         # A: [GROUP_SIZE]
-        a = tl.load(
+        # Force fp16 internal compute regardless of model dtype. Triton's
+        # AMD backend has much better fp16 codegen than bf16 (more mature
+        # v_pk_fma_f16 / v_pk_mul_f16 lowering). bf16 inputs are downcast
+        # for the duration of the matmul; the fp32 accumulator preserves
+        # accuracy across groups, and the caller casts back to bf16. This
+        # is the same approach that lets exllama (fp16-only) saturate
+        # RDNA3's W4A16 BW.
+        a_raw = tl.load(
             a_ptr + pid_m * stride_am + offs_k * stride_ak,
             mask=mask_k,
             other=0.0,
         )
+        a = a_raw.to(tl.float16)
 
         # B: [GROUP_SIZE//8, BLOCK_N] int32 -- coalesced N-row reads
         b_ptrs = b_ptr + offs_bk[:, None] * stride_bk + offs_n[None, :] * stride_bn
@@ -374,11 +382,12 @@ def triton_w4a16_gemv_kn_kernel(
         b3d = (b_packed[:, None, :] >> shifts[None, :, None]) & 0xF
         b = tl.reshape(b3d, (GROUP_SIZE, BLOCK_N))
 
-        # Scales/zeros for this group
+        # Scales/zeros for this group (cast scales to fp16 to match)
         g_idx = k_g_start // GROUP_SIZE
-        scales = tl.load(
+        scales_raw = tl.load(
             scales_ptr + g_idx * N + offs_n, mask=offs_n < N, other=1.0
         )
+        scales = scales_raw.to(tl.float16)
 
         if HAS_ZP:
             z_packed = tl.load(
@@ -391,21 +400,14 @@ def triton_w4a16_gemv_kn_kernel(
         else:
             z = tl.full((BLOCK_N,), ZP_BIAS, dtype=tl.int32)
 
-        # Bit-trick dequant
-        if a.dtype == tl.float16:
-            b_fp = ((b | 0x6400).to(tl.int16)).to(tl.float16, bitcast=True)
-            z_fp = ((z | 0x6400).to(tl.int16)).to(tl.float16, bitcast=True)
-            b_minus_z = b_fp - z_fp[None, :]
-        elif a.dtype == tl.bfloat16:
-            b_fp = ((b | 0x4300).to(tl.int16)).to(tl.bfloat16, bitcast=True)
-            z_fp = ((z | 0x4300).to(tl.int16)).to(tl.bfloat16, bitcast=True)
-            b_minus_z = b_fp - z_fp[None, :]
-        else:
-            b_minus_z = (b - z[None, :]).to(a.dtype)
+        # Bit-trick dequant — fp16 only (0x6400 = half(1024.0))
+        b_fp = ((b | 0x6400).to(tl.int16)).to(tl.float16, bitcast=True)
+        z_fp = ((z | 0x6400).to(tl.int16)).to(tl.float16, bitcast=True)
+        b_minus_z = b_fp - z_fp[None, :]
 
-        # GEMV reduction within this group
-        prod = a[:, None] * b_minus_z  # [GROUP_SIZE, BLOCK_N]
-        partial_g = tl.sum(prod, axis=0) * scales  # [BLOCK_N]
+        # GEMV reduction within this group, all fp16 → fp32 accumulator
+        prod = a[:, None] * b_minus_z  # [GROUP_SIZE, BLOCK_N] fp16
+        partial_g = tl.sum(prod, axis=0) * scales  # [BLOCK_N] fp16
         accumulator += partial_g.to(tl.float32)
 
     # Plain store to a unique slice [pid_k, m, n_tile] — no atomic
