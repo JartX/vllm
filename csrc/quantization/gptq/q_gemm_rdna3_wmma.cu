@@ -49,18 +49,78 @@ namespace gptq_rdna3_wmma {
 
 #if defined(USE_ROCM)
 
-// Pull dequant primitives from the sibling namespace. We use the *_precise
-// variants because the WMMA kernel can run with very small K (down to 16),
-// so the per-cell rounding error of the fast bit-trick (which amplifies
-// fp16(scale)≠scale by 1024×) does NOT average out — and shows up as visible
-// per-row error in the output. The scalar kernel keeps the fast variants
-// because its K is typically thousands of elements and errors average out.
+// Pull dequant types from the sibling namespace.
 using vllm::gptq_rdna3::bf16_t;
 using vllm::gptq_rdna3::bf162_t;
-using vllm::gptq_rdna3::dequant_4bit_8_bf16_precise;
-using vllm::gptq_rdna3::dequant_4bit_8_fp16_precise;
-using vllm::gptq_rdna3::prep_zero_scale_bf16_precise;
-using vllm::gptq_rdna3::prep_zero_scale_fp16_precise;
+
+// PRECISE dequant variants live HERE, not in the shared qdq_4_rdna3.cuh
+// header. Reason: hipcc takes different register/scheduling decisions when
+// the shared header grows, which caused a measurable decode-tk/s regression
+// in the scalar kernel even when these new functions were never called from
+// it. Keeping them in the WMMA TU only restores scalar's binary identity
+// to its tuned baseline.
+//
+// Numerics: the classic fp16 bit-trick (FMA form: q*scale + (-(1024+zero)*scale))
+// loses up to ~0.025 per cell at scale=0.1 because fp16(scale) ≠ scale and
+// the FMA amplifies that by 1024× without cancelling against the precomputed
+// (1024+zero)*scale (which is rounded to fp16 BEFORE the FMA).
+//
+// Fix: subtract (1024+zero) as an integer FIRST — exact in fp16 because
+// integers in [1024, 2047] are exactly representable — then multiply by
+// scale, incurring at most one half-ULP rounding. Costs one extra
+// instruction per dequant pair (sub+mul vs single FMA), worth it for the
+// WMMA path because K can be small (16) and errors don't average.
+__forceinline__ __device__ void prep_zero_scale_fp16_precise(uint32_t zero,
+                                                             half scale,
+                                                             half2& z_prep,
+                                                             half2& y_prep) {
+  union { uint16_t u; half h; } zu;
+  zu.u = (uint16_t)(0x6400 | zero);
+  z_prep = __half2half2(zu.h);
+  y_prep = __half2half2(scale);
+}
+
+__forceinline__ __device__ void dequant_4bit_8_fp16_precise(uint32_t qa,
+                                                            half2 (&dq)[4],
+                                                            half2 z_prep,
+                                                            half2 y_prep) {
+  const uint32_t c0 = 0x64006400;
+  union { uint32_t u; half2 h2; } q0, q1, q2, q3;
+  q0.u = ((qa >>  0) & 0x000F000F) | c0;
+  q1.u = ((qa >>  4) & 0x000F000F) | c0;
+  q2.u = ((qa >>  8) & 0x000F000F) | c0;
+  q3.u = ((qa >> 12) & 0x000F000F) | c0;
+  dq[0] = __hmul2(__hsub2(q0.h2, z_prep), y_prep);
+  dq[1] = __hmul2(__hsub2(q1.h2, z_prep), y_prep);
+  dq[2] = __hmul2(__hsub2(q2.h2, z_prep), y_prep);
+  dq[3] = __hmul2(__hsub2(q3.h2, z_prep), y_prep);
+}
+
+__forceinline__ __device__ void prep_zero_scale_bf16_precise(uint32_t zero,
+                                                             bf16_t scale,
+                                                             bf162_t& z_prep,
+                                                             bf162_t& y_prep) {
+  union { uint16_t u; bf16_t h; } zu;
+  zu.u = (uint16_t)(0x4300 | zero);
+  z_prep = __bfloat162bfloat162(zu.h);
+  y_prep = __bfloat162bfloat162(scale);
+}
+
+__forceinline__ __device__ void dequant_4bit_8_bf16_precise(uint32_t qa,
+                                                            bf162_t (&dq)[4],
+                                                            bf162_t z_prep,
+                                                            bf162_t y_prep) {
+  const uint32_t c0 = 0x43004300;
+  union { uint32_t u; bf162_t b2; } q0, q1, q2, q3;
+  q0.u = ((qa >>  0) & 0x000F000F) | c0;
+  q1.u = ((qa >>  4) & 0x000F000F) | c0;
+  q2.u = ((qa >>  8) & 0x000F000F) | c0;
+  q3.u = ((qa >> 12) & 0x000F000F) | c0;
+  dq[0] = __hmul2(__hsub2(q0.b2, z_prep), y_prep);
+  dq[1] = __hmul2(__hsub2(q1.b2, z_prep), y_prep);
+  dq[2] = __hmul2(__hsub2(q2.b2, z_prep), y_prep);
+  dq[3] = __hmul2(__hsub2(q3.b2, z_prep), y_prep);
+}
 
 // Native AMDGPU vector types expected by the WMMA built-ins.
 using v16fp16 = _Float16 __attribute__((ext_vector_type(16)));

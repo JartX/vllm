@@ -118,54 +118,6 @@ __forceinline__ __device__ void dequant_4bit_8_fp16(uint32_t qa,
 }
 
 // ---------------------------------------------------------------------------
-// fp16 PRECISE path: subtract-first instead of FMA.
-//
-// The classic bit-trick above (FMA form: q*scale + (-(1024+zero)*scale)) loses
-// up to ~0.025 per cell at scale=0.1 because fp16(scale) ≠ scale and the FMA
-// amplifies that by 1024x without cancelling against the precomputed
-// (1024+zero)*scale (which is rounded to fp16 BEFORE the FMA).
-//
-// The fix: subtract (1024+zero) as an integer first — this is EXACT in fp16
-// because integers in [1024, 2047] are exactly representable — then multiply
-// by scale, incurring at most one half-ULP rounding. This costs an extra
-// instruction per dequant pair (sub+mul vs single FMA), so we keep the fast
-// FMA path above for the scalar dot-product kernel where small per-cell error
-// averages out across thousands of K iterations, and use this precise variant
-// only in the WMMA path where K can be small (16) and errors don't average.
-__forceinline__ __device__ void prep_zero_scale_fp16_precise(uint32_t zero,
-                                                             half scale,
-                                                             half2& z_prep,
-                                                             half2& y_prep) {
-  // z = half(1024 + zero), exact for zero in [0, 15].
-  union {
-    uint16_t u;
-    half h;
-  } zu;
-  zu.u = (uint16_t)(0x6400 | zero);
-  z_prep = __half2half2(zu.h);
-  y_prep = __half2half2(scale);
-}
-
-__forceinline__ __device__ void dequant_4bit_8_fp16_precise(uint32_t qa,
-                                                            half2 (&dq)[4],
-                                                            half2 z_prep,
-                                                            half2 y_prep) {
-  const uint32_t c0 = 0x64006400;
-
-  union { uint32_t u; half2 h2; } q0, q1, q2, q3;
-  q0.u = ((qa >>  0) & 0x000F000F) | c0;
-  q1.u = ((qa >>  4) & 0x000F000F) | c0;
-  q2.u = ((qa >>  8) & 0x000F000F) | c0;
-  q3.u = ((qa >> 12) & 0x000F000F) | c0;
-
-  // (q + 1024) - (1024 + zero) = q - zero, exact. Then * scale (one rounding).
-  dq[0] = __hmul2(__hsub2(q0.h2, z_prep), y_prep);
-  dq[1] = __hmul2(__hsub2(q1.h2, z_prep), y_prep);
-  dq[2] = __hmul2(__hsub2(q2.h2, z_prep), y_prep);
-  dq[3] = __hmul2(__hsub2(q3.h2, z_prep), y_prep);
-}
-
-// ---------------------------------------------------------------------------
 // bf16 path
 // ---------------------------------------------------------------------------
 
@@ -210,41 +162,12 @@ __forceinline__ __device__ void dequant_4bit_8_bf16(uint32_t qa,
   dq[3] = __hfma2(q3.b2, y_prep, z_prep);
 }
 
-// PRECISE bf16 variant. Same motivation as fp16_precise: avoid amplifying the
-// fp16(scale)≠scale rounding error by 128x in the FMA. Used by the WMMA
-// kernel; the scalar kernel keeps the FMA form for speed.
-__forceinline__ __device__ void prep_zero_scale_bf16_precise(uint32_t zero,
-                                                             bf16_t scale,
-                                                             bf162_t& z_prep,
-                                                             bf162_t& y_prep) {
-  // z = bf16(128 + zero), exact for zero in [0, 15] (bf16 ULP=1 at 128).
-  union {
-    uint16_t u;
-    bf16_t h;
-  } zu;
-  zu.u = (uint16_t)(0x4300 | zero);
-  z_prep = __bfloat162bfloat162(zu.h);
-  y_prep = __bfloat162bfloat162(scale);
-}
-
-__forceinline__ __device__ void dequant_4bit_8_bf16_precise(uint32_t qa,
-                                                            bf162_t (&dq)[4],
-                                                            bf162_t z_prep,
-                                                            bf162_t y_prep) {
-  const uint32_t c0 = 0x43004300;
-
-  union { uint32_t u; bf162_t b2; } q0, q1, q2, q3;
-  q0.u = ((qa >>  0) & 0x000F000F) | c0;
-  q1.u = ((qa >>  4) & 0x000F000F) | c0;
-  q2.u = ((qa >>  8) & 0x000F000F) | c0;
-  q3.u = ((qa >> 12) & 0x000F000F) | c0;
-
-  // (128 + q) - (128 + zero) = q - zero, exact. Then * scale.
-  dq[0] = __hmul2(__hsub2(q0.b2, z_prep), y_prep);
-  dq[1] = __hmul2(__hsub2(q1.b2, z_prep), y_prep);
-  dq[2] = __hmul2(__hsub2(q2.b2, z_prep), y_prep);
-  dq[3] = __hmul2(__hsub2(q3.b2, z_prep), y_prep);
-}
+// NOTE: the *_precise dequant variants (subtract-first, used by the WMMA
+// kernel for numerical accuracy with non-power-of-2 scales) live in
+// q_gemm_rdna3_wmma.cu's anonymous namespace, NOT here. They are kept out
+// of this shared header because hipcc's TU-level optimizer makes different
+// register/scheduling decisions when this header grows, which previously
+// caused a measurable scalar-kernel decode regression.
 
 }  // namespace gptq_rdna3
 }  // namespace vllm
