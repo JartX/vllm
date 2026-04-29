@@ -422,6 +422,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("gptq_shuffle(Tensor! q_weight, Tensor q_perm, int bit) -> ()");
   ops.impl("gptq_shuffle", torch::kCUDA, &gptq_shuffle);
 
+  // W4A16 GPTQ GEMM tuned for AMD RDNA3 (gfx1100). Accepts both fp16 and
+  // bf16 activations; weights must be pre-shuffled via gptq_shuffle.
+  ops.def(
+      "gptq_gemm_rdna3(Tensor a, Tensor b_q_weight, Tensor b_qzeros, "
+      "Tensor b_scales, Tensor b_g_idx, bool use_v2_format) -> Tensor");
+  ops.impl("gptq_gemm_rdna3", torch::kCUDA, &gptq_gemm_rdna3);
+
   // Compute FP8 quantized tensor for given scaling factor.
   // Supports per-tensor, per-channel, per-token, and arbitrary 2D group
   // scaling. Optional group_m/group_n specify the group shape explicitly;
