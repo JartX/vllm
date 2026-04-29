@@ -37,8 +37,24 @@ class RDNA3W4A16LinearKernel(MPLinearKernel):
         if not current_platform.is_rocm():
             return False, "RDNA3 W4A16 kernel is ROCm-only"
 
-        if not getattr(current_platform, "on_gfx11", lambda: False)():
+        # `on_gfx11` is a module-level function in vllm.platforms.rocm, not
+        # a method on the platform instance, so we import it lazily here
+        # (the import is guarded by is_rocm() above).
+        try:
+            from vllm.platforms.rocm import on_gfx11
+        except ImportError:
+            return False, "vllm.platforms.rocm.on_gfx11 not available"
+        if not on_gfx11():
             return False, "RDNA3 W4A16 kernel requires gfx11 (RDNA3)"
+
+        # The HIP op is registered by the C++ extension; if a user is running
+        # against a vLLM build that doesn't include it (e.g. partial rebuild),
+        # fall through gracefully to the next kernel in the registry.
+        if not hasattr(torch.ops._C, "gptq_gemm_rdna3"):
+            return (
+                False,
+                "torch.ops._C.gptq_gemm_rdna3 missing — rebuild C++ extension",
+            )
 
         if c.act_type not in (torch.float16, torch.bfloat16):
             return False, "RDNA3 W4A16 kernel only supports fp16 and bf16"
