@@ -128,6 +128,17 @@ class RDNA3W4A16LinearKernel(MPLinearKernel):
     # ----- Weight prep (identical layout/shuffle as ExllamaLinearKernel) -----
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
+        # Resolve and cache the WMMA op exactly once across the process.
+        # This runs at model load time, BEFORE torch.compile / Dynamo
+        # touches apply_weights. We deliberately use a module-level cache
+        # (not setattr on self or the class) so that apply_weights only
+        # READS a captured Python local — Dynamo handles that fine, but
+        # any setattr on the class inside the traced fwd path makes it
+        # unsupported and crashes the worker.
+        global _WMMA_OP_CACHE
+        if _WMMA_OP_CACHE == "_uninitialized":
+            _WMMA_OP_CACHE = _resolve_wmma_op()
+
         c = self.config
         device = getattr(layer, self.w_q_name).device
 
