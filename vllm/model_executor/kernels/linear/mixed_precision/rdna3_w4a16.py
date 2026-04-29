@@ -232,8 +232,19 @@ class RDNA3W4A16LinearKernel(MPLinearKernel):
         if wmma_op == "_uninitialized":
             wmma_op = self._resolve_wmma_op()
             type(self)._wmma_op = wmma_op  # cache on the class — shared
+            # One-shot diagnostic: print exactly once when this kernel is
+            # first invoked, so you can confirm in logs that vLLM picked
+            # RDNA3W4A16LinearKernel and not a fallback. Remove this
+            # block after validating perf is back to baseline.
+            print(
+                f"[RDNA3W4A16] FIRST DISPATCH — wmma_op={wmma_op}, "
+                f"m={x_2d.size(0)}, k={x_2d.size(1)}, "
+                f"n={w_q.size(1)}",
+                flush=True,
+            )
 
-        if wmma_op is not None and x_2d.size(0) >= 16:
+        m = x_2d.size(0)
+        if wmma_op is not None and m >= 16:
             output = wmma_op(
                 x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format
             )
