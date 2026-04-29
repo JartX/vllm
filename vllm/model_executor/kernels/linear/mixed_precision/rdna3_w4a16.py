@@ -213,22 +213,6 @@ class RDNA3W4A16LinearKernel(MPLinearKernel):
 
     # ----- Forward --------------------------------------------------------
 
-    # Sentinel: dispatch cache hasn't been populated yet on this instance.
-    # We resolve torch.ops._C.gptq_gemm_rdna3_wmma lazily on the FIRST
-    # apply_weights call (rather than at module import) because vLLM's
-    # kernel registry imports this module before the C++ extension is
-    # guaranteed to be fully attribute-registered. Touching torch.ops._C
-    # at import time can fail and silently cause vLLM to drop this kernel
-    # from the registry, falling back to TritonW4A16LinearKernel — which
-    # is dramatically slower on RDNA3 (was the cause of an earlier 55→8
-    # tk/s decode regression).
-    _wmma_op = "_uninitialized"
-
-    def _resolve_wmma_op(self):
-        if os.environ.get("VLLM_RDNA3_DISABLE_WMMA", "") == "1":
-            return None
-        return getattr(torch.ops._C, "gptq_gemm_rdna3_wmma", None)
-
     def apply_weights(
         self,
         layer: torch.nn.Module,
@@ -251,28 +235,13 @@ class RDNA3W4A16LinearKernel(MPLinearKernel):
         assert w_g_idx is not None, "g_idx tensor (possibly empty) required"
 
         # Dispatch:
-        #   * M >= 16 → WMMA matrix-instruction path (prefill / batched).
-        #   * Else   → scalar dot-product (decode + small batch).
-        # WMMA op is resolved once per instance (lazy) and cached. The
-        # `m >= 16` check is the only per-call cost beyond the original
-        # decode path.
-        wmma_op = self._wmma_op
-        if wmma_op == "_uninitialized":
-            wmma_op = self._resolve_wmma_op()
-            type(self)._wmma_op = wmma_op  # cache on the class — shared
-            # One-shot diagnostic: print exactly once when this kernel is
-            # first invoked, so you can confirm in logs that vLLM picked
-            # RDNA3W4A16LinearKernel and not a fallback. Remove this
-            # block after validating perf is back to baseline.
-            print(
-                f"[RDNA3W4A16] FIRST DISPATCH — wmma_op={wmma_op}, "
-                f"m={x_2d.size(0)}, k={x_2d.size(1)}, "
-                f"n={w_q.size(1)}",
-                flush=True,
-            )
-
-        m = x_2d.size(0)
-        if wmma_op is not None and m >= 16:
+        #   * M >= 16 with WMMA op available → WMMA matrix-instruction
+        #     path (prefill / batched).
+        #   * Else → scalar dot-product (decode + small batch).
+        # _WMMA_OP_CACHE is populated in process_weights_after_loading
+        # so this is a constant by the time torch.compile traces fwd.
+        wmma_op = _WMMA_OP_CACHE
+        if wmma_op is not None and x_2d.size(0) >= 16:
             output = wmma_op(
                 x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format
             )
