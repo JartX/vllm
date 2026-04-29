@@ -27,6 +27,7 @@
 //     16M × 16N output tile (no split-K, no atomic).
 
 #include <cstdint>
+#include <cstdlib>
 
 #include <torch/all.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -356,18 +357,190 @@ __global__ void gemm_q4_wmma_kernel(const T* __restrict__ a,
   }
 }
 
+// ===========================================================================
+// V2 kernel: 4 waves per block, 16M × 64N output tile.
+//
+// Same WMMA fragment contract as v1 (mode 1 layout: A row-major, B col-major,
+// output [m=2*i+lane_hi][n=lane_lo]). Difference is purely organisational:
+//   * 4 waves cooperate on a single block, each owning a 16-col N stripe.
+//   * B dequant is split block-wide: 128 threads × 1 task each cover the
+//     64 N cols × 2 K-octets = 128 dequant tasks per K iter.
+//   * A is reloaded by each wave from global memory; with all 4 waves on
+//     the same WGP (and therefore the same L0 cache), 3 of 4 reads should
+//     hit L0 → ~1.25x effective A bandwidth, not 4x.
+//
+// Why this should beat v1: v1 launches 1 wave per block, so for the
+// typical Qwen prefill shape (M=16, N=4096) the grid is only 256 blocks,
+// running 2-3 waves per CU on a 96-CU GPU — well below the ~8 waves/CU
+// needed to hide LDS / global latency. v2 quadruples the work per block
+// without changing block count significantly (it does drop blocks 4× in
+// the N direction, but each does 4× the work; net is more useful waves
+// in flight per CU at small M).
+//
+// Selectable at runtime via VLLM_RDNA3_WMMA_V2=1; default keeps v1 so
+// production bf16 prefill is unaffected until v2 is validated.
+// ===========================================================================
+template <typename T>
+__global__ void gemm_q4_wmma_kernel_v2(
+    const T* __restrict__ a, const uint32_t* __restrict__ b_q,
+    const uint32_t* __restrict__ b_qzeros, const T* __restrict__ b_scales,
+    T* __restrict__ c, const int size_m, const int size_n, const int size_k,
+    const int groups, const int zero_offset,
+    const int* __restrict__ b_q_perm) {
+  using E = typename WmmaNative<T>::elem;
+  using V16 = typename WmmaNative<T>::v16;
+
+  const int wave_id = threadIdx.x >> 5;  // 0..3
+  const int lane = threadIdx.x & 31;
+  const int lane_lo = lane & 15;
+  const int lane_hi = lane >> 4;
+
+  const int m_tile = blockIdx.y * 16;
+  const int n_tile_block = blockIdx.x * 64;
+  // Block-level early-out: if BOTH dims out of range, every wave bails out
+  // before touching __syncthreads(). Per-wave/per-lane bounds (n_tile + ...
+  // < size_n) are handled below without divergent syncs.
+  if (m_tile >= size_m || n_tile_block >= size_n) return;
+
+  const int wave_n_base = wave_id * 16;        // wave's offset within block tile
+  const int n_tile_wave = n_tile_block + wave_n_base;
+
+  v8fp32 c_acc = {0, 0, 0, 0, 0, 0, 0, 0};
+
+  const int groupsize = size_k / groups;
+
+  // 16K × 64N B tile in LDS. Each wave writes its own 16-col stripe.
+  __shared__ T b_lds[16][64];
+
+  for (int k_tile = 0; k_tile < size_k; k_tile += 16) {
+    // ---- Cooperative B dequant: 128 threads, 1 task each ----
+    // Per-block: 64 N cols × 2 K-octets = 128 tasks. Each wave's 32 lanes
+    // dequant 16 cols × 2 octets within its N stripe.
+    const int my_n_local = wave_n_base + lane_lo;  // 0..63 inside block
+    const int my_k_octet = lane_hi;
+    const int actual_n = n_tile_block + my_n_local;
+
+    if (actual_n < size_n) {
+      const int qk_row = (k_tile / 8) + my_k_octet;
+      const uint32_t qa = b_q[qk_row * size_n + actual_n];
+
+      const int g = k_tile / groupsize;
+      const int qz_idx = g * (size_n / 8) + actual_n / 8;
+      const int qz_shift = (actual_n & 7) * 4;
+      const uint32_t zero_v =
+          ((b_qzeros[qz_idx] >> qz_shift) & 0xF) + (uint32_t)zero_offset;
+      const T scale_t = b_scales[g * size_n + actual_n];
+
+      const int k_base = my_k_octet * 8;
+
+      if constexpr (std::is_same<T, half>::value) {
+        half2 z_prep, y_prep;
+        prep_zero_scale_fp16_precise(zero_v, scale_t, z_prep, y_prep);
+        half2 dq[4];
+        dequant_4bit_8_fp16_precise(qa, dq, z_prep, y_prep);
+        b_lds[k_base + 0][my_n_local] = __low2half(dq[0]);
+        b_lds[k_base + 1][my_n_local] = __high2half(dq[0]);
+        b_lds[k_base + 2][my_n_local] = __low2half(dq[1]);
+        b_lds[k_base + 3][my_n_local] = __high2half(dq[1]);
+        b_lds[k_base + 4][my_n_local] = __low2half(dq[2]);
+        b_lds[k_base + 5][my_n_local] = __high2half(dq[2]);
+        b_lds[k_base + 6][my_n_local] = __low2half(dq[3]);
+        b_lds[k_base + 7][my_n_local] = __high2half(dq[3]);
+      } else {
+        bf162_t z_b, y_b;
+        prep_zero_scale_bf16_precise(zero_v, scale_t, z_b, y_b);
+        bf162_t dq[4];
+        dequant_4bit_8_bf16_precise(qa, dq, z_b, y_b);
+        b_lds[k_base + 0][my_n_local] = dq[0].x;
+        b_lds[k_base + 1][my_n_local] = dq[0].y;
+        b_lds[k_base + 2][my_n_local] = dq[1].x;
+        b_lds[k_base + 3][my_n_local] = dq[1].y;
+        b_lds[k_base + 4][my_n_local] = dq[2].x;
+        b_lds[k_base + 5][my_n_local] = dq[2].y;
+        b_lds[k_base + 6][my_n_local] = dq[3].x;
+        b_lds[k_base + 7][my_n_local] = dq[3].y;
+      }
+    }
+
+    __syncthreads();
+
+    // ---- Build A frag (per-wave from global; L0 cache on the WGP serves
+    // 3 of 4 waves' duplicate reads) and B frag (per-wave from LDS stripe).
+    V16 a_frag, b_frag;
+    const int m_row = m_tile + lane_lo;
+
+    if (m_row < size_m) {
+      const T* a_row = a + m_row * size_k;
+#pragma unroll
+      for (int i = 0; i < 16; i++) {
+        T v;
+        if (k_tile + i < size_k) {
+          v = b_q_perm ? a_row[b_q_perm[k_tile + i]] : a_row[k_tile + i];
+        } else {
+          v = tzero<T>();
+        }
+        a_frag[i] = bitcast_elem<T, E>(v);
+      }
+    } else {
+#pragma unroll
+      for (int i = 0; i < 16; i++) a_frag[i] = (E)0;
+    }
+
+#pragma unroll
+    for (int i = 0; i < 16; i++) {
+      b_frag[i] = bitcast_elem<T, E>(b_lds[i][wave_n_base + lane_lo]);
+    }
+
+    c_acc = wmma_mma(a_frag, b_frag, c_acc);
+
+    __syncthreads();  // before next iter overwrites b_lds
+  }
+
+  // ---- Store ----
+  const int out_n = n_tile_wave + lane_lo;
+  if (out_n < size_n) {
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+      const int out_m = m_tile + 2 * i + lane_hi;
+      if (out_m < size_m) {
+        T* dst = c + out_m * size_n + out_n;
+        if constexpr (std::is_same<T, half>::value) {
+          *dst = __float2half_rn(c_acc[i]);
+        } else {
+          *dst = __float2bfloat16(c_acc[i]);
+        }
+      }
+    }
+  }
+}
+
 template <typename T>
 void launch_gemm_q4_wmma(const T* a, const uint32_t* b_q_weight,
                          const uint32_t* b_qzeros, const T* b_scales,
                          const int* b_q_perm, T* c, int size_m, int size_n,
                          int size_k, int groups, int zero_offset,
                          cudaStream_t stream) {
-  // 1 wave per block (32 lanes), 16x16 C tile per block.
-  dim3 block(32);
-  dim3 grid((size_n + 15) / 16, (size_m + 15) / 16, 1);
-  gemm_q4_wmma_kernel<T><<<grid, block, 0, stream>>>(
-      a, b_q_weight, b_qzeros, b_scales, c, size_m, size_n, size_k, groups,
-      zero_offset, b_q_perm);
+  // VLLM_RDNA3_WMMA_V2=1 selects the 4-wave-per-block kernel. Default = v1
+  // so production bf16 prefill keeps the validated path until v2 is
+  // confirmed bit-exact + faster end-to-end.
+  static const bool use_v2 = []() {
+    const char* env = std::getenv("VLLM_RDNA3_WMMA_V2");
+    return env != nullptr && env[0] == '1' && env[1] == '\0';
+  }();
+
+  if (use_v2) {
+    dim3 block(128);  // 4 waves
+    dim3 grid((size_n + 63) / 64, (size_m + 15) / 16, 1);
+    gemm_q4_wmma_kernel_v2<T><<<grid, block, 0, stream>>>(
+        a, b_q_weight, b_qzeros, b_scales, c, size_m, size_n, size_k, groups,
+        zero_offset, b_q_perm);
+  } else {
+    dim3 block(32);  // 1 wave
+    dim3 grid((size_n + 15) / 16, (size_m + 15) / 16, 1);
+    gemm_q4_wmma_kernel<T><<<grid, block, 0, stream>>>(
+        a, b_q_weight, b_qzeros, b_scales, c, size_m, size_n, size_k, groups,
+        zero_offset, b_q_perm);
+  }
 }
 
 // ===========================================================================
