@@ -3,12 +3,22 @@
 """W4A16 GPTQ kernel for AMD RDNA3 (gfx1100) — fp16 + bf16.
 
 Drop-in replacement for ExllamaLinearKernel on RDNA3 that adds native bf16
-support. The HIP kernel lives in ``csrc/quantization/gptq/q_gemm_rdna3.cu``
-and is exposed via ``torch.ops._C.gptq_gemm_rdna3``.
+support. The HIP kernels live in ``csrc/quantization/gptq/q_gemm_rdna3.cu``
+(scalar dot-product, decode + small-batch path) and
+``csrc/quantization/gptq/q_gemm_rdna3_wmma.cu`` (matrix-instruction path
+for prefill / M >= 16). They are exposed as separate torch ops:
+``gptq_gemm_rdna3`` and ``gptq_gemm_rdna3_wmma``. Keeping them in separate
+TUs is intentional — an earlier monolithic version where both kernels
+shared a TU caused hipcc to miscompile the M=1 scalar path even when the
+WMMA template was never instantiated for that case.
+
+This wrapper picks the right op at forward time based on M.
 
 Registered ahead of TritonW4A16LinearKernel for the ROCm-RDNA3 path; falls
 through to the Triton kernel on non-RDNA3 ROCm devices (e.g. CDNA/MI300).
 """
+
+import os
 
 import torch
 
@@ -196,9 +206,30 @@ class RDNA3W4A16LinearKernel(MPLinearKernel):
         assert w_zp is not None, "Zero points are required by RDNA3 W4A16"
         assert w_g_idx is not None, "g_idx tensor (possibly empty) required"
 
-        output = ops.gptq_gemm_rdna3(
-            x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format
+        # Dispatch: WMMA path for M >= 16 with N, K both multiples of 16.
+        # Else the scalar dot-product kernel (decode + small batch). The
+        # VLLM_RDNA3_DISABLE_WMMA env var forces scalar even for M >= 16 —
+        # useful for A/B tests if the WMMA kernel is suspected.
+        m = x_2d.size(0)
+        n = w_q.size(1)
+        k = w_q.size(0) * 8
+        wmma_disabled = os.environ.get("VLLM_RDNA3_DISABLE_WMMA", "") == "1"
+        use_wmma = (
+            not wmma_disabled
+            and hasattr(torch.ops._C, "gptq_gemm_rdna3_wmma")
+            and m >= 16
+            and n % 16 == 0
+            and k % 16 == 0
         )
+
+        if use_wmma:
+            output = ops.gptq_gemm_rdna3_wmma(
+                x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format
+            )
+        else:
+            output = ops.gptq_gemm_rdna3(
+                x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format
+            )
 
         if bias is not None:
             output.add_(bias)

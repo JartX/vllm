@@ -429,6 +429,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor b_scales, Tensor b_g_idx, bool use_v2_format) -> Tensor");
   ops.impl("gptq_gemm_rdna3", torch::kCUDA, &gptq_gemm_rdna3);
 
+  // RDNA3 WMMA prefill kernel (M >= 16). Same weight format as
+  // gptq_gemm_rdna3 (gptq_shuffle layout). Lives in its own TU.
+  ops.def(
+      "gptq_gemm_rdna3_wmma(Tensor a, Tensor b_q_weight, Tensor b_qzeros, "
+      "Tensor b_scales, Tensor b_g_idx, bool use_v2_format) -> Tensor");
+  ops.impl("gptq_gemm_rdna3_wmma", torch::kCUDA, &gptq_gemm_rdna3_wmma);
+
   // Compute FP8 quantized tensor for given scaling factor.
   // Supports per-tensor, per-channel, per-token, and arbitrary 2D group
   // scaling. Optional group_m/group_n specify the group shape explicitly;
