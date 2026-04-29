@@ -72,6 +72,43 @@ __forceinline__ __device__ float dot22_8_f(bf162_t (&dq)[4],
   return __bfloat162float(result.x) + __bfloat162float(result.y);
 }
 
+// ---------------------------------------------------------------------------
+// Packed atomic-add via CAS-loop on the underlying uint32. RDNA3 (gfx11) does
+// NOT have native v_global_atomic_pk_add_f16 / _bf16 (those landed on gfx940
+// / gfx1250 respectively), so this lowers to global_atomic_cmpswap_b32 plus
+// retry. We use this in the kernel epilogue to write directly to fp16/bf16
+// output without going through an FP32 accumulator buffer + epilogue cast
+// pass — saves M*N*4 bytes of allocation, the memset, and a kernel launch
+// per matmul (~5-10 μs/call → 11-22% of decode budget at 50 tk/s).
+// ---------------------------------------------------------------------------
+
+__forceinline__ __device__ void atomic_add_pk_f16(half2* addr, half2 val) {
+  uint32_t* addr_u = reinterpret_cast<uint32_t*>(addr);
+  uint32_t old = *addr_u;
+  while (true) {
+    half2 cur = *reinterpret_cast<half2*>(&old);
+    half2 sum = __hadd2(cur, val);
+    uint32_t sum_u = *reinterpret_cast<uint32_t*>(&sum);
+    uint32_t prev = atomicCAS(addr_u, old, sum_u);
+    if (prev == old) break;
+    old = prev;
+  }
+}
+
+__forceinline__ __device__ void atomic_add_pk_bf16(bf162_t* addr,
+                                                   bf162_t val) {
+  uint32_t* addr_u = reinterpret_cast<uint32_t*>(addr);
+  uint32_t old = *addr_u;
+  while (true) {
+    bf162_t cur = *reinterpret_cast<bf162_t*>(&old);
+    bf162_t sum = __hadd2(cur, val);
+    uint32_t sum_u = *reinterpret_cast<uint32_t*>(&sum);
+    uint32_t prev = atomicCAS(addr_u, old, sum_u);
+    if (prev == old) break;
+    old = prev;
+  }
+}
+
 // Load one row's worth of 4 packed zeros (column n..n+3) from a [groups, N/8]
 // uint32 tensor. n is a multiple of 4 by construction (n = offset_n + t*4 with
 // offset_n = blockIdx.x * 512), so the 4 nibbles always live within one or two
@@ -105,7 +142,7 @@ __global__ void gemm_q4_kernel_rdna3(const T* __restrict__ a,
                                      const uint32_t* __restrict__ b_q_weight,
                                      const uint32_t* __restrict__ b_qzeros,
                                      const T* __restrict__ b_scales,
-                                     float* __restrict__ c_fp32,
+                                     T* __restrict__ c,
                                      const int size_m, const int size_n,
                                      const int size_k, const int groups,
                                      const int zero_offset,
@@ -257,30 +294,30 @@ __global__ void gemm_q4_kernel_rdna3(const T* __restrict__ a,
     k += 32;  // 4 weight words * 8 nibbles = 32 K elements
   }
 
-  // Atomic add into FP32 accumulator (zeroed by caller). Cast happens after.
+  // Pack the 4 FP32 partial sums into 2 packed pairs and atomically add them
+  // directly into the T-typed output (caller pre-zeros it). On gfx11 the
+  // packed atomic is a CAS-loop on uint32, but we save the FP32 buffer +
+  // memset + cast pass that we'd otherwise need.
 #pragma unroll
   for (int m = 0; m < M_COUNT; ++m) {
-    float* out = c_fp32 + (offset_m + m) * size_n + n;
-    atomicAdd(out + 0, block_c[m][0]);
-    atomicAdd(out + 1, block_c[m][1]);
-    atomicAdd(out + 2, block_c[m][2]);
-    atomicAdd(out + 3, block_c[m][3]);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Cast FP32 accumulator buffer back to T.
-// ---------------------------------------------------------------------------
-
-template <typename T>
-__global__ void cast_fp32_to_T(const float* __restrict__ src,
-                               T* __restrict__ dst, const int n_elem) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= n_elem) return;
-  if constexpr (std::is_same<T, half>::value) {
-    dst[i] = __float2half_rn(src[i]);
-  } else {
-    dst[i] = __float2bfloat16(src[i]);
+    T* out = c + (offset_m + m) * size_n + n;
+    if constexpr (std::is_same<T, half>::value) {
+      half2 r01 = __halves2half2(__float2half_rn(block_c[m][0]),
+                                 __float2half_rn(block_c[m][1]));
+      half2 r23 = __halves2half2(__float2half_rn(block_c[m][2]),
+                                 __float2half_rn(block_c[m][3]));
+      atomic_add_pk_f16(reinterpret_cast<half2*>(out + 0), r01);
+      atomic_add_pk_f16(reinterpret_cast<half2*>(out + 2), r23);
+    } else {
+      bf162_t r01;
+      r01.x = __float2bfloat16(block_c[m][0]);
+      r01.y = __float2bfloat16(block_c[m][1]);
+      bf162_t r23;
+      r23.x = __float2bfloat16(block_c[m][2]);
+      r23.y = __float2bfloat16(block_c[m][3]);
+      atomic_add_pk_bf16(reinterpret_cast<bf162_t*>(out + 0), r01);
+      atomic_add_pk_bf16(reinterpret_cast<bf162_t*>(out + 2), r23);
+    }
   }
 }
 
@@ -291,14 +328,13 @@ __global__ void cast_fp32_to_T(const float* __restrict__ src,
 template <typename T>
 void launch_gemm_q4(const T* a, const uint32_t* b_q_weight,
                     const uint32_t* b_qzeros, const T* b_scales,
-                    const int* b_q_perm, T* c, float* c_fp32, int size_m,
-                    int size_n, int size_k, int groups, bool use_v2_format,
+                    const int* b_q_perm, T* c, int size_m, int size_n,
+                    int size_k, int groups, bool use_v2_format,
                     cudaStream_t stream) {
   const int zero_offset = use_v2_format ? 0 : 1;
 
-  // Caller is responsible for zero-initializing c_fp32 (we ask for
-  // torch::zeros at the entry point so PyTorch handles platform-specific
-  // memset via its async stream).
+  // Caller is responsible for zero-initializing c (we ask for torch::zeros
+  // at the entry point so PyTorch handles the memset on the same stream).
 
   // For decode (M small) we use M_COUNT=1; we could template on larger
   // M_COUNTs later for prefill, but the Triton path can keep handling those
@@ -311,14 +347,8 @@ void launch_gemm_q4(const T* a, const uint32_t* b_q_weight,
             (size_k + BLOCK_KN_SIZE - 1) / BLOCK_KN_SIZE);
 
   gemm_q4_kernel_rdna3<T, M_COUNT><<<grid, block, 0, stream>>>(
-      a, b_q_weight, b_qzeros, b_scales, c_fp32, size_m, size_n, size_k,
-      groups, zero_offset, b_q_perm);
-
-  // Cast FP32 buffer to output dtype.
-  int n_elem = size_m * size_n;
-  int tcast = 256;
-  int bcast = (n_elem + tcast - 1) / tcast;
-  cast_fp32_to_T<T><<<bcast, tcast, 0, stream>>>(c_fp32, c, n_elem);
+      a, b_q_weight, b_qzeros, b_scales, c, size_m, size_n, size_k, groups,
+      zero_offset, b_q_perm);
 }
 
 }  // namespace gptq_rdna3
@@ -369,10 +399,9 @@ torch::Tensor gptq_gemm_rdna3(torch::Tensor a, torch::Tensor b_q_weight,
   TORCH_CHECK(b_scales.size(1) == size_n, "b_scales last dim must be N");
 
   auto opts = torch::TensorOptions().dtype(a.dtype()).device(a.device());
-  auto opts_f32 = torch::TensorOptions().dtype(torch::kFloat32).device(a.device());
-  at::Tensor c = torch::empty({size_m, size_n}, opts);
-  // FP32 accumulator must start zeroed; the kernel does atomicAdd into it.
-  at::Tensor c_fp32 = torch::zeros({size_m, size_n}, opts_f32);
+  // c must be zeroed: the kernel atomically accumulates partial sums from
+  // every split-K block into it.
+  at::Tensor c = torch::zeros({size_m, size_n}, opts);
 
   const int* g_idx_ptr = nullptr;
   if (!b_g_idx.device().is_meta() && b_g_idx.numel() > 0) {
@@ -387,17 +416,15 @@ torch::Tensor gptq_gemm_rdna3(torch::Tensor a, torch::Tensor b_q_weight,
         (const uint32_t*)b_q_weight.data_ptr(),
         (const uint32_t*)b_qzeros.data_ptr(),
         (const half*)b_scales.data_ptr(), g_idx_ptr, (half*)c.data_ptr(),
-        (float*)c_fp32.data_ptr(), size_m, size_n, size_k, groups,
-        use_v2_format, stream);
+        size_m, size_n, size_k, groups, use_v2_format, stream);
   } else {
     vllm::gptq_rdna3::launch_gemm_q4<vllm::gptq_rdna3::bf16_t>(
         (const vllm::gptq_rdna3::bf16_t*)a.data_ptr(),
         (const uint32_t*)b_q_weight.data_ptr(),
         (const uint32_t*)b_qzeros.data_ptr(),
         (const vllm::gptq_rdna3::bf16_t*)b_scales.data_ptr(), g_idx_ptr,
-        (vllm::gptq_rdna3::bf16_t*)c.data_ptr(),
-        (float*)c_fp32.data_ptr(), size_m, size_n, size_k, groups,
-        use_v2_format, stream);
+        (vllm::gptq_rdna3::bf16_t*)c.data_ptr(), size_m, size_n, size_k,
+        groups, use_v2_format, stream);
   }
 
   return c;
