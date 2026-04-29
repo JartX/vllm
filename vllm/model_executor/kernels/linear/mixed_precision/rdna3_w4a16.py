@@ -32,6 +32,16 @@ from vllm.scalar_type import scalar_types
 
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
 
+# Cache dispatch decisions at import time. Querying os.environ and
+# hasattr(torch.ops._C, ...) on every forward adds ~100 µs each — over a
+# 30-token response with 32 layers × ~4 linears, that's ~400 ms of pure
+# Python overhead. The env var is read once; if you need to toggle it,
+# restart the worker. The hasattr check is also evaluated once because the
+# extension is loaded at import and won't change at runtime.
+_WMMA_DISABLED = os.environ.get("VLLM_RDNA3_DISABLE_WMMA", "") == "1"
+_WMMA_OP = getattr(torch.ops._C, "gptq_gemm_rdna3_wmma", None) if not _WMMA_DISABLED else None
+_SCALAR_OP = torch.ops._C.gptq_gemm_rdna3
+
 
 class RDNA3W4A16LinearKernel(MPLinearKernel):
     SUPPORTED_QUANT_TYPES = [scalar_types.uint4b8]
@@ -206,30 +216,16 @@ class RDNA3W4A16LinearKernel(MPLinearKernel):
         assert w_zp is not None, "Zero points are required by RDNA3 W4A16"
         assert w_g_idx is not None, "g_idx tensor (possibly empty) required"
 
-        # Dispatch: WMMA path for M >= 16 with N, K both multiples of 16.
-        # Else the scalar dot-product kernel (decode + small batch). The
-        # VLLM_RDNA3_DISABLE_WMMA env var forces scalar even for M >= 16 —
-        # useful for A/B tests if the WMMA kernel is suspected.
+        # Dispatch: WMMA for M >= 16 (prefill / batched), scalar otherwise
+        # (decode). N, K are guaranteed multiples of 16 in any modern GPTQ
+        # checkpoint, so we don't re-check them per call. The cached
+        # _WMMA_OP is None when the env disables WMMA or the C++ ext lacks
+        # the op, falling through to scalar.
         m = x_2d.size(0)
-        n = w_q.size(1)
-        k = w_q.size(0) * 8
-        wmma_disabled = os.environ.get("VLLM_RDNA3_DISABLE_WMMA", "") == "1"
-        use_wmma = (
-            not wmma_disabled
-            and hasattr(torch.ops._C, "gptq_gemm_rdna3_wmma")
-            and m >= 16
-            and n % 16 == 0
-            and k % 16 == 0
-        )
-
-        if use_wmma:
-            output = ops.gptq_gemm_rdna3_wmma(
-                x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format
-            )
+        if _WMMA_OP is not None and m >= 16:
+            output = _WMMA_OP(x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format)
         else:
-            output = ops.gptq_gemm_rdna3(
-                x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format
-            )
+            output = _SCALAR_OP(x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format)
 
         if bias is not None:
             output.add_(bias)
