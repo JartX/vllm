@@ -114,19 +114,33 @@ __device__ __forceinline__ bf16_t tzero<bf16_t>() {
 // ===========================================================================
 // WMMA kernel: 16M × 16N tile per block, 1 wave, full K traversal.
 //
-// Wave32 fragment layout (verified empirically with diagnostic tests):
-//   * A frag: lane t holds A[t & 15][0..15] — ROW (t & 15), all 16 cols.
-//   * B frag: lane t holds B[t & 15][0..15] — ROW (t & 15), all 16 cols.
-//     IMPORTANT: BOTH input fragments are row-major per lane on RDNA3
-//     wave32. Loading B as column-major produces C^T instead of C — the
-//     bug surfaces only on non-symmetric outputs (a layout test with a
-//     symmetric B matrix can't distinguish the two cases).
-//   * C frag: lane t holds row (t & 15), 8 elements that are NOT contiguous —
-//     they are EVEN-or-ODD columns determined by lane_hi:
-//       - lanes 0..15  → c_acc[i] = C[lane_lo][2*i]      (even cols)
-//       - lanes 16..31 → c_acc[i] = C[lane_lo][2*i + 1]  (odd cols)
-//   * Lanes 16..31 duplicate lanes 0..15 for the input fragments
-//     (AMD's "doubled" fragment).
+// Wave32 fragment layout (verified empirically with all-modes diagnostic
+// against a random A and B and the eight candidate output mappings):
+//
+//   * A frag (row-major in M, K in slot):
+//       lane t, slot i → A[lane_lo][k = i]
+//       Lane axis encodes M (A's row), slot encodes K.
+//   * B frag (col-major in N, K in slot):
+//       lane t, slot i → B[k = i][lane_lo]
+//       Lane axis encodes N (B's column), slot encodes K. K-axis aligns
+//       with A's K-axis (same slot index).
+//   * C frag (output, lane = N, slot = M with hi-bit interleave):
+//       lane t, slot i → C[m = 2*i + lane_hi][n = lane_lo]
+//       Lane axis encodes N (C's column). Each lane holds 8 elements of
+//       its output column, alternating rows: lanes 0..15 (hi=0) hold even
+//       rows m=0,2,4,...,14; lanes 16..31 (hi=1) hold odd rows
+//       m=1,3,5,...,15.
+//   * Both halves of the wave (lanes 0..15 and 16..31) hold IDENTICAL input
+//     fragments (AMD's "doubled" wave32 input layout). Output is split
+//     between halves via lane_hi.
+//
+// History note: an earlier version of this kernel loaded B row-major in K
+// and assumed the output was C[lane_lo][2*i+lane_hi]. That layout passes
+// all-A=identity tests because A=I makes the K-axis sum collapse, but
+// implements C = A @ B^T for non-trivial A — the bug only shows up against
+// random A. The probe op gptq_gemm_rdna3_wmma_probe iterates all four
+// {row,col} × {row,col} loadings and identifies mode 1 (A row, B col) with
+// output [m=2*i+hi][n=lane_lo] as the unique mapping that yields A @ B.
 // ===========================================================================
 
 template <typename T>
@@ -228,13 +242,13 @@ __global__ void gemm_q4_wmma_kernel(const T* __restrict__ a,
       for (int i = 0; i < 16; i++) a_frag[i] = (E)0;
     }
 
-    // B fragment: lane t holds ROW (t & 15) of the B tile, all 16 columns.
-    // Both A and B are row-major per lane on RDNA3 wave32 — the WMMA
-    // hardware does the K-axis routing internally. Loading as column-major
-    // makes WMMA produce C^T (skew-symmetric error against C).
+    // B fragment: lane t holds COLUMN n=lane_lo of the B tile (K-axis in
+    // slot, N-axis in lane). This is the AMD WMMA convention for the right
+    // operand of a matrix multiply — K-axis aligns with A's K-axis (also
+    // in slot), enabling per-lane inner products.
 #pragma unroll
     for (int i = 0; i < 16; i++) {
-      b_frag[i] = bitcast_elem<T, E>(b_lds[lane_lo][i]);
+      b_frag[i] = bitcast_elem<T, E>(b_lds[i][lane_lo]);
     }
 
 #ifdef VLLM_WMMA_LAYOUT_DEBUG
@@ -259,24 +273,23 @@ __global__ void gemm_q4_wmma_kernel(const T* __restrict__ a,
   }
 
   // ---- Store C ----
-  // Lane t holds row (lane_lo), 8 elements at columns:
-  //   lane_hi == 0  →  cols 0, 2, 4, ..., 14   (even, parity 0)
-  //   lane_hi == 1  →  cols 1, 3, 5, ..., 15   (odd,  parity 1)
-  // c_acc[i] is the i-th element in that interleaved sequence — i.e.,
-  // c_acc[i] corresponds to actual column (2*i + lane_hi).
-  const int out_m = m_tile + lane_lo;
-  const int parity = lane_hi;  // 0 = even cols, 1 = odd cols
+  // Lane t holds column n=lane_lo of the output tile, 8 rows determined by
+  // slot i and lane_hi:
+  //   lane_hi == 0  →  rows 0, 2, 4, ..., 14   (even rows)
+  //   lane_hi == 1  →  rows 1, 3, 5, ..., 15   (odd rows)
+  // c_acc[i] corresponds to actual row m = 2*i + lane_hi at column lane_lo.
+  const int out_n = n_tile + lane_lo;
 
-  if (out_m < size_m) {
-    T* row_out = c + out_m * size_n;
+  if (out_n < size_n) {
 #pragma unroll
     for (int i = 0; i < 8; i++) {
-      const int out_n = n_tile + 2 * i + parity;
-      if (out_n < size_n) {
+      const int out_m = m_tile + 2 * i + lane_hi;
+      if (out_m < size_m) {
+        T* dst = c + out_m * size_n + out_n;
         if constexpr (std::is_same<T, half>::value) {
-          row_out[out_n] = __float2half_rn(c_acc[i]);
+          *dst = __float2half_rn(c_acc[i]);
         } else {
-          row_out[out_n] = __float2bfloat16(c_acc[i]);
+          *dst = __float2bfloat16(c_acc[i]);
         }
       }
     }
@@ -384,7 +397,7 @@ __global__ void gemm_q4_wmma_dump_kernel(
 
 #pragma unroll
     for (int i = 0; i < 16; i++) {
-      b_frag[i] = bitcast_elem<half, _Float16>(b_lds[lane_lo][i]);
+      b_frag[i] = bitcast_elem<half, _Float16>(b_lds[i][lane_lo]);
     }
 
     c_acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_frag, b_frag, c_acc);
