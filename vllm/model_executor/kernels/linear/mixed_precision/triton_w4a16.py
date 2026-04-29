@@ -553,16 +553,27 @@ def triton_w4a16_gemm_kn(
     has_zp = qzeros is not None
     zeros_ptr = qzeros if has_zp else b_q
 
-    # ---- Decode path: split-K multi-group GEMV ----
+    # ---- Decode path: clone exllama's tile geometry exactly ----
+    # ExLlama 4-bit kernel (csrc/quantization/gptq/q_gemm.cu:191):
+    #   128 threads × 4 N-cols/thread × 128 K = 64k FMAs/program
+    #   gridDim = (N/512, M/m_count, K/128) → 256 programs at M=1 N=K=4096
+    #
+    # Triton equivalent: BLOCK_N=512 with num_warps=4 (128 lanes total),
+    # so each lane handles 4 N-cols (Triton auto-distributes the BLOCK_N
+    # dim across 128 lanes → 4 cols/lane). BLOCK_K=128 matches exllama's
+    # K-tile; for G=32 this is 4 inner-group iterations.
     if M <= 16:
-        # Match exllama's per-program work density:
-        #   exllama: 256 programs × 128 threads × 4 N-cols × 128 K = 64k FMAs/prog
-        #   ours:    1024 programs × 128 lanes × 1 N-col × 128 K = 16k FMAs/prog
-        # 4× fewer FMAs/prog than exllama but 4× more programs total — still
-        # better setup-overhead amortization than the prior 64×32 tile (8k
-        # FMAs/prog). Larger tiles risk register spills; this is the sweet
-        # spot for RDNA3 wave32 with 4 warps.
-        BLOCK_N = 128
+        # Cap BLOCK_N to N to handle small layers; round to a multiple of
+        # 8 (packed N dim) and prefer powers of 2 for tile alignment.
+        if N >= 512:
+            BLOCK_N = 512
+        elif N >= 256:
+            BLOCK_N = 256
+        elif N >= 128:
+            BLOCK_N = 128
+        else:
+            BLOCK_N = max(64, ((N + 7) // 8) * 8)
+
         BLOCK_K = max(128, group_size)
         BLOCK_K = (BLOCK_K // group_size) * group_size  # multiple of G
         BLOCK_K = min(BLOCK_K, K)
@@ -571,11 +582,13 @@ def triton_w4a16_gemm_kn(
 
         K_SPLITS = triton.cdiv(K, BLOCK_K)
 
-        # Use atomic_add directly to fp32 output instead of temp buffer
-        # + torch.sum. fp32 atomic_add is well-supported on RDNA3 and
-        # eliminates one kernel launch per matmul (~5-10 µs saved).
+        # fp32 atomic_add output. RDNA3 has v_global_atomic_add_f32 in
+        # hardware so contention is sub-cycle per cell.
         c_fp32 = torch.zeros((M, N), dtype=torch.float32, device=a.device)
 
+        # num_warps=4 → 128 lanes/program, matching exllama's 128 threads.
+        # Combined with BLOCK_N=512, each lane covers 4 N cols (exactly
+        # what exllama's `n = offset_n + t * 4` does).
         grid = (M, triton.cdiv(N, BLOCK_N), K_SPLITS)
         triton_w4a16_gemv_kn_kernel[grid](
             a,
@@ -590,7 +603,7 @@ def triton_w4a16_gemm_kn(
             a.stride(1),
             b_q.stride(0),
             b_q.stride(1),
-            0,  # stride_csplit unused (we atomic_add to single output plane)
+            0,  # stride_csplit unused for atomic_add path
             c_fp32.stride(0),
             c_fp32.stride(1),
             GROUP_SIZE=group_size,
