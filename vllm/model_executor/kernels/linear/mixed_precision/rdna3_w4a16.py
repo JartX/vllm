@@ -10,8 +10,6 @@ Registered ahead of TritonW4A16LinearKernel for the ROCm-RDNA3 path; falls
 through to the Triton kernel on non-RDNA3 ROCm devices (e.g. CDNA/MI300).
 """
 
-import os
-
 import torch
 
 from vllm import _custom_ops as ops
@@ -189,21 +187,6 @@ class RDNA3W4A16LinearKernel(MPLinearKernel):
         out_shape = x.shape[:-1] + (c.partition_weight_shape[1],)
 
         w_q, w_s, w_zp, w_g_idx = self._get_weight_params(layer)
-
-        # Opt-in debug: VLLM_DEBUG_DTYPE=1 prints the actual dtype + shape
-        # arriving at this kernel per call. Useful to confirm whether the
-        # workload is hitting the fp16 path (no WMMA in current dispatch)
-        # or the bf16 path (WMMA M>=16). Once verified, unset the env var.
-        if os.environ.get("VLLM_DEBUG_DTYPE") == "1":
-            M = x_2d.size(0)
-            phase = "prefill" if M >= 16 else "decode"
-            print(
-                f"[RDNA3 W4A16] phase={phase} M={M} K={x_2d.size(1)} "
-                f"N={c.partition_weight_shape[1]} "
-                f"x.dtype={x.dtype} w_s.dtype={w_s.dtype} "
-                f"act_type={c.act_type}",
-                flush=True,
-            )
 
         # Same GPTQv1 vs v2 distinction as ExllamaLinearKernel — the
         # MPLinearLayerConfig doesn't carry format info, so we hardcode v1

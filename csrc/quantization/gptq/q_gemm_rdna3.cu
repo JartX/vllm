@@ -80,14 +80,36 @@ __forceinline__ __device__ float dot22_8_f(half2 (&dq)[4], const half* a_ptr) {
 
 __forceinline__ __device__ float dot22_8_f(bf162_t (&dq)[4],
                                            const bf16_t* a_ptr) {
-  bf162_t result;
-  result.x = __float2bfloat16(0.0f);
-  result.y = __float2bfloat16(0.0f);
-  const bf162_t* a2_ptr = (const bf162_t*)a_ptr;
+  // RDNA3 (gfx1100) lacks a packed bf16 FMA: there is no v_pk_fma_bf16 in
+  // the gfx11 ISA (it only landed on CDNA3+ / gfx94x and later). hipcc
+  // therefore lowers __hfma2(bf162_t, bf162_t, bf162_t) to a serialised
+  // fallback (single-element FMAs or fp32 round-trips), which empirically
+  // runs ~2× the cycle count of v_pk_fma_f16 on the same VALU. The bf16
+  // decode path was paying that tax in full, scaling linearly with M (the
+  // fp16 path scales sub-linearly because its v_pk_fma_f16 is full rate
+  // and the kernel becomes memory-bound).
+  //
+  // Fix: widen bf16 → fp32 explicitly (a left-shift by 16, free in VGPRs)
+  // and accumulate with v_fma_f32, which IS full rate on RDNA3. Same FMA
+  // count, but each FMA is fast. Bonus: the accumulator is now fp32
+  // throughout instead of bf16, which is also numerically more accurate
+  // (no compounding bf16-rounding inside the dot loop).
+  float result = 0.0f;
 #pragma unroll
-  for (int i = 0; i < 4; i++) result = __hfma2(dq[i], *a2_ptr++, result);
-  // .x / .y access works on both __hip_bfloat162 and __nv_bfloat162.
-  return __bfloat162float(result.x) + __bfloat162float(result.y);
+  for (int i = 0; i < 4; i++) {
+    uint32_t aw, dw;
+    __builtin_memcpy(&aw, a_ptr + 2 * i, sizeof(uint32_t));
+    __builtin_memcpy(&dw, &dq[i], sizeof(uint32_t));
+    // bf16 in low 16 bits  → fp32 by left-shifting into the upper half.
+    // bf16 in high 16 bits → already aligned with fp32's upper half.
+    float a_x = __uint_as_float((aw & 0xFFFFu) << 16);
+    float a_y = __uint_as_float(aw & 0xFFFF0000u);
+    float d_x = __uint_as_float((dw & 0xFFFFu) << 16);
+    float d_y = __uint_as_float(dw & 0xFFFF0000u);
+    result = __fmaf_rn(d_x, a_x, result);
+    result = __fmaf_rn(d_y, a_y, result);
+  }
+  return result;
 }
 
 // ---------------------------------------------------------------------------
