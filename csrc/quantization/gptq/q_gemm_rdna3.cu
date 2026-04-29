@@ -41,7 +41,11 @@ namespace vllm {
 namespace gptq_rdna3 {
 
 #define BLOCK_KN_SIZE 128
-#define THREADS_X 32
+// 128 threads per block (4 waves on RDNA3 wave32, 2 waves on wave64 / NVIDIA).
+// Each thread is responsible for 4 consecutive N columns, so a block covers
+// THREADS_X*4 = 512 N columns — matches BLOCK_KN_SIZE*4 in the grid.x stride.
+// Using 32 threads here would silently skip 3/4 of every block's N range.
+#define THREADS_X 128
 
 // ---------------------------------------------------------------------------
 // Per-dtype helpers. We avoid heavy template metaprogramming and just provide
@@ -115,31 +119,30 @@ __global__ void gemm_q4_kernel_rdna3(const T* __restrict__ a,
 
   __shared__ T block_a[M_COUNT][BLOCK_KN_SIZE];
 
-  // Stage A: each thread loads 1 element of A per row into LDS (with optional
-  // act-order permutation). Entire wave covers BLOCK_KN_SIZE/threads = 4 K
-  // elements per thread for THREADS_X=32, but exllama keeps it simple and
-  // assumes BLOCK_KN_SIZE == THREADS_X. To keep parity we also assume that.
-  static_assert(BLOCK_KN_SIZE == 4 * THREADS_X,
-                "BLOCK_KN_SIZE must equal 4*THREADS_X");
+  // Stage A: each thread loads 1 K element per row into LDS (with optional
+  // act-order permutation). THREADS_X == BLOCK_KN_SIZE so this is a 1:1 map.
+  static_assert(BLOCK_KN_SIZE == THREADS_X,
+                "BLOCK_KN_SIZE must equal THREADS_X (1 K element per thread)");
+  if (offset_k + t < end_k) {
 #pragma unroll
-  for (int km = 0; km < 4; ++km) {
-    int kk = km * THREADS_X + t;
-    if (offset_k + kk < end_k) {
-#pragma unroll
-      for (int m = 0; m < M_COUNT; ++m) {
-        const T* a_row = a + (offset_m + m) * size_k;
-        T av;
-        if (b_q_perm)
-          av = a_row[b_q_perm[offset_k + kk]];
-        else
-          av = a_row[offset_k + kk];
-        block_a[m][kk] = av;
-      }
+    for (int m = 0; m < M_COUNT; ++m) {
+      const T* a_row = a + (offset_m + m) * size_k;
+      T av;
+      if (b_q_perm)
+        av = a_row[b_q_perm[offset_k + t]];
+      else
+        av = a_row[offset_k + t];
+      block_a[m][t] = av;
     }
   }
 
-  if (n >= size_n) return;
+  // Threads beyond the right edge of N have nothing to do. Note: we must NOT
+  // return before __syncthreads() if any thread in the block participates in
+  // the LDS load above — but here all 128 threads always do, regardless of
+  // whether their `n` is in bounds. The early return below is safe because
+  // the LDS load doesn't depend on `n`, only on `t`/`offset_k`.
   __syncthreads();
+  if (n >= size_n) return;
 
   // Group bookkeeping. We require size_k % groups == 0 (groupsize divides K).
   const int groupsize = size_k / groups;
