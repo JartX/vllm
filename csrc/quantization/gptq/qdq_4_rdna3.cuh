@@ -162,6 +162,58 @@ __forceinline__ __device__ void dequant_4bit_8_bf16(uint32_t qa,
   dq[3] = __hfma2(q3.b2, y_prep, z_prep);
 }
 
+// ---------------------------------------------------------------------------
+// bf16-input → fp32-output dequant (RDNA3 scalar path).
+//
+// RDNA3 (gfx1100) has no v_pk_fma_bf16; packed bf16 FMA lowers to a slow
+// fallback. Rather than computing dq in bf16 and widening at FMA time in
+// the dot product, we widen to fp32 here once (a free left-shift by 16) and
+// emit the (q - zero) * scale FMA directly in fp32. This:
+//   * Replaces 4× slow bf16 packed FMA with 8× fast fp32 FMA per int32.
+//   * Eliminates 4× bf16→fp32 widens that the dot product would do.
+//   * Keeps the dot product accumulator in fp32 without a roundtrip.
+//
+// Output: fp32 dq[8], one element per K position (consumed by the
+// fp32-overload of dot22_8_f in q_gemm_rdna3.cu).
+__forceinline__ __device__ void prep_zero_scale_bf16_f32(uint32_t zero,
+                                                          bf16_t scale,
+                                                          float& z_prep,
+                                                          float& y_prep) {
+  float scale_f = __bfloat162float(scale);
+  z_prep = -(128.0f + (float)zero) * scale_f;
+  y_prep = scale_f;
+}
+
+__forceinline__ __device__ void dequant_4bit_8_bf16_f32(uint32_t qa,
+                                                         float (&dq)[8],
+                                                         float z_prep,
+                                                         float y_prep) {
+  const uint32_t c0 = 0x43004300;
+  const uint32_t q0 = ((qa >>  0) & 0x000F000F) | c0;
+  const uint32_t q1 = ((qa >>  4) & 0x000F000F) | c0;
+  const uint32_t q2 = ((qa >>  8) & 0x000F000F) | c0;
+  const uint32_t q3 = ((qa >> 12) & 0x000F000F) | c0;
+  // bf16(128+nibble) bits → fp32(128+nibble) bits via left-shift by 16
+  // (just zero-extends the mantissa from 7 to 23 bits; exponent preserved).
+  const float q0x = __uint_as_float((q0 & 0xFFFFu) << 16);
+  const float q0y = __uint_as_float(q0 & 0xFFFF0000u);
+  const float q1x = __uint_as_float((q1 & 0xFFFFu) << 16);
+  const float q1y = __uint_as_float(q1 & 0xFFFF0000u);
+  const float q2x = __uint_as_float((q2 & 0xFFFFu) << 16);
+  const float q2y = __uint_as_float(q2 & 0xFFFF0000u);
+  const float q3x = __uint_as_float((q3 & 0xFFFFu) << 16);
+  const float q3y = __uint_as_float(q3 & 0xFFFF0000u);
+  // dq[i] = q_f32 * scale + (-(128+zero)*scale) = (nibble - zero) * scale
+  dq[0] = __fmaf_rn(q0x, y_prep, z_prep);
+  dq[1] = __fmaf_rn(q0y, y_prep, z_prep);
+  dq[2] = __fmaf_rn(q1x, y_prep, z_prep);
+  dq[3] = __fmaf_rn(q1y, y_prep, z_prep);
+  dq[4] = __fmaf_rn(q2x, y_prep, z_prep);
+  dq[5] = __fmaf_rn(q2y, y_prep, z_prep);
+  dq[6] = __fmaf_rn(q3x, y_prep, z_prep);
+  dq[7] = __fmaf_rn(q3y, y_prep, z_prep);
+}
+
 }  // namespace gptq_rdna3
 }  // namespace vllm
 

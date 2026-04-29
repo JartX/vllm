@@ -41,11 +41,19 @@
 namespace vllm {
 namespace gptq_rdna3 {
 
-// BLOCK_KN_SIZE = 256 (was 128 in exllama). Each block now covers 256 K
+// BLOCK_KN_SIZE = 256 (was 128 in exllama). Each block covers 256 K
 // elements and THREADS_X*4 = 1024 N columns. For Qwen-class K=4096 this
 // halves gridDim.z (32 → 16) and therefore halves the atomic count per
 // output position vs the exllama default. THREADS_X=256 = 8 waves on RDNA3
 // wave32; with ~32 wave slots per CU we still fit 4 blocks per CU at peak.
+//
+// We tried BLOCK_KN_SIZE=512 (microbench bc.log on Qwen3.6-27B): bf16
+// improved 5-10% extra at large M (atomic CAS halved), but fp16 decode
+// regressed up to +40% on qkv-square (32 → 45 μs at M=1). Cause: 16
+// waves/block × 16 total blocks for [M=1, K=N=4096] only saturates ~8 of
+// the 96 CUs, breaking memory-latency hiding for the fp16 path that was
+// already at ~26% HBM peak. Reverted to 256; bf16 keeps most of its gains
+// from the fp32 dequant rewrite alone.
 #define BLOCK_KN_SIZE 256
 #define THREADS_X 256
 
@@ -108,6 +116,27 @@ __forceinline__ __device__ float dot22_8_f(bf162_t (&dq)[4],
     float d_y = __uint_as_float(dw & 0xFFFF0000u);
     result = __fmaf_rn(d_x, a_x, result);
     result = __fmaf_rn(d_y, a_y, result);
+  }
+  return result;
+}
+
+// fp32-input dot product: paired with dequant_4bit_8_bf16_f32 which already
+// produces fp32 dq[8]. Saves the bf16→fp32 widening that the bf162_t
+// overload above does for dq (still need to widen A from bf16). Wins more
+// at high N: the bf162_t version's per-call widening cost scales with the
+// number of dequants × M_COUNT × 4 dot calls; the fp32 version pays only
+// for A widening (M_COUNT × 4 × 4 widens, half as many).
+__forceinline__ __device__ float dot22_8_f(float (&dq)[8],
+                                           const bf16_t* a_ptr) {
+  float result = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    uint32_t aw;
+    __builtin_memcpy(&aw, a_ptr + 2 * i, sizeof(uint32_t));
+    float a_x = __uint_as_float((aw & 0xFFFFu) << 16);
+    float a_y = __uint_as_float(aw & 0xFFFF0000u);
+    result = __fmaf_rn(dq[2 * i + 0], a_x, result);
+    result = __fmaf_rn(dq[2 * i + 1], a_y, result);
   }
   return result;
 }
@@ -245,10 +274,12 @@ __global__ void gemm_q4_kernel_rdna3(const T* __restrict__ a,
   const uint32_t* b_ptr = b_q_weight + qk * size_n + n;
 
   // Per-column dequant constants. We hold one set of (z, y) pairs per column.
-  // For fp16 we need the exllama (z1z16, y1y16) double-pair; for bf16 a single
-  // (z, y) suffices because we shift each pair down to bits [3:0]/[19:16].
+  // fp16 uses the exllama (z1z16, y1y16) double-pair to enable the upper-
+  // nibble-*16 trick. bf16 uses fp32 scalars (z, y) because the dequant
+  // produces fp32 directly — see prep_zero_scale_bf16_f32 / the FMA
+  // bypass for the missing v_pk_fma_bf16 on gfx11.
   half2 z1z16_h[4][2], y1y16_h[4][2];
-  bf162_t z_b[4], y_b[4];
+  float z_b_f[4], y_b_f[4];
 
   auto refresh_group = [&](int g) {
     const uint32_t* qz_row = b_qzeros + g * (size_n / 8);
@@ -266,8 +297,8 @@ __global__ void gemm_q4_kernel_rdna3(const T* __restrict__ a,
     } else {
 #pragma unroll
       for (int i = 0; i < 4; ++i) {
-        prep_zero_scale_bf16((uint32_t)(zeros[i] + zero_offset), scales[i],
-                             z_b[i], y_b[i]);
+        prep_zero_scale_bf16_f32((uint32_t)(zeros[i] + zero_offset), scales[i],
+                                 z_b_f[i], y_b_f[i]);
       }
     }
   };
@@ -336,11 +367,14 @@ __global__ void gemm_q4_kernel_rdna3(const T* __restrict__ a,
           block_c[m][3] += dot22_8_f(dq[3], a_ptr);
         }
       } else {
-        bf162_t dq[4][4];
-        dequant_4bit_8_bf16((uint32_t)b_w[j].x, dq[0], z_b[0], y_b[0]);
-        dequant_4bit_8_bf16((uint32_t)b_w[j].y, dq[1], z_b[1], y_b[1]);
-        dequant_4bit_8_bf16((uint32_t)b_w[j].z, dq[2], z_b[2], y_b[2]);
-        dequant_4bit_8_bf16((uint32_t)b_w[j].w, dq[3], z_b[3], y_b[3]);
+        // fp32 dequant: avoids the slow packed bf16 FMA on gfx11. dq layout
+        // is flat fp32[8] per int32 weight (one element per K position).
+        // Resolved overload of dot22_8_f picks the float[8] variant below.
+        float dq[4][8];
+        dequant_4bit_8_bf16_f32((uint32_t)b_w[j].x, dq[0], z_b_f[0], y_b_f[0]);
+        dequant_4bit_8_bf16_f32((uint32_t)b_w[j].y, dq[1], z_b_f[1], y_b_f[1]);
+        dequant_4bit_8_bf16_f32((uint32_t)b_w[j].z, dq[2], z_b_f[2], y_b_f[2]);
+        dequant_4bit_8_bf16_f32((uint32_t)b_w[j].w, dq[3], z_b_f[3], y_b_f[3]);
 
 #pragma unroll
         for (int m = 0; m < M_COUNT; ++m) {
