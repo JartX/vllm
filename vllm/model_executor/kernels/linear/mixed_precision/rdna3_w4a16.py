@@ -33,6 +33,23 @@ from vllm.scalar_type import scalar_types
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
 
 
+def _resolve_wmma_op():
+    """Resolve the WMMA op once. Called from process_weights_after_loading,
+    BEFORE vLLM/Dynamo traces the forward pass (so the result is captured
+    as a constant during torch.compile rather than triggering an untrace
+    able setattr inside apply_weights)."""
+    if os.environ.get("VLLM_RDNA3_DISABLE_WMMA", "") == "1":
+        return None
+    return getattr(torch.ops._C, "gptq_gemm_rdna3_wmma", None)
+
+
+# Module-level cache: shared across all instances. Populated on first
+# process_weights_after_loading call. Sentinel "_uninitialized" → not yet
+# resolved. None → resolved and either env-disabled or the op doesn't
+# exist (use scalar). Op → use WMMA for M >= 16.
+_WMMA_OP_CACHE: object = "_uninitialized"
+
+
 class RDNA3W4A16LinearKernel(MPLinearKernel):
     SUPPORTED_QUANT_TYPES = [scalar_types.uint4b8]
 
