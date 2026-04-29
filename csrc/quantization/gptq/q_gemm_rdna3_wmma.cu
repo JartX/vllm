@@ -109,13 +109,18 @@ __device__ __forceinline__ bf16_t tzero<bf16_t>() {
 // ===========================================================================
 // WMMA kernel: 16M × 16N tile per block, 1 wave, full K traversal.
 //
-// Wave32 fragment layout (cross-checked against rocWMMA gfx11 wave32 backend):
-//   * A frag: lane t holds A[t & 15][0..15]; lanes 16..31 duplicate.
-//   * B frag: lane t holds B[0..15][t & 15]; lanes 16..31 duplicate.
-//     (Effectively column-major view of the 16x16 B tile.)
+// Wave32 fragment layout (RDNA3 ISA + AMD's WMMA samples):
+//   * A frag: lane t holds A[t & 15][0..15] — row (t & 15), all 16 cols.
+//   * B frag: lane t holds B[t & 15][0..15] — row (t & 15), all 16 cols.
+//     IMPORTANT: B is row-major per-lane just like A. The MMA hardware
+//     internally does the per-output column gather; the kernel does NOT
+//     load "column t of B" into lane t. (An earlier version of this file
+//     assumed column-major and produced numerically wrong results.)
 //   * C frag: lane t holds row (t & 15), 8 contiguous columns starting at
 //     column (lane >> 4) * 8. So lanes 0..15 → columns 0..7;
 //     lanes 16..31 → columns 8..15.
+//   * Lanes 16..31 duplicate lanes 0..15 for the input fragments
+//     (AMD's "doubled" fragment).
 // ===========================================================================
 
 template <typename T>
@@ -217,9 +222,12 @@ __global__ void gemm_q4_wmma_kernel(const T* __restrict__ a,
       for (int i = 0; i < 16; i++) a_frag[i] = (E)0;
     }
 
+    // B fragment: lane t holds row (t & 15) of the B tile, all 16 columns.
+    // Same row-major convention as A. The WMMA hardware does the per-output
+    // column gather internally; we must NOT pre-transpose to "column of B".
 #pragma unroll
     for (int i = 0; i < 16; i++) {
-      b_frag[i] = bitcast_elem<T, E>(b_lds[i][lane_lo]);
+      b_frag[i] = bitcast_elem<T, E>(b_lds[lane_lo][i]);
     }
 
     c_acc = wmma_mma(a_frag, b_frag, c_acc);
