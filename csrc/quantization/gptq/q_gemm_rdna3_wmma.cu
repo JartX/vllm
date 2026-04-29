@@ -49,13 +49,18 @@ namespace gptq_rdna3_wmma {
 
 #if defined(USE_ROCM)
 
-// Pull dequant primitives from the sibling namespace.
+// Pull dequant primitives from the sibling namespace. We use the *_precise
+// variants because the WMMA kernel can run with very small K (down to 16),
+// so the per-cell rounding error of the fast bit-trick (which amplifies
+// fp16(scale)≠scale by 1024×) does NOT average out — and shows up as visible
+// per-row error in the output. The scalar kernel keeps the fast variants
+// because its K is typically thousands of elements and errors average out.
 using vllm::gptq_rdna3::bf16_t;
 using vllm::gptq_rdna3::bf162_t;
-using vllm::gptq_rdna3::dequant_4bit_8_bf16;
-using vllm::gptq_rdna3::dequant_4bit_8_fp16;
-using vllm::gptq_rdna3::prep_zero_scale_bf16;
-using vllm::gptq_rdna3::prep_zero_scale_fp16;
+using vllm::gptq_rdna3::dequant_4bit_8_bf16_precise;
+using vllm::gptq_rdna3::dequant_4bit_8_fp16_precise;
+using vllm::gptq_rdna3::prep_zero_scale_bf16_precise;
+using vllm::gptq_rdna3::prep_zero_scale_fp16_precise;
 
 // Native AMDGPU vector types expected by the WMMA built-ins.
 using v16fp16 = _Float16 __attribute__((ext_vector_type(16)));
@@ -109,16 +114,17 @@ __device__ __forceinline__ bf16_t tzero<bf16_t>() {
 // ===========================================================================
 // WMMA kernel: 16M × 16N tile per block, 1 wave, full K traversal.
 //
-// Wave32 fragment layout (RDNA3 ISA + AMD's WMMA samples):
-//   * A frag: lane t holds A[t & 15][0..15] — row (t & 15), all 16 cols.
-//   * B frag: lane t holds B[t & 15][0..15] — row (t & 15), all 16 cols.
-//     IMPORTANT: B is row-major per-lane just like A. The MMA hardware
-//     internally does the per-output column gather; the kernel does NOT
-//     load "column t of B" into lane t. (An earlier version of this file
-//     assumed column-major and produced numerically wrong results.)
-//   * C frag: lane t holds row (t & 15), 8 contiguous columns starting at
-//     column (lane >> 4) * 8. So lanes 0..15 → columns 0..7;
-//     lanes 16..31 → columns 8..15.
+// Wave32 fragment layout (verified empirically with diagnostic tests):
+//   * A frag: lane t holds A[t & 15][0..15] — ROW (t & 15), all 16 cols.
+//   * B frag: lane t holds B[t & 15][0..15] — ROW (t & 15), all 16 cols.
+//     IMPORTANT: BOTH input fragments are row-major per lane on RDNA3
+//     wave32. Loading B as column-major produces C^T instead of C — the
+//     bug surfaces only on non-symmetric outputs (a layout test with a
+//     symmetric B matrix can't distinguish the two cases).
+//   * C frag: lane t holds row (t & 15), 8 elements that are NOT contiguous —
+//     they are EVEN-or-ODD columns determined by lane_hi:
+//       - lanes 0..15  → c_acc[i] = C[lane_lo][2*i]      (even cols)
+//       - lanes 16..31 → c_acc[i] = C[lane_lo][2*i + 1]  (odd cols)
 //   * Lanes 16..31 duplicate lanes 0..15 for the input fragments
 //     (AMD's "doubled" fragment).
 // ===========================================================================
@@ -171,10 +177,10 @@ __global__ void gemm_q4_wmma_kernel(const T* __restrict__ a,
       const int k_base = my_k_octet * 8;
 
       if constexpr (std::is_same<T, half>::value) {
-        half2 z1z16[2], y1y16[2];
-        prep_zero_scale_fp16(zero_v, scale_t, z1z16, y1y16);
+        half2 z_prep, y_prep;
+        prep_zero_scale_fp16_precise(zero_v, scale_t, z_prep, y_prep);
         half2 dq[4];
-        dequant_4bit_8_fp16(qa, dq, z1z16, y1y16);
+        dequant_4bit_8_fp16_precise(qa, dq, z_prep, y_prep);
         b_lds[k_base + 0][my_n] = __low2half(dq[0]);
         b_lds[k_base + 1][my_n] = __high2half(dq[0]);
         b_lds[k_base + 2][my_n] = __low2half(dq[1]);
@@ -185,9 +191,9 @@ __global__ void gemm_q4_wmma_kernel(const T* __restrict__ a,
         b_lds[k_base + 7][my_n] = __high2half(dq[3]);
       } else {
         bf162_t z_b, y_b;
-        prep_zero_scale_bf16(zero_v, scale_t, z_b, y_b);
+        prep_zero_scale_bf16_precise(zero_v, scale_t, z_b, y_b);
         bf162_t dq[4];
-        dequant_4bit_8_bf16(qa, dq, z_b, y_b);
+        dequant_4bit_8_bf16_precise(qa, dq, z_b, y_b);
         b_lds[k_base + 0][my_n] = dq[0].x;
         b_lds[k_base + 1][my_n] = dq[0].y;
         b_lds[k_base + 2][my_n] = dq[1].x;
@@ -222,34 +228,55 @@ __global__ void gemm_q4_wmma_kernel(const T* __restrict__ a,
       for (int i = 0; i < 16; i++) a_frag[i] = (E)0;
     }
 
-    // B fragment: lane t holds row (t & 15) of the B tile, all 16 columns.
-    // Same row-major convention as A. The WMMA hardware does the per-output
-    // column gather internally; we must NOT pre-transpose to "column of B".
+    // B fragment: lane t holds ROW (t & 15) of the B tile, all 16 columns.
+    // Both A and B are row-major per lane on RDNA3 wave32 — the WMMA
+    // hardware does the K-axis routing internally. Loading as column-major
+    // makes WMMA produce C^T (skew-symmetric error against C).
 #pragma unroll
     for (int i = 0; i < 16; i++) {
       b_frag[i] = bitcast_elem<T, E>(b_lds[lane_lo][i]);
     }
 
+#ifdef VLLM_WMMA_LAYOUT_DEBUG
+    // Diagnostic: skip WMMA, force c_acc to encode (lane, slot) so the
+    // store pattern reveals the C-output lane→matrix mapping. Compile with
+    // -DVLLM_WMMA_LAYOUT_DEBUG to enable. Output: c[m][n] = lane + slot/16.
+    (void)a_frag;
+    (void)b_frag;
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+      c_acc[i] = (float)lane + (float)i / 16.0f;
+    }
+    // Run only one K iteration in debug mode so c_acc isn't overwritten.
+    if (k_tile == 0) {
+      k_tile = size_k;  // exit loop on next check
+    }
+#else
     c_acc = wmma_mma(a_frag, b_frag, c_acc);
+#endif
 
     __syncthreads();  // before next iter overwrites b_lds
   }
 
   // ---- Store C ----
-  // C frag: lane t holds row (t & 15) at columns ((t >> 4) * 8) + 0..7.
+  // Lane t holds row (lane_lo), 8 elements at columns:
+  //   lane_hi == 0  →  cols 0, 2, 4, ..., 14   (even, parity 0)
+  //   lane_hi == 1  →  cols 1, 3, 5, ..., 15   (odd,  parity 1)
+  // c_acc[i] is the i-th element in that interleaved sequence — i.e.,
+  // c_acc[i] corresponds to actual column (2*i + lane_hi).
   const int out_m = m_tile + lane_lo;
-  const int out_n_base = n_tile + lane_hi * 8;
+  const int parity = lane_hi;  // 0 = even cols, 1 = odd cols
 
   if (out_m < size_m) {
-    T* out = c + out_m * size_n + out_n_base;
+    T* row_out = c + out_m * size_n;
 #pragma unroll
     for (int i = 0; i < 8; i++) {
-      const int out_n = out_n_base + i;
+      const int out_n = n_tile + 2 * i + parity;
       if (out_n < size_n) {
         if constexpr (std::is_same<T, half>::value) {
-          out[i] = __float2half_rn(c_acc[i]);
+          row_out[out_n] = __float2half_rn(c_acc[i]);
         } else {
-          out[i] = __float2bfloat16(c_acc[i]);
+          row_out[out_n] = __float2bfloat16(c_acc[i]);
         }
       }
     }
@@ -268,6 +295,204 @@ void launch_gemm_q4_wmma(const T* a, const uint32_t* b_q_weight,
   gemm_q4_wmma_kernel<T><<<grid, block, 0, stream>>>(
       a, b_q_weight, b_qzeros, b_scales, c, size_m, size_n, size_k, groups,
       zero_offset, b_q_perm);
+}
+
+// ===========================================================================
+// Layout probe kernel — diagnostic only.
+// Takes fp16 A[16,16] and B[16,16] directly (no dequant). Loads them into
+// the WMMA fragments under one of several layout hypotheses, runs WMMA, and
+// dumps c_acc[i] per lane to a flat fp32 output[32 * 8].
+// Mode selects how A and B are loaded:
+//   0: A row-major (a_frag[i] = A[lane_lo][i]),
+//      B row-major (b_frag[i] = B[lane_lo][i])
+//   1: A row-major,
+//      B col-major (b_frag[i] = B[i][lane_lo])
+//   2: A col-major (a_frag[i] = A[i][lane_lo]),
+//      B row-major
+//   3: A col-major,
+//      B col-major
+// With A = identity (16x16) and B with unique per-cell values, decoding the
+// dump tells us which C cell each c_acc[lane][i] holds.
+// ===========================================================================
+
+// Full-kernel dump probe: same code path as gemm_q4_wmma_kernel for ONE 16x16
+// output tile (block (0,0)) — dequant + LDS + WMMA — but writes c_acc[lane][i]
+// directly to a flat fp32 [32 * 8] dump instead of doing the interleaved
+// row store. Used to isolate whether c_acc is correct (store-mapping bug)
+// vs c_acc itself wrong (dequant/LDS/fragment-load bug).
+__global__ void gemm_q4_wmma_dump_kernel(
+    const half* __restrict__ a, const uint32_t* __restrict__ b_q,
+    const uint32_t* __restrict__ b_qzeros, const half* __restrict__ b_scales,
+    float* __restrict__ dump_out, const int size_m, const int size_n,
+    const int size_k, const int groups, const int zero_offset) {
+  const int lane = threadIdx.x;
+  const int lane_lo = lane & 15;
+  const int lane_hi = lane >> 4;
+
+  v8fp32 c_acc = {0, 0, 0, 0, 0, 0, 0, 0};
+  const int groupsize = size_k / groups;
+  __shared__ half b_lds[16][16];
+
+  for (int k_tile = 0; k_tile < size_k; k_tile += 16) {
+    const int my_n = lane_lo;
+    const int my_k_octet = lane_hi;
+    const int actual_n = my_n;
+
+    if (actual_n < size_n) {
+      const int qk_row = (k_tile / 8) + my_k_octet;
+      const uint32_t qa = b_q[qk_row * size_n + actual_n];
+
+      const int g = k_tile / groupsize;
+      const int qz_idx = g * (size_n / 8) + actual_n / 8;
+      const int qz_shift = (actual_n & 7) * 4;
+      const uint32_t zero_v =
+          ((b_qzeros[qz_idx] >> qz_shift) & 0xF) + (uint32_t)zero_offset;
+      const half scale_t = b_scales[g * size_n + actual_n];
+
+      const int k_base = my_k_octet * 8;
+
+      half2 z_prep, y_prep;
+      prep_zero_scale_fp16_precise(zero_v, scale_t, z_prep, y_prep);
+      half2 dq[4];
+      dequant_4bit_8_fp16_precise(qa, dq, z_prep, y_prep);
+      b_lds[k_base + 0][my_n] = __low2half(dq[0]);
+      b_lds[k_base + 1][my_n] = __high2half(dq[0]);
+      b_lds[k_base + 2][my_n] = __low2half(dq[1]);
+      b_lds[k_base + 3][my_n] = __high2half(dq[1]);
+      b_lds[k_base + 4][my_n] = __low2half(dq[2]);
+      b_lds[k_base + 5][my_n] = __high2half(dq[2]);
+      b_lds[k_base + 6][my_n] = __low2half(dq[3]);
+      b_lds[k_base + 7][my_n] = __high2half(dq[3]);
+    }
+
+    __syncthreads();
+
+    v16fp16 a_frag, b_frag;
+    const int m_row = lane_lo;
+
+    if (m_row < size_m) {
+      const half* a_row = a + m_row * size_k;
+#pragma unroll
+      for (int i = 0; i < 16; i++) {
+        half v = (k_tile + i < size_k) ? a_row[k_tile + i] : __float2half_rn(0.0f);
+        a_frag[i] = bitcast_elem<half, _Float16>(v);
+      }
+    } else {
+#pragma unroll
+      for (int i = 0; i < 16; i++) a_frag[i] = (_Float16)0;
+    }
+
+#pragma unroll
+    for (int i = 0; i < 16; i++) {
+      b_frag[i] = bitcast_elem<half, _Float16>(b_lds[lane_lo][i]);
+    }
+
+    c_acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_frag, b_frag, c_acc);
+
+    __syncthreads();
+  }
+
+#pragma unroll
+  for (int i = 0; i < 8; i++) {
+    dump_out[lane * 8 + i] = c_acc[i];
+  }
+}
+
+// LDS-content probe. Runs the same dequant + LDS-write path as the GEMM
+// kernel for a single 16x16 B tile, then has lane 0 dump all 256 b_lds cells
+// to global memory after __syncthreads. If the dump matches the expected
+// dequantized B[k][n], then dequant + LDS-write are correct and the bug is
+// in fragment load (b_frag = b_lds[lane_lo][i]) or the WMMA instruction.
+__global__ void wmma_lds_check_kernel(const uint32_t* __restrict__ b_q,
+                                      const uint32_t* __restrict__ b_qzeros,
+                                      const half* __restrict__ b_scales,
+                                      half* __restrict__ lds_dump,
+                                      const int size_n, const int size_k,
+                                      const int groups,
+                                      const int zero_offset) {
+  const int lane = threadIdx.x;
+  const int lane_lo = lane & 15;
+  const int lane_hi = lane >> 4;
+
+  const int groupsize = size_k / groups;
+  __shared__ half b_lds[16][16];
+
+  const int k_tile = 0;
+  const int my_n = lane_lo;
+  const int my_k_octet = lane_hi;
+  const int actual_n = my_n;
+
+  if (actual_n < size_n) {
+    const int qk_row = (k_tile / 8) + my_k_octet;
+    const uint32_t qa = b_q[qk_row * size_n + actual_n];
+
+    const int g = k_tile / groupsize;
+    const int qz_idx = g * (size_n / 8) + actual_n / 8;
+    const int qz_shift = (actual_n & 7) * 4;
+    const uint32_t zero_v =
+        ((b_qzeros[qz_idx] >> qz_shift) & 0xF) + (uint32_t)zero_offset;
+    const half scale_t = b_scales[g * size_n + actual_n];
+
+    const int k_base = my_k_octet * 8;
+
+    half2 z_prep, y_prep;
+    prep_zero_scale_fp16_precise(zero_v, scale_t, z_prep, y_prep);
+    half2 dq[4];
+    dequant_4bit_8_fp16_precise(qa, dq, z_prep, y_prep);
+    b_lds[k_base + 0][my_n] = __low2half(dq[0]);
+    b_lds[k_base + 1][my_n] = __high2half(dq[0]);
+    b_lds[k_base + 2][my_n] = __low2half(dq[1]);
+    b_lds[k_base + 3][my_n] = __high2half(dq[1]);
+    b_lds[k_base + 4][my_n] = __low2half(dq[2]);
+    b_lds[k_base + 5][my_n] = __high2half(dq[2]);
+    b_lds[k_base + 6][my_n] = __low2half(dq[3]);
+    b_lds[k_base + 7][my_n] = __high2half(dq[3]);
+  }
+
+  __syncthreads();
+
+  if (lane == 0) {
+    for (int k = 0; k < 16; k++) {
+      for (int n = 0; n < 16; n++) {
+        lds_dump[k * 16 + n] = b_lds[k][n];
+      }
+    }
+  }
+}
+
+__global__ void wmma_layout_probe_kernel(const half* a_in, const half* b_in,
+                                         float* dump_out, int mode) {
+  const int lane = threadIdx.x;
+  const int lane_lo = lane & 15;
+
+  v16fp16 a_frag, b_frag;
+#pragma unroll
+  for (int i = 0; i < 16; i++) {
+    half av, bv;
+    if (mode == 0) {
+      av = a_in[lane_lo * 16 + i];
+      bv = b_in[lane_lo * 16 + i];
+    } else if (mode == 1) {
+      av = a_in[lane_lo * 16 + i];
+      bv = b_in[i * 16 + lane_lo];
+    } else if (mode == 2) {
+      av = a_in[i * 16 + lane_lo];
+      bv = b_in[lane_lo * 16 + i];
+    } else {
+      av = a_in[i * 16 + lane_lo];
+      bv = b_in[i * 16 + lane_lo];
+    }
+    a_frag[i] = bitcast_elem<half, _Float16>(av);
+    b_frag[i] = bitcast_elem<half, _Float16>(bv);
+  }
+
+  v8fp32 c = {0, 0, 0, 0, 0, 0, 0, 0};
+  c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_frag, b_frag, c);
+
+#pragma unroll
+  for (int i = 0; i < 8; i++) {
+    dump_out[lane * 8 + i] = c[i];
+  }
 }
 
 #endif  // USE_ROCM
@@ -365,4 +590,111 @@ torch::Tensor gptq_gemm_rdna3_wmma(torch::Tensor a, torch::Tensor b_q_weight,
 #endif
 
   return c;
+}
+
+// Diagnostic probe: takes raw fp16 A[16,16] and B[16,16], runs a single WMMA
+// under the requested fragment-load hypothesis, returns fp32 [32, 8] dump of
+// c_acc[lane][i] per lane. Used to empirically identify the wave32 fragment
+// layout. Not for production use.
+// Diagnostic: runs the FULL gemm_q4_wmma path (dequant + LDS + WMMA) for a
+// single 16x16 output tile, dumps c_acc per lane to fp32 [32, 8]. Tells us
+// whether c_acc itself is correct or whether the bug is in the store mapping.
+torch::Tensor gptq_gemm_rdna3_wmma_dump(torch::Tensor a, torch::Tensor b_q_weight,
+                                        torch::Tensor b_qzeros,
+                                        torch::Tensor b_scales,
+                                        bool use_v2_format) {
+  TORCH_CHECK(a.is_cuda() && b_q_weight.is_cuda() && b_qzeros.is_cuda() &&
+              b_scales.is_cuda(), "all tensors must be CUDA");
+  TORCH_CHECK(a.scalar_type() == torch::kHalf, "a must be fp16");
+  TORCH_CHECK(b_scales.scalar_type() == torch::kHalf, "b_scales must be fp16");
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(a));
+  auto stream = at::cuda::getCurrentCUDAStream();
+
+  int size_m = (int)a.size(0);
+  int size_k = (int)a.size(1);
+  int size_n = (int)b_q_weight.size(1);
+  int groups = (int)b_qzeros.size(0);
+  const int zero_offset = use_v2_format ? 0 : 1;
+
+  auto opts = torch::TensorOptions().dtype(torch::kFloat32).device(a.device());
+  at::Tensor dump = torch::zeros({32, 8}, opts);
+
+#if defined(USE_ROCM)
+  vllm::gptq_rdna3_wmma::gemm_q4_wmma_dump_kernel<<<1, 32, 0, stream>>>(
+      (const half*)a.data_ptr(),
+      (const uint32_t*)b_q_weight.data_ptr(),
+      (const uint32_t*)b_qzeros.data_ptr(),
+      (const half*)b_scales.data_ptr(),
+      (float*)dump.data_ptr(),
+      size_m, size_n, size_k, groups, zero_offset);
+#else
+  TORCH_CHECK(false, "gptq_gemm_rdna3_wmma_dump is ROCm-only");
+#endif
+
+  return dump;
+}
+
+// Diagnostic: runs the dequant + LDS-write path, then dumps the entire
+// 16x16 b_lds tile to a fp16 [16, 16] tensor. Lets us verify dequant + LDS
+// produce correct B values before the WMMA reads them.
+torch::Tensor gptq_gemm_rdna3_wmma_lds_check(torch::Tensor b_q_weight,
+                                             torch::Tensor b_qzeros,
+                                             torch::Tensor b_scales,
+                                             bool use_v2_format) {
+  TORCH_CHECK(b_q_weight.is_cuda() && b_qzeros.is_cuda() && b_scales.is_cuda(),
+              "all tensors must be CUDA");
+  TORCH_CHECK(b_scales.scalar_type() == torch::kHalf,
+              "b_scales must be fp16");
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(b_q_weight));
+  auto stream = at::cuda::getCurrentCUDAStream();
+
+  int size_k = (int)b_q_weight.size(0) * 8;
+  int size_n = (int)b_q_weight.size(1);
+  int groups = (int)b_qzeros.size(0);
+  const int zero_offset = use_v2_format ? 0 : 1;
+
+  auto opts = torch::TensorOptions().dtype(torch::kHalf).device(b_q_weight.device());
+  at::Tensor dump = torch::zeros({16, 16}, opts);
+
+#if defined(USE_ROCM)
+  vllm::gptq_rdna3_wmma::wmma_lds_check_kernel<<<1, 32, 0, stream>>>(
+      (const uint32_t*)b_q_weight.data_ptr(),
+      (const uint32_t*)b_qzeros.data_ptr(),
+      (const half*)b_scales.data_ptr(),
+      (half*)dump.data_ptr(),
+      size_n, size_k, groups, zero_offset);
+#else
+  TORCH_CHECK(false, "gptq_gemm_rdna3_wmma_lds_check is ROCm-only");
+#endif
+
+  return dump;
+}
+
+torch::Tensor gptq_gemm_rdna3_wmma_probe(torch::Tensor a, torch::Tensor b,
+                                         int64_t mode) {
+  TORCH_CHECK(a.is_cuda() && b.is_cuda(), "a/b must be CUDA tensors");
+  TORCH_CHECK(a.scalar_type() == torch::kHalf, "a must be fp16");
+  TORCH_CHECK(b.scalar_type() == torch::kHalf, "b must be fp16");
+  TORCH_CHECK(a.dim() == 2 && a.size(0) == 16 && a.size(1) == 16,
+              "a must be 16x16");
+  TORCH_CHECK(b.dim() == 2 && b.size(0) == 16 && b.size(1) == 16,
+              "b must be 16x16");
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(a));
+  auto stream = at::cuda::getCurrentCUDAStream();
+
+  auto opts = torch::TensorOptions().dtype(torch::kFloat32).device(a.device());
+  at::Tensor dump = torch::zeros({32, 8}, opts);
+
+#if defined(USE_ROCM)
+  vllm::gptq_rdna3_wmma::wmma_layout_probe_kernel<<<1, 32, 0, stream>>>(
+      (const half*)a.data_ptr(), (const half*)b.data_ptr(),
+      (float*)dump.data_ptr(), (int)mode);
+#else
+  TORCH_CHECK(false, "gptq_gemm_rdna3_wmma_probe is ROCm-only");
+#endif
+
+  return dump;
 }
