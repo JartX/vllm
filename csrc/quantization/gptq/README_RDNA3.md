@@ -272,70 +272,85 @@ Prefill (M=64):
 
 ## Performance reference (RX 7900 XTX, Qwen3.6-27B-GPTQ-W4A16-G32, tp=2)
 
-End-to-end throughput on `evalscope perf openqa` (50 reqs, max-num-seqs=8):
+End-to-end throughput on `evalscope perf openqa` — 50 requests, concurrency
+100, prompt avg 30 tok, output avg ~1800 tok. Output dominates wall-time
+~60:1, so the steady-state decode regime determines TPS.
 
-| Config                                      | Concurrency 1 | Concurrency 100 |
-| ---                                         | ---           | ---             |
-| ExLlama fp16 (no bf16 support)              | (baseline)    | 255 tk/s        |
-| Triton W4A16 fp16                           | —             | 83 tk/s         |
-| Triton W4A16 bf16                           | —             | 82 tk/s         |
-| **RDNA3 W4A16 fp16**                        | par fp16      | **247 tk/s**    |
-| **RDNA3 W4A16 bf16** (initial branch)       | par fp16      | ~100 tk/s       |
-| **RDNA3 W4A16 bf16** (after this PR)        | par fp16      | **234 tk/s**    |
+| Kernel                          | max-num-seqs=8 | max-num-seqs=32 |
+| ---                             | ---            | ---             |
+| Triton W4A16 fp16               | 83.2 tk/s      | —               |
+| Triton W4A16 bf16               | 82.4 tk/s      | —               |
+| **ExLlama fp16** (no bf16)      | 255.0 tk/s     | 382.5 tk/s      |
+| **RDNA3 fp16** (this PR)        | **270.2 tk/s** | **445.7 tk/s**  |
+| **RDNA3 bf16** (this PR)        | 205.3 tk/s     | 345.6 tk/s      |
 
-The bf16 path under load was the last gap. Three stacked changes closed it
-(see lessons 7–8 below): packed atomic CAS-64, factored scale/zb fold for
-M_COUNT=1 decode, and col-outer `#pragma unroll 1` to free VGPR pressure
-in the M_COUNT=4/8 templates (decode batched). Net: bf16 gained +134%
-under load and now sits at ~95% of the best fp16 baseline (ExLlama).
+* **RDNA3 fp16 vs ExLlama fp16:** +5.9% at seqs=8, **+16.5% at seqs=32**.
+  ExLlama is the previous best fp16 GPTQ kernel on ROCm; RDNA3 W4A16
+  beats it at every concurrency tested.
+* **RDNA3 vs Triton same-dtype:** 3.2× at seqs=8 fp16, 2.5× at seqs=8
+  bf16. Triton's W4A16 path is 4-5× slower at this workload.
+* **bf16 has no fp16-class baseline to compare against.** ExLlama
+  doesn't support bf16 (we listed `ExLlamaLinearKernel Without BFLOAT16`
+  in the bench command above); Triton bf16 is 4.2× slower than RDNA3
+  bf16 at seqs=8. The bf16 path here replaces Triton's slow path for
+  users who need bf16 dynamic range or who serve models trained natively
+  in bf16.
 
-VGPR / spill audit at gfx1100 (`.note.AMDGPU.metadata` from the .so):
+### Note on M vs max-num-seqs
 
-| Kernel       | VGPR before | VGPR after | Spill before     | Spill after |
-| ---          | ---         | ---        | ---              | ---         |
-| bf16 M=1     | 82          | 41         | 0                | 0           |
-| bf16 M=2     | 138         | 56         | 0                | 0           |
-| bf16 M=4     | 192 (cap)   | 82         | 38 VGPR / 156 B  | **0**       |
-| bf16 M=8     | 192 (cap)   | 130        | 144 VGPR / 580 B | **0**       |
-| fp16 M=*     | unchanged   | unchanged  | 0                | 0           |
+Earlier doc revisions and several commit messages on this branch
+conflated `max-num-seqs` (a vLLM scheduler parameter capping concurrent
+sequences) with `M` (the matmul batch dim the kernel actually sees on
+each call). They are not the same:
 
-bf16 M=8 (the decode-batched template under load) went from 5 waves/SIMD
-with 144 VGPRs spilled to scratch every K-iteration, to ~7 waves/SIMD
-with zero scratch traffic. The fp16 path was already register-clean
+* During **decode** the engine batches up to `max-num-seqs` sequences
+  per step. M ≈ `running_batch_size`, capped at `max-num-seqs`.
+* During **prefill chunks** M = `chunk_token_count` (≤ the
+  `--max-num-batched-tokens` budget, default 2048). Far larger than
+  `max-num-seqs` even for short prompts.
+* During **mixed batches** M = `decode_seqs + prefill_chunk_tokens`.
+
+In this long-output bench (output 60× input) decode dominates wall-time
+and the steady-state M is close to `max-num-seqs`. So a serving config
+with `max-num-seqs=32` mostly exercises the kernel at M≈32 in decode
+plus brief prefill spikes at higher M. References below to "M=8" or
+"M=32" for serving benches refer to this steady-state.
+
+### VGPR / spill audit (gfx1100, `.note.AMDGPU.metadata`)
+
+| Kernel           | VGPR before | VGPR after | Spill before     | Spill after |
+| ---              | ---         | ---        | ---              | ---         |
+| bf16 M_COUNT=1   | 82          | 41         | 0                | 0           |
+| bf16 M_COUNT=2   | 138         | 56         | 0                | 0           |
+| bf16 M_COUNT=4   | 192 (cap)   | 82         | 38 VGPR / 156 B  | **0**       |
+| bf16 M_COUNT=8   | 192 (cap)   | 130        | 144 VGPR / 580 B | **0**       |
+| fp16 M_COUNT=*   | unchanged   | unchanged  | 0                | 0           |
+| bf16 WMMA        | 43          | 44         | 0                | 0           |
+| fp16 WMMA        | 35          | 43         | 0                | 0           |
+
+The scalar bf16 M_COUNT=8 template (decode batched at max-num-seqs ≥ 8
+and the M < 16 portion of max-num-seqs=32) went from 5 waves/SIMD with
+144 VGPRs spilled to scratch every K-iteration, to ~7 waves/SIMD with
+zero scratch traffic. The fp16 scalar path was already register-clean
 thanks to the `0x6400` bit-trick + `v_pk_fma_f16` (1 cycle/packed-FMA),
-and only the atomic-64 swap applies there.
+so only the atomic-64 swap and the `v_dot2_f32_f16` swap apply there.
 
-WMMA bf16 at M ≥ 16 (`gptq_gemm_rdna3_wmma`):
+### Cumulative bf16 path improvement
 
-| Workload (M=32, K=N=4096, output tk/s) | bf16 WMMA            | % of fp16 |
-| ---                                    | ---                  | ---       |
-| Initial branch                         | 187 tk/s             | 37%       |
-| Round 1 — single-wave latency fix      | 365 tk/s (+95%)      | 73%       |
-| Round 2 — K-split = 4 with atomic add  | **444 tk/s** (+21%)  | **89%**   |
-| fp16 scalar reference (same workload)  | 500 tk/s             | 100%      |
+The bf16 path on the initial branch was producing truncated outputs
+(~100 tk/s with malformed completions, indicative of numerical drift in
+the kernel). After the optimisations in this PR, bf16 produces correct
+output at the rates above:
 
-Total bf16 WMMA path improvement across the two rounds: **+137% (187 →
-444 tk/s)**. The path is now competitive with the fp16 scalar reference,
-trailing it by ~11% rather than the original ~63%.
-
-The dispatch sends bf16 to WMMA whenever M ≥ 16, which under realistic
-serving covers two regimes:
-
-* **Decode batched at high concurrency** — `evalscope perf` with
-  `concurrency 100` and `max-num-seqs 32` pushes the decode batch up to
-  M=32, well past the WMMA threshold. The 444 tk/s above is steady-state
-  output tokens during this batched-decode regime, not prefill TTFT.
-* **Prefill chunks** — long prompts batch through here too, but they
-  don't dominate the TPS metric in this bench.
-
-The remaining 11% gap to fp16 scalar at the same wave count (2048 waves,
-67% CU saturation in both) is likely a mix of WMMA-instruction issue
-latency (16-cycle, harder to back-to-back) and dequant-per-K density
-(WMMA needs a full 16x16 B tile materialised per K-step in LDS, vs the
-scalar path's lighter 4-col-per-thread-per-K dequant). Closing it would
-require structural changes (multi-wave per block + LDS-shared A across
-waves, or larger N tile per WMMA invocation), which are out of scope
-for this round.
+* **bf16 max-num-seqs=8** (mostly scalar M_COUNT=8 in decode, brief
+  WMMA spikes for prefill chunks): broken initial → 205.3 tk/s.
+  Lessons 6 (atomic CAS-64), 7 (factored scale/zb fold for M=1) and 8
+  (col-outer + `#pragma unroll 1`) are the contributing changes.
+* **bf16 max-num-seqs=32** (mix of scalar M_COUNT=8 for M=1..15 decode
+  + WMMA for M=16..32 decode + WMMA for all prefill chunks): broken
+  initial → 345.6 tk/s. Adds lessons 9 (WMMA single-wave latency fix)
+  and 10 (WMMA K-split with packed atomic) on top of the scalar
+  improvements.
 
 ## Diagnostic ops (registered, callable from Python)
 
@@ -521,7 +536,9 @@ stay `#pragma unroll`d for FMA pipelining within a col.
 Outcome: bf16 M_COUNT=8 went from 192 VGPRs + 144 spilled / 580 B
 scratch to 130 VGPRs / 0 spilled / 0 scratch. ~7 waves/SIMD vs 5
 previously; no more scratch IO in the inner loop. End-to-end bf16
-under load went from ~100 tk/s to 234 tk/s.
+went from broken/truncated outputs on the initial branch to the
+correct-output rates in the Performance reference table (205.3 tk/s
+at max-num-seqs=8, 345.6 tk/s at max-num-seqs=32).
 
 The same trick applied to the M_COUNT=1 factored path (`q_f32[8]`
 inside the col loop instead of `q_f32[4][8]` outside): VGPRs dropped
@@ -563,9 +580,12 @@ Two such operations were costing 95% of the wall-time:
   `__builtin_memcpy` lowered to two `global_load_b128` instructions
   drops this to ~400 cycles/K-tile (~102K cycles per block).
 
-Combined, the two changes took bf16 WMMA from 187 to 365 tk/s — same
-algorithm, same VGPR class, just removing the serial stalls that the
-single-wave layout had no way to hide.
+Combined, the two changes were the headline contributor to the bf16
+WMMA wall-time at max-num-seqs ≥ 32 — same algorithm, same VGPR class,
+just removing the serial stalls that the single-wave layout had no
+way to hide. See the Performance reference table for the end-to-end
+TPS impact (the bf16 path's max-num-seqs=32 number reflects this fix
+plus the K-split in lesson 10).
 
 **Implementation note for the A vectorise change:** memcpy into the
 whole vector (`__builtin_memcpy(&a_frag, ptr, 32)`), not into individual
@@ -573,19 +593,21 @@ elements. `&a_frag[0]` on `ext_vector_type` is not reliably a valid C
 pointer across compiler versions; building this on hipcc 7.2.1 fails
 with the per-element form. The whole-vector address works.
 
-The remaining gap to fp16 scalar (365 vs 500 tk/s) at this point was
-CU saturation: WMMA was 256 N-tiles × 1 wave = 512 waves at M=32, vs
-fp16 scalar's 2048 waves. Replicating the K-split structure in the
-WMMA kernel was the next attack — see lesson 10.
+The remaining bottleneck after this fix was CU saturation: WMMA was
+256 N-tiles × 1 wave = 512 waves at steady-state decode M≈32, vs the
+fp16 scalar path's 2048 waves at the same workload. Replicating the
+K-split structure in the WMMA kernel was the next attack — see
+lesson 10.
 
 ### 10. WMMA K-split with packed atomic write — closing the wave-count gap
 
-After the single-wave latency fix (lesson 9), the WMMA bf16 path was
-still trailing fp16 scalar by ~27% (365 vs 500 tk/s) because it ran
-only 512 waves vs fp16's 2048 — a 4× CU-saturation deficit. The fp16
-scalar kernel uses gridDim.z to split K into 16 segments with atomic
-write-back per output cell; this lesson replicates the same idea in
-the WMMA kernel at K_SPLIT=4 (capped to bound atomic contention).
+After the single-wave latency fix (lesson 9), the WMMA bf16 path still
+ran with low CU saturation: at typical Qwen-class shapes only 512
+waves were in flight vs the fp16 scalar path's 2048 at the same
+workload — a 4× wave-count deficit. The fp16 scalar kernel uses
+gridDim.z to split K into 16 segments with atomic write-back per
+output cell; this lesson replicates the same idea in the WMMA kernel
+at K_SPLIT=4 (capped to bound atomic contention).
 
 **Mechanism:** the kernel takes `gridDim.z = K_SPLIT` and each block
 processes a contiguous K-segment `[k_start, k_end) = [blockIdx.z *
@@ -620,26 +642,87 @@ instead of `torch::empty`. K_SPLIT == 1 keeps `torch::empty` (every
 cell assigned exactly once). The conditional adds zero-init cost only
 where it's actually needed.
 
-**Wall-time outcome (M=32, K=N=4096, bf16):**
+**Wall-time outcome:** the K-split is the change that takes the WMMA
+path the rest of the way to its current bf16 max-num-seqs=32 number
+in the Performance reference table (345.6 tk/s). The K-split moved the
+needle by 4×-ing the wave count and matching fp16 scalar's CU
+saturation; the residual gap to fp16 scalar at the same workload
+comes from WMMA-instruction issue latency (16-cycle pipeline depth)
+and a heavier per-K-tile dequant footprint (32 lanes × 4 dequants =
+128 dequant operations per K_tile, vs ~8 in the scalar M_COUNT=8
+path's K_tile-equivalent).
 
-```
-Before K-split (lesson 9 baseline):  365 tk/s  (73% of fp16 scalar)
-After  K-split = 4:                   444 tk/s  (89% of fp16 scalar)
-                                      +21.6%
-```
-
-VGPR audit: 45 → 44 (slight decrease, atomic helpers add little
+VGPR audit: 45 → 44 after the K-split (atomic helpers add little
 state). No spills introduced.
 
-**Why we left the last 11% on the table.** Same wave count, same
-CU saturation, fewer atomics per cell than fp16 scalar — bf16 WMMA
-should win at this point but trails 11%. The likely causes are
-WMMA-instruction issue latency (back-to-back WMMAs are limited by
-the 16-cycle pipeline depth) and a heavier per-K-tile dequant footprint
-(32 lanes × 4 dequants = 128 dequant operations per K_tile, vs ~8 in
-the scalar M_COUNT=8 path's K_tile-equivalent). Closing this gap
+**Why we don't try to close the residual gap further.** Closing it
 needs a structural change — multi-wave per block with LDS-shared A,
-or a larger N tile per WMMA invocation — which is out of scope.
+or a larger N tile per WMMA invocation — which is out of scope for
+this round. At the current bf16 numbers (TPS competitive with fp16
+within ~22%, vs broken/truncated outputs on the initial branch) the
+path is shippable as-is.
+
+### 11. fp16 scalar dot uses `v_dot2_f32_f16` directly
+
+The fp16 `dot22_8_f` originally accumulated in `half2` and cast to
+fp32 at the end:
+
+```
+half2 result = {};
+for i in 0..3: result = __hfma2(dq[i], a2[i], result);  // 4× v_pk_fma_f16
+return __half2float(low(result)) + __half2float(high(result));
+```
+
+That's 4 packed FMAs + 2 fp16→fp32 casts + a fp32 add per call. RDNA3
+has `v_dot2_f32_f16` (intrinsic `__builtin_amdgcn_fdot2`) which does
+`fp32 += a.x*b.x + a.y*b.y` in one instruction with the accumulator
+staying fp32 throughout. Replacing the loop with the intrinsic
+eliminates the trailing 2× `v_cvt_f32_f16` + `v_add_f32`:
+
+```
+float result = 0.0f;
+for i in 0..3: result = __builtin_amdgcn_fdot2(dq[i], a2[i], result, false);
+return result;
+```
+
+**Why hipcc doesn't peephole this for us.** ISA verification on the
+M_COUNT=8 kernel before the swap: 0 `v_dot2_f32_f16` instructions, 256
+`v_cvt_f32_f16`, and 218 `v_add_f32`. hipcc 7.2.1 does not recognise
+the `__hfma2 + cast + add` pattern as fdot2-equivalent (presumably
+because the half2 accumulator's bit-exact behaviour differs from
+fp32 accumulation when intermediates would round). The explicit
+intrinsic is required.
+
+**Wall-time outcome:**
+
+```
+fp16 max-num-seqs=8:   247 → 270.2 tk/s   (+9.3%)   (now beats ExLlama 255 by 5.9%)
+fp16 max-num-seqs=32:  402 → 445.7 tk/s   (+10.7%)  (now beats ExLlama 382 by 16.5%)
+```
+
+The microbench at the kernel level showed 47% (77 → 52.5 μs/call at
+M=32, K=N=4096), but only ~10% materialises in serving TPS because
+the kernel is not the only thing on the critical path.
+
+**Numerical bonus:** the new form keeps fp32 precision throughout
+the dot. The old form accumulated 8 muladds in fp16 (10-bit
+mantissa) before casting to fp32, which could lose ~3 bits of
+precision on borderline-magnitude intermediates.
+
+**Not applied to bf16.** gfx11 has no `v_dot2_f32_bf16` (that's
+CDNA3+). The bf16 `dot22_8_f` overload already widens to fp32 by
+left-shifting the bf16 bits and accumulates with `v_fma_f32` (full
+rate), which is the right shape for this hardware.
+
+**Not applied to fp16 → WMMA dispatch either.** A direct microbench
+showed fp16 WMMA was 47% faster than fp16 scalar+fdot2 at M=32, but
+end-to-end serving was a wash (440.7 vs 445.7 tk/s, within
+run-to-run variance). Most kernel time in real serving is decode at
+M < 16 (which falls back to scalar regardless of the dispatch
+guard) or memory-bound prefill where the WMMA compute-density
+advantage doesn't translate to TPS. The dispatch stays bf16-only;
+the standalone op `gptq_gemm_rdna3_wmma` remains callable for fp16
+in case a future workload makes it worthwhile.
 
 ## Known limitations / future work
 
