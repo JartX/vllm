@@ -184,6 +184,30 @@ __forceinline__ __device__ void prep_zero_scale_bf16_f32(uint32_t zero,
   y_prep = scale_f;
 }
 
+// Pure-q dequant for the M_COUNT=1 factored path: outputs the unscaled fp32
+// values 128+nibble, without folding scale/zero. The caller folds scale/zb
+// into the accumulator outside the inner loop using a precomputed sum_a,
+// which saves ~27% of the FMA count vs the per-col-dequant approach above
+// (only beneficial at M_COUNT=1; break-even at M_COUNT=2).
+//
+// Cost: 0 FMAs (pure bit-trick + as_float reinterprets).
+__forceinline__ __device__ void dequant_4bit_8_bf16_q_only(uint32_t qa,
+                                                            float (&q_f32)[8]) {
+  const uint32_t c0 = 0x43004300;
+  const uint32_t q0 = ((qa >>  0) & 0x000F000F) | c0;
+  const uint32_t q1 = ((qa >>  4) & 0x000F000F) | c0;
+  const uint32_t q2 = ((qa >>  8) & 0x000F000F) | c0;
+  const uint32_t q3 = ((qa >> 12) & 0x000F000F) | c0;
+  q_f32[0] = __uint_as_float((q0 & 0xFFFFu) << 16);
+  q_f32[1] = __uint_as_float(q0 & 0xFFFF0000u);
+  q_f32[2] = __uint_as_float((q1 & 0xFFFFu) << 16);
+  q_f32[3] = __uint_as_float(q1 & 0xFFFF0000u);
+  q_f32[4] = __uint_as_float((q2 & 0xFFFFu) << 16);
+  q_f32[5] = __uint_as_float(q2 & 0xFFFF0000u);
+  q_f32[6] = __uint_as_float((q3 & 0xFFFFu) << 16);
+  q_f32[7] = __uint_as_float(q3 & 0xFFFF0000u);
+}
+
 __forceinline__ __device__ void dequant_4bit_8_bf16_f32(uint32_t qa,
                                                          float (&dq)[8],
                                                          float z_prep,

@@ -141,37 +141,54 @@ __forceinline__ __device__ float dot22_8_f(float (&dq)[8],
 }
 
 // ---------------------------------------------------------------------------
-// Packed atomic-add via CAS-loop on the underlying uint32. RDNA3 (gfx11) does
-// NOT have native v_global_atomic_pk_add_f16 / _bf16 (those landed on gfx940
-// / gfx1250 respectively), so this lowers to global_atomic_cmpswap_b32 plus
-// retry. We use this in the kernel epilogue to write directly to fp16/bf16
-// output without going through an FP32 accumulator buffer + epilogue cast
-// pass — saves M*N*4 bytes of allocation, the memset, and a kernel launch
+// Packed atomic-add via CAS-loop on a 64-bit word (4 fp16/bf16 lanes per CAS).
+// RDNA3 (gfx11) does NOT have native v_global_atomic_pk_add_f16 / _bf16 (those
+// landed on gfx940 / gfx1250 respectively), so this lowers to
+// global_atomic_cmpswap_b64 plus retry. We use this in the kernel epilogue to
+// write 4 output columns per row in a single atomic operation — half the
+// atomic instruction count and half the contention vs two 32-bit CAS calls.
+//
+// Writing directly to fp16/bf16 (instead of through an FP32 scratch buffer +
+// cast pass) saves M*N*4 bytes of allocation, the memset, and a kernel launch
 // per matmul (~5-10 μs/call → 11-22% of decode budget at 50 tk/s).
+//
+// 64-bit alignment: the kernel writes at `out + n` where n = offset_n + t*4
+// (always multiple of 4), and partition_weight_shape[1] is required to be a
+// multiple of 8 by can_implement(), so every (m, n) write target is 8-byte
+// aligned. Required by global_atomic_cmpswap_b64.
 // ---------------------------------------------------------------------------
 
-__forceinline__ __device__ void atomic_add_pk_f16(half2* addr, half2 val) {
-  uint32_t* addr_u = reinterpret_cast<uint32_t*>(addr);
-  uint32_t old = *addr_u;
+__forceinline__ __device__ void atomic_add_pk4_f16(half* addr, half2 v01,
+                                                   half2 v23) {
+  unsigned long long* addr_u = reinterpret_cast<unsigned long long*>(addr);
+  unsigned long long old = *addr_u;
   while (true) {
-    half2 cur = *reinterpret_cast<half2*>(&old);
-    half2 sum = __hadd2(cur, val);
-    uint32_t sum_u = *reinterpret_cast<uint32_t*>(&sum);
-    uint32_t prev = atomicCAS(addr_u, old, sum_u);
+    union {
+      unsigned long long u;
+      half2 h2[2];
+    } cur, sum;
+    cur.u = old;
+    sum.h2[0] = __hadd2(cur.h2[0], v01);
+    sum.h2[1] = __hadd2(cur.h2[1], v23);
+    unsigned long long prev = atomicCAS(addr_u, old, sum.u);
     if (prev == old) break;
     old = prev;
   }
 }
 
-__forceinline__ __device__ void atomic_add_pk_bf16(bf162_t* addr,
-                                                   bf162_t val) {
-  uint32_t* addr_u = reinterpret_cast<uint32_t*>(addr);
-  uint32_t old = *addr_u;
+__forceinline__ __device__ void atomic_add_pk4_bf16(bf16_t* addr, bf162_t v01,
+                                                    bf162_t v23) {
+  unsigned long long* addr_u = reinterpret_cast<unsigned long long*>(addr);
+  unsigned long long old = *addr_u;
   while (true) {
-    bf162_t cur = *reinterpret_cast<bf162_t*>(&old);
-    bf162_t sum = __hadd2(cur, val);
-    uint32_t sum_u = *reinterpret_cast<uint32_t*>(&sum);
-    uint32_t prev = atomicCAS(addr_u, old, sum_u);
+    union {
+      unsigned long long u;
+      bf162_t b2[2];
+    } cur, sum;
+    cur.u = old;
+    sum.b2[0] = __hadd2(cur.b2[0], v01);
+    sum.b2[1] = __hadd2(cur.b2[1], v23);
+    unsigned long long prev = atomicCAS(addr_u, old, sum.u);
     if (prev == old) break;
     old = prev;
   }
@@ -365,34 +382,97 @@ __global__ void gemm_q4_kernel_rdna3(const T* __restrict__ a,
           block_c[m][2] += dot22_8_f(dq[2], a_ptr);
           block_c[m][3] += dot22_8_f(dq[3], a_ptr);
         }
-      } else {
-        // fp32 dequant: avoids the slow packed bf16 FMA on gfx11. dq layout
-        // is flat fp32[8] per int32 weight (one element per K position).
-        // Resolved overload of dot22_8_f picks the float[8] variant below.
-        float dq[4][8];
-        dequant_4bit_8_bf16_f32((uint32_t)b_w[j].x, dq[0], z_b_f[0], y_b_f[0]);
-        dequant_4bit_8_bf16_f32((uint32_t)b_w[j].y, dq[1], z_b_f[1], y_b_f[1]);
-        dequant_4bit_8_bf16_f32((uint32_t)b_w[j].z, dq[2], z_b_f[2], y_b_f[2]);
-        dequant_4bit_8_bf16_f32((uint32_t)b_w[j].w, dq[3], z_b_f[3], y_b_f[3]);
+      } else if constexpr (M_COUNT == 1) {
+        // Factored path (bf16 decode, M=1). The dequant produces q_f32 only
+        // (free bit-trick — 0 FMAs). We compute sum_a once across all 4 N
+        // cols and fold scale/zb_neg into the accumulator with 2 FMAs per
+        // col instead of paying the 8-FMA dequant per col. Net: 47 FMAs per
+        // int32 weight vs 64 in the per-col-dequant path (~27% reduction).
+        // Only profitable at M_COUNT=1; break-even is M_COUNT=2.
+        //
+        // Col-outer scoping: q_f32[8] is declared inside the col loop so
+        // the compiler can reuse the same 8 VGPRs across all 4 col
+        // iterations instead of holding [4][8] = 32 fp32 alive at once.
+        uint32_t w[4];
+        __builtin_memcpy(w, &b_w[j], sizeof(int4));
 
+        const bf16_t* a_ptr =
+            reinterpret_cast<const bf16_t*>(&block_a[0][a_off]);
+        // Widen 8 bf16 → fp32 once (free shifts), shared across all 4 N cols.
+        float a_f[8];
 #pragma unroll
-        for (int m = 0; m < M_COUNT; ++m) {
-          const bf16_t* a_ptr =
-              reinterpret_cast<const bf16_t*>(&block_a[m][a_off]);
-          block_c[m][0] += dot22_8_f(dq[0], a_ptr);
-          block_c[m][1] += dot22_8_f(dq[1], a_ptr);
-          block_c[m][2] += dot22_8_f(dq[2], a_ptr);
-          block_c[m][3] += dot22_8_f(dq[3], a_ptr);
+        for (int i = 0; i < 4; ++i) {
+          uint32_t aw;
+          __builtin_memcpy(&aw, a_ptr + 2 * i, sizeof(uint32_t));
+          a_f[2 * i + 0] = __uint_as_float((aw & 0xFFFFu) << 16);
+          a_f[2 * i + 1] = __uint_as_float(aw & 0xFFFF0000u);
+        }
+        // sum_a = Σa[i], computed once and reused across all 4 N cols.
+        // 7 fp32 adds (vs 4 cols × 8 FMAs of dequant = 32 FMAs saved).
+        float sum_a = a_f[0] + a_f[1] + a_f[2] + a_f[3] +
+                      a_f[4] + a_f[5] + a_f[6] + a_f[7];
+        // unroll 1 forces a real loop so the compiler must free q_f32 at
+        // each col-iter boundary instead of expanding the 4 cols into a
+        // straight-line block where all 4 q_f32 arrays are alive at once
+        // for ILP — that defeats the col-outer scoping. Loop overhead
+        // (counter + branch × 4) is negligible vs the dot FMAs.
+#pragma unroll 1
+        for (int col = 0; col < 4; ++col) {
+          float q_f32[8];
+          dequant_4bit_8_bf16_q_only(w[col], q_f32);
+          float partial = 0.0f;
+#pragma unroll
+          for (int i = 0; i < 8; ++i) {
+            partial = __fmaf_rn(q_f32[i], a_f[i], partial);
+          }
+          // block_c += y_b_f[col] * partial + z_b_f[col] * sum_a
+          //   y_b_f[col] = scale            (per-col scale)
+          //   z_b_f[col] = -(128+zero)*scale (per-col negative bias)
+          // Nested fmaf_rn keeps the dependency chain on 1 accumulator VGPR.
+          block_c[0][col] = __fmaf_rn(
+              y_b_f[col], partial,
+              __fmaf_rn(z_b_f[col], sum_a, block_c[0][col]));
+        }
+      } else {
+        // fp32 dequant: avoids the slow packed bf16 FMA on gfx11. dq is a
+        // flat fp32[8] per int32 weight (one element per K position).
+        // Resolved overload of dot22_8_f picks the float[8] variant.
+        //
+        // Col-outer scoping: dq is declared inside the col loop so the
+        // compiler can reuse the same 8 fp32 VGPRs across all 4 col
+        // iterations instead of holding [4][8] = 32 fp32 alive across
+        // the m-loop. Targets the M_COUNT=4/8 spills observed in the
+        // VGPR audit (38/144 VGPRs spilled to scratch with the previous
+        // all-cols-alive structure, hitting the 192-VGPR cap).
+        uint32_t w[4];
+        __builtin_memcpy(w, &b_w[j], sizeof(int4));
+        // unroll 1 forces a real loop so the compiler must free dq at each
+        // col-iter boundary instead of expanding the 4 cols into a
+        // straight-line block where all 4 dq arrays are alive at once for
+        // ILP — that defeats the col-outer scoping that targets the
+        // M_COUNT=4/8 spills. Loop overhead is negligible vs the m-loop's
+        // dot FMAs.
+#pragma unroll 1
+        for (int col = 0; col < 4; ++col) {
+          float dq[8];
+          dequant_4bit_8_bf16_f32(w[col], dq, z_b_f[col], y_b_f[col]);
+#pragma unroll
+          for (int m = 0; m < M_COUNT; ++m) {
+            const bf16_t* a_ptr =
+                reinterpret_cast<const bf16_t*>(&block_a[m][a_off]);
+            block_c[m][col] += dot22_8_f(dq, a_ptr);
+          }
         }
       }
     }
     k += 32;  // 4 weight words * 8 nibbles = 32 K elements
   }
 
-  // Pack the 4 FP32 partial sums into 2 packed pairs and atomically add them
-  // directly into the T-typed output (caller pre-zeros it). On gfx11 the
-  // packed atomic is a CAS-loop on uint32, but we save the FP32 buffer +
-  // memset + cast pass that we'd otherwise need.
+  // Pack the 4 FP32 partial sums into 2 packed pairs and atomically add all
+  // four lanes in a single 64-bit CAS write directly to the T-typed output
+  // (caller pre-zeros it). On gfx11 the packed atomic is a CAS-loop, but with
+  // a single b64 op we halve the atomic instruction count vs two b32 CAS
+  // calls, AND save the FP32 buffer + memset + cast pass entirely.
 #pragma unroll
   for (int m = 0; m < M_COUNT; ++m) {
     if (offset_m + m >= size_m) continue;  // skip padding rows past size_m
@@ -402,8 +482,7 @@ __global__ void gemm_q4_kernel_rdna3(const T* __restrict__ a,
                                  __float2half_rn(block_c[m][1]));
       half2 r23 = __halves2half2(__float2half_rn(block_c[m][2]),
                                  __float2half_rn(block_c[m][3]));
-      atomic_add_pk_f16(reinterpret_cast<half2*>(out + 0), r01);
-      atomic_add_pk_f16(reinterpret_cast<half2*>(out + 2), r23);
+      atomic_add_pk4_f16(out, r01, r23);
     } else {
       bf162_t r01;
       r01.x = __float2bfloat16(block_c[m][0]);
@@ -411,8 +490,7 @@ __global__ void gemm_q4_kernel_rdna3(const T* __restrict__ a,
       bf162_t r23;
       r23.x = __float2bfloat16(block_c[m][2]);
       r23.y = __float2bfloat16(block_c[m][3]);
-      atomic_add_pk_bf16(reinterpret_cast<bf162_t*>(out + 0), r01);
-      atomic_add_pk_bf16(reinterpret_cast<bf162_t*>(out + 2), r23);
+      atomic_add_pk4_bf16(out, r01, r23);
     }
   }
 }
