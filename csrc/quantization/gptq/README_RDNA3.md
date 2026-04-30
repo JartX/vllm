@@ -305,6 +305,19 @@ with zero scratch traffic. The fp16 path was already register-clean
 thanks to the `0x6400` bit-trick + `v_pk_fma_f16` (1 cycle/packed-FMA),
 and only the atomic-64 swap applies there.
 
+WMMA bf16 prefill (`gptq_gemm_rdna3_wmma`, M ≥ 16):
+
+| Shape (M=32, K=N=4096)        | bf16 WMMA throughput |
+| ---                           | ---                  |
+| Initial branch                | 187 tk/s             |
+| After single-wave latency fix | **365 tk/s** (+95%)  |
+| fp16 scalar reference         | 500 tk/s             |
+
+The fp16 scalar reference is the same workload going through the scalar
+M_COUNT=8 template at gridDim.y=4 (= 4×) — the WMMA path still trails it
+because of single-wave-per-block giving only ~17% CU saturation vs the
+scalar's ~67%. Closing that gap requires K-split (next round, untested).
+
 ## Diagnostic ops (registered, callable from Python)
 
 For kernel correctness debugging only — not used in production paths:
@@ -495,6 +508,58 @@ The same trick applied to the M_COUNT=1 factored path (`q_f32[8]`
 inside the col loop instead of `q_f32[4][8]` outside): VGPRs dropped
 82 → 41. Generally: when scope-inside-loop alone doesn't reduce
 pressure on AMDGPU, force a real loop with `#pragma unroll 1`.
+
+**Caveat — does not apply universally:** tried the same col-outer +
+`#pragma unroll 1` on the fp16 scalar path expecting the +12 VGPRs
+(110 → ~98 at M_COUNT=8) to cross an occupancy threshold. Wall-time
+regressed 247 → 200 tk/s (−19%) in the same evalscope bench. fp16 was
+register-clean (no spills), so the trade-off was pure ILP loss vs
+marginal occupancy gain — and the AMD compiler had been interleaving
+the 4 independent col-dot accumulator chains, which `unroll 1` killed.
+Reverted. Heuristic: only apply when the audit shows
+`.vgpr_spill_count > 0` or `.private_segment_fixed_size > 0`. Without
+spills, trust the compiler's ILP scheduling.
+
+### 9. WMMA single-wave block: every stall blocks the whole block
+
+`gemm_q4_wmma_kernel` launches with `dim3 block(32)` = exactly one
+wave32. There is no second wave to overlap with stalls, which makes the
+kernel uniquely sensitive to long-latency operations in the K-loop.
+Two such operations were costing 95% of the wall-time:
+
+* **`__syncthreads()` × 2 per K-iteration.** A single-wave block has
+  no inter-wave concurrency to synchronize, but the explicit barrier
+  still emits `s_barrier` and stalls the wave (~30 cycles). The
+  compiler-inserted `s_waitcnt lgkmcnt(0)` already orders dependent
+  ds_write/ds_read pairs within a wave (including across-lane reads —
+  e.g., lane 0 reading what lane 16 wrote into b_lds[8..15][0]). Over
+  256 K-iterations on K=4096 that's ~15K wasted cycles per block.
+
+* **Sequential A-row global loads.** Each lane loaded its 16
+  fp16/bf16 A elements with 16 separate `global_load_b16`. Each load
+  has ~200 cycles of HBM latency. With one wave there is no other
+  wave to schedule during the wait — every load is a serial stall
+  against the same wave. That's ~3200 cycles/K-tile × 256 K-tiles =
+  ~819K cycles per block. Replacing with a 32-byte bulk
+  `__builtin_memcpy` lowered to two `global_load_b128` instructions
+  drops this to ~400 cycles/K-tile (~102K cycles per block).
+
+Combined, the two changes took bf16 WMMA from 187 to 365 tk/s — same
+algorithm, same VGPR class, just removing the serial stalls that the
+single-wave layout had no way to hide.
+
+**Implementation note for the A vectorise change:** memcpy into the
+whole vector (`__builtin_memcpy(&a_frag, ptr, 32)`), not into individual
+elements. `&a_frag[0]` on `ext_vector_type` is not reliably a valid C
+pointer across compiler versions; building this on hipcc 7.2.1 fails
+with the per-element form. The whole-vector address works.
+
+The remaining gap to fp16 scalar (365 vs 500 tk/s) is CU saturation:
+WMMA is 256 N-tiles × 1 wave = 512 waves at M=32, vs fp16 scalar's
+2048 waves. The scalar path has gridDim.y splitting M into 4 row-blocks
+and gridDim.z splitting K into 16 K-blocks (with atomic write-back).
+Replicating the K-split in the WMMA kernel would 4× the wave count
+and is the next attack.
 
 ## Known limitations / future work
 
