@@ -279,7 +279,14 @@ __global__ void gemm_q4_wmma_kernel(const T* __restrict__ a,
       }
     }
 
-    __syncthreads();
+    // No __syncthreads() needed: the launch is `dim3 block(32)` = exactly one
+    // wave32, so there is no inter-wave concurrency. Within a wave the
+    // compiler emits `s_waitcnt lgkmcnt(0)` between dependent ds_write/ds_read
+    // pairs automatically, so cross-lane LDS reads (lane 0 reading what
+    // lane 16 wrote into b_lds[8..15][0]) still observe the writes. Keeping
+    // the explicit `__syncthreads()` would emit a wave-level `s_barrier` that
+    // costs ~10-20 cycles every iteration but provides no semantic guarantee
+    // we don't already have for free in single-wave mode.
 
     // ---- Build A and B fragments, run WMMA ----
     V16 a_frag, b_frag;
@@ -287,15 +294,24 @@ __global__ void gemm_q4_wmma_kernel(const T* __restrict__ a,
 
     if (m_row < size_m) {
       const T* a_row = a + m_row * size_k;
+      if (b_q_perm) {
+        // Permuted (act-order): scattered global reads, no vectorization.
 #pragma unroll
-      for (int i = 0; i < 16; i++) {
-        T v;
-        if (k_tile + i < size_k) {
-          v = b_q_perm ? a_row[b_q_perm[k_tile + i]] : a_row[k_tile + i];
-        } else {
-          v = tzero<T>();
+        for (int i = 0; i < 16; i++) {
+          T v = a_row[b_q_perm[k_tile + i]];
+          a_frag[i] = bitcast_elem<T, E>(v);
         }
-        a_frag[i] = bitcast_elem<T, E>(v);
+      } else {
+        // Sequential A reads: replace 16 single-element global_load_b16 with
+        // a bulk 32-byte copy. The AMDGPU backend lowers a memcpy of this
+        // size + alignment to two `global_load_b128` instructions. size_k is
+        // a multiple of 16 (TORCH_CHECK above) and k_tile increments by 16,
+        // so k_tile + 16 is always within bounds — no tail handling needed.
+        // Note: we memcpy into the whole vector (`&a_frag`) rather than
+        // `&a_frag[0]`; ext_vector_type element addresses aren't reliably
+        // valid C pointers across compiler versions.
+        static_assert(sizeof(a_frag) == 32, "V16 must be 32 bytes (16 × 2)");
+        __builtin_memcpy(&a_frag, a_row + k_tile, sizeof(a_frag));
       }
     } else {
 #pragma unroll
@@ -329,7 +345,10 @@ __global__ void gemm_q4_wmma_kernel(const T* __restrict__ a,
     c_acc = wmma_mma(a_frag, b_frag, c_acc);
 #endif
 
-    __syncthreads();  // before next iter overwrites b_lds
+    // No __syncthreads() needed before the next iter overwrites b_lds:
+    // single-wave block, and the next iter's ds_write to b_lds is preceded
+    // by a `s_waitcnt lgkmcnt(0)` from the compiler that ensures the WMMA's
+    // ds_read of b_frag has completed before the new ds_write issues.
   }
 
   // ---- Store C ----
