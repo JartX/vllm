@@ -78,11 +78,26 @@ __forceinline__ __device__ bf16_t tzero<bf16_t>() {
 }
 
 __forceinline__ __device__ float dot22_8_f(half2 (&dq)[4], const half* a_ptr) {
-  half2 result = {};
+  // RDNA3 has v_dot2_f32_f16 (`__builtin_amdgcn_fdot2`) which computes
+  // fp32 += a.x*b.x + a.y*b.y in a single instruction with the accumulator
+  // staying in fp32 throughout. hipcc 7.2 does NOT peephole the obvious
+  // `__hfma2 + cast + add` pattern into v_dot2 (verified by ISA
+  // disassembly: 0 v_dot2_f32_f16 vs 256 v_cvt_f32_f16 + 218 v_add_f32 in
+  // the M_COUNT=8 kernel before this change), so we issue the builtin
+  // explicitly. Saves the trailing 2× v_cvt_f32_f16 + v_add_f32 (3 ops)
+  // per dot22_8_f call vs the half2-accumulator form. With 128 calls per
+  // K=32 step that's ~384 ops/K-step less issue pressure on the VALU.
+  //
+  // Numerical bonus: accumulator stays fp32 throughout the dot. The old
+  // form accumulated 8 muladds in fp16 (10-bit mantissa) before casting,
+  // which could lose ~3 bits of precision on borderline magnitudes.
+  float result = 0.0f;
   const half2* a2_ptr = (const half2*)a_ptr;
 #pragma unroll
-  for (int i = 0; i < 4; i++) result = __hfma2(dq[i], *a2_ptr++, result);
-  return __half2float(__low2half(result)) + __half2float(__high2half(result));
+  for (int i = 0; i < 4; i++) {
+    result = __builtin_amdgcn_fdot2(dq[i], *a2_ptr++, result, /*clamp=*/false);
+  }
+  return result;
 }
 
 __forceinline__ __device__ float dot22_8_f(bf162_t (&dq)[4],
@@ -601,7 +616,10 @@ torch::Tensor gptq_gemm_rdna3(torch::Tensor a, torch::Tensor b_q_weight,
   // scalar is compute-bound (extra shifts in dequant), so WMMA wins from
   // M=16 onward. The fp16 WMMA path stays available via the standalone op
   // gptq_gemm_rdna3_wmma for direct callers / future kernel tuning, but is
-  // not auto-dispatched here until the kernel hits >2x scalar at fp16.
+  // not auto-dispatched here — at end-to-end serving the WMMA path matched
+  // (within run-to-run variance) the fp16 scalar+fdot2 path despite a
+  // 47% kernel-microbench advantage; the scalar path's lower complexity
+  // wins.
   if (a.scalar_type() == torch::kBFloat16 &&
       a.dim() == 2 && b_q_weight.dim() == 2 && a.size(0) >= 16 &&
       a.size(1) % 16 == 0 && b_q_weight.size(1) % 16 == 0) {
