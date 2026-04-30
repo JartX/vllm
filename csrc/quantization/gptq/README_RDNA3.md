@@ -305,18 +305,37 @@ with zero scratch traffic. The fp16 path was already register-clean
 thanks to the `0x6400` bit-trick + `v_pk_fma_f16` (1 cycle/packed-FMA),
 and only the atomic-64 swap applies there.
 
-WMMA bf16 prefill (`gptq_gemm_rdna3_wmma`, M ≥ 16):
+WMMA bf16 at M ≥ 16 (`gptq_gemm_rdna3_wmma`):
 
-| Shape (M=32, K=N=4096)        | bf16 WMMA throughput |
-| ---                           | ---                  |
-| Initial branch                | 187 tk/s             |
-| After single-wave latency fix | **365 tk/s** (+95%)  |
-| fp16 scalar reference         | 500 tk/s             |
+| Workload (M=32, K=N=4096, output tk/s) | bf16 WMMA            | % of fp16 |
+| ---                                    | ---                  | ---       |
+| Initial branch                         | 187 tk/s             | 37%       |
+| Round 1 — single-wave latency fix      | 365 tk/s (+95%)      | 73%       |
+| Round 2 — K-split = 4 with atomic add  | **444 tk/s** (+21%)  | **89%**   |
+| fp16 scalar reference (same workload)  | 500 tk/s             | 100%      |
 
-The fp16 scalar reference is the same workload going through the scalar
-M_COUNT=8 template at gridDim.y=4 (= 4×) — the WMMA path still trails it
-because of single-wave-per-block giving only ~17% CU saturation vs the
-scalar's ~67%. Closing that gap requires K-split (next round, untested).
+Total bf16 WMMA path improvement across the two rounds: **+137% (187 →
+444 tk/s)**. The path is now competitive with the fp16 scalar reference,
+trailing it by ~11% rather than the original ~63%.
+
+The dispatch sends bf16 to WMMA whenever M ≥ 16, which under realistic
+serving covers two regimes:
+
+* **Decode batched at high concurrency** — `evalscope perf` with
+  `concurrency 100` and `max-num-seqs 32` pushes the decode batch up to
+  M=32, well past the WMMA threshold. The 444 tk/s above is steady-state
+  output tokens during this batched-decode regime, not prefill TTFT.
+* **Prefill chunks** — long prompts batch through here too, but they
+  don't dominate the TPS metric in this bench.
+
+The remaining 11% gap to fp16 scalar at the same wave count (2048 waves,
+67% CU saturation in both) is likely a mix of WMMA-instruction issue
+latency (16-cycle, harder to back-to-back) and dequant-per-K density
+(WMMA needs a full 16x16 B tile materialised per K-step in LDS, vs the
+scalar path's lighter 4-col-per-thread-per-K dequant). Closing it would
+require structural changes (multi-wave per block + LDS-shared A across
+waves, or larger N tile per WMMA invocation), which are out of scope
+for this round.
 
 ## Diagnostic ops (registered, callable from Python)
 
@@ -554,12 +573,73 @@ elements. `&a_frag[0]` on `ext_vector_type` is not reliably a valid C
 pointer across compiler versions; building this on hipcc 7.2.1 fails
 with the per-element form. The whole-vector address works.
 
-The remaining gap to fp16 scalar (365 vs 500 tk/s) is CU saturation:
-WMMA is 256 N-tiles × 1 wave = 512 waves at M=32, vs fp16 scalar's
-2048 waves. The scalar path has gridDim.y splitting M into 4 row-blocks
-and gridDim.z splitting K into 16 K-blocks (with atomic write-back).
-Replicating the K-split in the WMMA kernel would 4× the wave count
-and is the next attack.
+The remaining gap to fp16 scalar (365 vs 500 tk/s) at this point was
+CU saturation: WMMA was 256 N-tiles × 1 wave = 512 waves at M=32, vs
+fp16 scalar's 2048 waves. Replicating the K-split structure in the
+WMMA kernel was the next attack — see lesson 10.
+
+### 10. WMMA K-split with packed atomic write — closing the wave-count gap
+
+After the single-wave latency fix (lesson 9), the WMMA bf16 path was
+still trailing fp16 scalar by ~27% (365 vs 500 tk/s) because it ran
+only 512 waves vs fp16's 2048 — a 4× CU-saturation deficit. The fp16
+scalar kernel uses gridDim.z to split K into 16 segments with atomic
+write-back per output cell; this lesson replicates the same idea in
+the WMMA kernel at K_SPLIT=4 (capped to bound atomic contention).
+
+**Mechanism:** the kernel takes `gridDim.z = K_SPLIT` and each block
+processes a contiguous K-segment `[k_start, k_end) = [blockIdx.z *
+K/K_SPLIT, (blockIdx.z+1) * K/K_SPLIT)`. K_SPLIT blocks contribute a
+partial sum to each 16x16 output tile and the epilogue writes them
+atomically. Total wave count multiplies by K_SPLIT — for the typical
+Qwen-class K=4096 case, 512 → 2048 waves at gridDim.z = 4, matching
+fp16 scalar's wave count exactly.
+
+**Atomic contention management.** gfx11 has no native packed atomic
+add for fp16/bf16, so the epilogue uses a CAS-32 retry loop on a
+uint32 word covering 2 adjacent fp16/bf16 lanes. Without further care
+this would have intra-block contention: lanes lane_lo and lane_lo+1
+would target the same uint32 every iteration. To avoid this, the
+even lane uses `__shfl_xor(c_acc[i], 1)` to pull the odd lane's value
+across the wave, packs both values into a half2/bf162, and issues a
+single atomic CAS — the odd lane skips the write. This halves the
+atomic count (from 256 to 128 per block) and eliminates intra-block
+contention. The remaining 4-way inter-block contention from K_SPLIT=4
+is the unavoidable cost.
+
+**K_SPLIT heuristic:** `compute_wmma_k_split(K)` returns 4 if K ≥
+1024 and K % 64 == 0, 2 if K ≥ 512 and K % 32 == 0, else 1. K_SPLIT
+must divide K/16 cleanly. Typical Qwen shapes (K ∈ {4096, 5120,
+11008}) all hit K_SPLIT = 4. K_SPLIT = 1 falls back to direct write
+with no atomics — useful for small K where the per-block constant
+overhead would dominate the work.
+
+**Output zero-init:** with K_SPLIT > 1 multiple writers contend on
+each cell, so the output tensor is allocated via `torch::zeros`
+instead of `torch::empty`. K_SPLIT == 1 keeps `torch::empty` (every
+cell assigned exactly once). The conditional adds zero-init cost only
+where it's actually needed.
+
+**Wall-time outcome (M=32, K=N=4096, bf16):**
+
+```
+Before K-split (lesson 9 baseline):  365 tk/s  (73% of fp16 scalar)
+After  K-split = 4:                   444 tk/s  (89% of fp16 scalar)
+                                      +21.6%
+```
+
+VGPR audit: 45 → 44 (slight decrease, atomic helpers add little
+state). No spills introduced.
+
+**Why we left the last 11% on the table.** Same wave count, same
+CU saturation, fewer atomics per cell than fp16 scalar — bf16 WMMA
+should win at this point but trails 11%. The likely causes are
+WMMA-instruction issue latency (back-to-back WMMAs are limited by
+the 16-cycle pipeline depth) and a heavier per-K-tile dequant footprint
+(32 lanes × 4 dequants = 128 dequant operations per K_tile, vs ~8 in
+the scalar M_COUNT=8 path's K_tile-equivalent). Closing this gap
+needs a structural change — multi-wave per block with LDS-shared A,
+or a larger N tile per WMMA invocation — which is out of scope.
 
 ## Known limitations / future work
 

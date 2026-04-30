@@ -22,9 +22,13 @@
 //     lanes 0..15 for the input fragments. The output C fragment splits
 //     across the wave: lanes 0..15 hold columns 0..7 of one row each,
 //     lanes 16..31 hold columns 8..15.
-//   * No native v_global_atomic_pk_add_{f16,bf16} on gfx11; we sidestep
-//     this entirely by giving each block exclusive ownership of its
-//     16M × 16N output tile (no split-K, no atomic).
+//   * No native v_global_atomic_pk_add_{f16,bf16} on gfx11; the K-split
+//     epilogue (gridDim.z > 1) emulates packed atomic add via a CAS-32
+//     retry loop on a uint32 word covering 2 fp16/bf16 lanes. Within a
+//     block we shuffle adjacent lanes via shfl_xor first so each pair of
+//     output cols goes through a single atomic — no intra-block
+//     contention. K_SPLIT == 1 keeps the original direct-write path with
+//     each block owning its 16M × 16N output tile.
 
 #include <cstdint>
 
@@ -120,6 +124,65 @@ __forceinline__ __device__ void dequant_4bit_8_bf16_precise(uint32_t qa,
   dq[1] = __hmul2(__hsub2(q1.b2, z_prep), y_prep);
   dq[2] = __hmul2(__hsub2(q2.b2, z_prep), y_prep);
   dq[3] = __hmul2(__hsub2(q3.b2, z_prep), y_prep);
+}
+
+// ---------------------------------------------------------------------------
+// Packed atomic-add helpers used by the K-split epilogue.
+//
+// When the kernel is launched with gridDim.z > 1, multiple K-segments
+// accumulate into the same 16x16 output tile and need atomic write-back.
+// gfx11 has no native v_global_atomic_pk_add_{f16,bf16}, so we issue a
+// CAS-loop on a 32-bit word covering 2 packed fp16/bf16 lanes. Within a
+// block the kernel pairs adjacent lanes via shfl_xor first, so each pair
+// of cols (n=lane_lo even, lane_lo+1) goes through a SINGLE atomic — no
+// intra-block contention on the same uint32 target. Inter-block
+// contention from gridDim.z (4-way at K_SPLIT=4) is the residual cost.
+// ---------------------------------------------------------------------------
+
+__forceinline__ __device__ void atomic_add_pk_f16(half2* addr, half2 val) {
+  uint32_t* addr_u = reinterpret_cast<uint32_t*>(addr);
+  uint32_t old = *addr_u;
+  while (true) {
+    half2 cur;
+    __builtin_memcpy(&cur, &old, sizeof(cur));
+    half2 sum = __hadd2(cur, val);
+    uint32_t sum_u;
+    __builtin_memcpy(&sum_u, &sum, sizeof(sum_u));
+    uint32_t prev = atomicCAS(addr_u, old, sum_u);
+    if (prev == old) break;
+    old = prev;
+  }
+}
+
+__forceinline__ __device__ void atomic_add_pk_bf16(bf162_t* addr,
+                                                   bf162_t val) {
+  uint32_t* addr_u = reinterpret_cast<uint32_t*>(addr);
+  uint32_t old = *addr_u;
+  while (true) {
+    bf162_t cur;
+    __builtin_memcpy(&cur, &old, sizeof(cur));
+    bf162_t sum = __hadd2(cur, val);
+    uint32_t sum_u;
+    __builtin_memcpy(&sum_u, &sum, sizeof(sum_u));
+    uint32_t prev = atomicCAS(addr_u, old, sum_u);
+    if (prev == old) break;
+    old = prev;
+  }
+}
+
+// K-split factor heuristic. Returns the gridDim.z to use for a given K.
+// Aim: each block does at least ~16 K-tiles (= K=256) so the per-block
+// constant overhead (LDS init, kernel prologue) is amortised. Upper
+// bound K_SPLIT=4 to cap inter-block atomic contention to 4-way.
+//
+// For typical Qwen-class shapes K ∈ {4096, 5120, 11008}, all return 4.
+// Smaller K (e.g., embedding lookups) fall back to 1 (no split, no
+// atomic). K must be divisible by (K_SPLIT × 16) for the split to be
+// valid; the heuristic checks divisibility before raising the factor.
+__host__ __device__ static inline int compute_wmma_k_split(int size_k) {
+  if (size_k >= 1024 && size_k % 64 == 0) return 4;
+  if (size_k >= 512 && size_k % 32 == 0) return 2;
+  return 1;
 }
 
 // Native AMDGPU vector types expected by the WMMA built-ins.
@@ -227,10 +290,25 @@ __global__ void gemm_q4_wmma_kernel(const T* __restrict__ a,
 
   const int groupsize = size_k / groups;
 
+  // K-split: each block in the gridDim.z dimension processes a contiguous
+  // K-segment [k_start, k_end). With gridDim.z > 1, multiple blocks
+  // accumulate into the same output tile and need atomic write-back at
+  // the end. With gridDim.z == 1 the kernel falls back to the original
+  // behaviour: full K range, single writer per cell, direct write.
+  //
+  // The split multiplies the wave count by gridDim.z and proportionally
+  // raises CU saturation — this is the dominant lever for closing the
+  // throughput gap to the fp16 scalar kernel at M >= 16, which already
+  // uses K-split natively (gridDim.z = K/256). At gridDim.z = 4 with
+  // K=4096, WMMA jumps from 17% to ~67% wave-slot saturation.
+  const int k_per_split = size_k / gridDim.z;
+  const int k_start = blockIdx.z * k_per_split;
+  const int k_end = k_start + k_per_split;
+
   // LDS tile of dequantized B. 16 K rows × 16 N cols.
   __shared__ T b_lds[16][16];
 
-  for (int k_tile = 0; k_tile < size_k; k_tile += 16) {
+  for (int k_tile = k_start; k_tile < k_end; k_tile += 16) {
     // ---- Dequant 16x16 B tile into LDS ----
     // 32 lanes split 16 N cols × 2 K-octets per col = 32 dequant tasks.
     const int my_n = lane_lo;
@@ -357,18 +435,58 @@ __global__ void gemm_q4_wmma_kernel(const T* __restrict__ a,
   //   lane_hi == 0  →  rows 0, 2, 4, ..., 14   (even rows)
   //   lane_hi == 1  →  rows 1, 3, 5, ..., 15   (odd rows)
   // c_acc[i] corresponds to actual row m = 2*i + lane_hi at column lane_lo.
-  const int out_n = n_tile + lane_lo;
-
-  if (out_n < size_n) {
+  if (gridDim.z > 1) {
+    // K-split path: 4 (or whatever the split factor is) K-segments per
+    // output cell contend → atomic accumulation. Caller has zero-init'd c.
+    //
+    // Pair-shuffle to avoid intra-block CAS contention: lanes lane_lo and
+    // lane_lo+1 share the same uint32 atomic target (4 bytes = 2 fp16),
+    // so without pairing they'd hammer the same word. Instead, swap the
+    // c_acc[i] value with the lane_lo+1 neighbour via shfl_xor and have
+    // ONLY the even lane issue a single packed CAS. Inter-block contention
+    // (gridDim.z-way per cell) remains and is the residual atomic cost.
+    const bool is_even_lane = (lane_lo & 1) == 0;
+    const int out_n_pair = n_tile + lane_lo;  // valid only on even lane
 #pragma unroll
     for (int i = 0; i < 8; i++) {
+      // Wave-wide shuffle: every lane participates so the side-effect is
+      // visible. Only even lanes use the result. shfl_xor with mask 1
+      // swaps with the lane_lo XOR 1 neighbour (same lane_hi → same row).
+      float other_f = __shfl_xor(c_acc[i], 1);
+      if (!is_even_lane) continue;
+
       const int out_m = m_tile + 2 * i + lane_hi;
-      if (out_m < size_m) {
-        T* dst = c + out_m * size_n + out_n;
-        if constexpr (std::is_same<T, half>::value) {
-          *dst = __float2half_rn(c_acc[i]);
-        } else {
-          *dst = __float2bfloat16(c_acc[i]);
+      if (out_m >= size_m || out_n_pair >= size_n) continue;
+
+      T* dst = c + out_m * size_n + out_n_pair;
+      if constexpr (std::is_same<T, half>::value) {
+        // Pack: .x = mine (col=lane_lo even), .y = neighbour (col=lane_lo+1)
+        half2 packed = __halves2half2(__float2half_rn(c_acc[i]),
+                                      __float2half_rn(other_f));
+        atomic_add_pk_f16(reinterpret_cast<half2*>(dst), packed);
+      } else {
+        bf162_t packed;
+        packed.x = __float2bfloat16(c_acc[i]);
+        packed.y = __float2bfloat16(other_f);
+        atomic_add_pk_bf16(reinterpret_cast<bf162_t*>(dst), packed);
+      }
+    }
+  } else {
+    // gridDim.z == 1: single writer per cell, direct non-atomic write.
+    // Caller can leave c uninitialised (torch::empty) since every cell is
+    // assigned exactly once.
+    const int out_n = n_tile + lane_lo;
+    if (out_n < size_n) {
+#pragma unroll
+      for (int i = 0; i < 8; i++) {
+        const int out_m = m_tile + 2 * i + lane_hi;
+        if (out_m < size_m) {
+          T* dst = c + out_m * size_n + out_n;
+          if constexpr (std::is_same<T, half>::value) {
+            *dst = __float2half_rn(c_acc[i]);
+          } else {
+            *dst = __float2bfloat16(c_acc[i]);
+          }
         }
       }
     }
@@ -381,9 +499,12 @@ void launch_gemm_q4_wmma(const T* a, const uint32_t* b_q_weight,
                          const int* b_q_perm, T* c, int size_m, int size_n,
                          int size_k, int groups, int zero_offset,
                          cudaStream_t stream) {
-  // 1 wave per block (32 lanes), 16x16 C tile per block.
+  // 1 wave per block (32 lanes), 16x16 C tile per block. gridDim.z splits
+  // K so that more blocks (and therefore more waves) are in flight; with
+  // K_SPLIT > 1 the kernel switches to atomic write-back at the epilogue.
+  const int k_split = compute_wmma_k_split(size_k);
   dim3 block(32);
-  dim3 grid((size_n + 15) / 16, (size_m + 15) / 16, 1);
+  dim3 grid((size_n + 15) / 16, (size_m + 15) / 16, k_split);
   gemm_q4_wmma_kernel<T><<<grid, block, 0, stream>>>(
       a, b_q_weight, b_qzeros, b_scales, c, size_m, size_n, size_k, groups,
       zero_offset, b_q_perm);
@@ -646,8 +767,14 @@ torch::Tensor gptq_gemm_rdna3_wmma(torch::Tensor a, torch::Tensor b_q_weight,
   TORCH_CHECK(size_k % 16 == 0, "WMMA path requires K % 16 == 0");
 
   auto opts = torch::TensorOptions().dtype(a.dtype()).device(a.device());
-  // No atomics, so no zero-init needed.
-  at::Tensor c = torch::empty({size_m, size_n}, opts);
+  // The kernel uses atomic write-back when K-split is enabled (gridDim.z>1
+  // for K_SPLIT > 1). In that case the output must be pre-zeroed because
+  // multiple K-segments add into each cell. For K_SPLIT == 1 the kernel
+  // does a direct write per cell and an empty buffer is fine.
+  const bool need_zero_init =
+      vllm::gptq_rdna3_wmma::compute_wmma_k_split(size_k) > 1;
+  at::Tensor c = need_zero_init ? torch::zeros({size_m, size_n}, opts)
+                                : torch::empty({size_m, size_n}, opts);
 
   const int* g_idx_ptr = nullptr;
   if (!b_g_idx.device().is_meta() && b_g_idx.numel() > 0) {
