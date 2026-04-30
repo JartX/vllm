@@ -1,0 +1,452 @@
+# RDNA3 W4A16 GPTQ Kernels (gfx1100)
+
+Drop-in replacement for `ExllamaLinearKernel` / `TritonW4A16LinearKernel`
+on AMD RDNA3 (RX 7900 XT/XTX, gfx1100/gfx1101/gfx1102). Provides:
+
+* a hand-tuned scalar dot-product kernel for decode + small batches, and
+* a `v_wmma_f32_16x16x16` matrix-instruction kernel for bf16 prefill.
+
+Registered as `RDNA3W4A16LinearKernel` in
+`vllm/model_executor/kernels/linear/mixed_precision/rdna3_w4a16.py` ahead of
+the Triton kernel for the ROCm path; falls through on non-RDNA3 ROCm
+devices via `can_implement()` gating on `vllm.platforms.rocm.on_gfx11()`.
+
+## Files
+
+| File | Role |
+| --- | --- |
+| `q_gemm_rdna3.cu` | Scalar dot-product kernel + C++ dispatch entry `gptq_gemm_rdna3` |
+| `q_gemm_rdna3_wmma.cu` | WMMA prefill kernel + 3 diagnostic ops |
+| `qdq_4_rdna3.cuh` | int4 dequant helpers (fp16 bit-trick, bf16 fp32-output) |
+
+## Dispatch (decision tree)
+
+The `torch.ops._C.gptq_gemm_rdna3` op is the **single Python entry point**.
+All branching happens in C++ to keep `apply_weights` torch.compile-friendly:
+
+```
+gptq_gemm_rdna3(a, b_q_weight, b_qzeros, b_scales, b_g_idx, use_v2_format)
+│
+├── if dtype == bf16 and M >= 16 and N % 16 == 0 and K % 16 == 0
+│       → gptq_gemm_rdna3_wmma  (v_wmma_f32_16x16x16_bf16_w32, prefill)
+│
+└── else
+        → scalar dot-product kernel (decode + fp16 prefill + small batches)
+```
+
+**Why bf16-only WMMA?** Microbench across 5 Qwen-class shapes × M ∈ {1..256}
+showed the fp16 scalar path (with the exllama bit-trick) beats the current
+WMMA implementation at every M because fp16 dequant is essentially free
+and the kernel becomes memory-bound at ~26% HBM peak. The WMMA kernel
+underperforms because:
+
+* 1 wave per block / 16×16 output tile → ~10% CU occupancy at typical
+  prefill grid sizes
+* No LDS-shared A across waves; each wave reloads from global
+* No K-pipelining; `__syncthreads()` twice per K iteration
+
+For bf16 the picture is different: `bf16` scalar pays a tax for the
+missing `v_pk_fma_bf16` on gfx11 (the kernel uses fp32 widening to
+sidestep, see below), but WMMA wins consistently at M ≥ 16 by 1.5-2×
+because it avoids per-element FMAs entirely.
+
+## Kernel architecture
+
+### Compute paths overview
+
+```
+================================================================================
+                    RDNA3 GPTQ W4A16 COMPUTE PATHS (gfx1100)
+================================================================================
+
+                       [ C++ ENTRY: gptq_gemm_rdna3 ]
+                            (single Python entry)
+                                      │
+                ┌─────────────────────┴─────────────────────┐
+                │  dtype == bf16                            │
+                │  AND M >= 16                              │
+                │  AND N % 16 == 0  AND  K % 16 == 0        │
+                └────────┬─────────────────────────┬────────┘
+                         │ FALSE                   │ TRUE
+                         ▼                         ▼
+================================================================================
+        SCALAR PATH                       WMMA PATH
+        gemm_q4_kernel_rdna3<T,M_COUNT>   gemm_q4_wmma_kernel<T>
+        (decode + fp16 prefill            (bf16 prefill, M >= 16,
+         + small M < 16)                   compute-bound win)
+================================================================================
+
+ BLOCK STRUCTURE                          BLOCK STRUCTURE
+  - 256 threads (8 waves x 32 lanes)       - 32 threads = 1 wave-group
+  - all 256 lanes active                   - lanes 0..15 unique inputs
+                                           - lanes 16..31 hold COPIES
+                                             (RDNA3 doubled wave32 conv.)
+
+ TILE PER BLOCK                           TILE PER BLOCK
+  M_COUNT rows x 1024 N x 256 K            16 M rows x 16 N x full-K
+  ┌─────────────────────────────┐          ┌──────────┐
+M │      1024 N columns         │ K=256  M │ 16 N     │ K = full
+  │   (4 N cols per thread)     │ (1/16    │  cols    │ (no K-split,
+  └─────────────────────────────┘  of K)   └──────────┘  one block
+                                                          owns the
+                                                          16x16 tile)
+
+ GRID                                     GRID
+  (N/1024, M/M_COUNT, K/256)               (N/16, M/16, 1)
+   gridDim.z splits K -> atomic acc         NO K-split, NO atomics
+
+ CORE EXECUTION  (per outer K=32 iter)    CORE EXECUTION  (per K=16 step)
+  for k in 0..256 step 32:                  for k_tile in 0..K step 16:
+   ┌─────────────────────────────┐           ┌─────────────────────────────┐
+   │ uint4 weight load (4 ints)  │           │ Cooperative dequant:        │
+   │ bit-trick dequant 32 weights│           │   32 lanes do 32 dequants   │
+   │   fp16: 0x6400 + FMA        │           │   -> 16 N x 16 K B-tile in  │
+   │   bf16: 0x4300 + fp32 widen │           │      LDS                    │
+   │ 4 dot22_8 vs LDS A          │           │ build a_frag, b_frag        │
+   │   (4 packed FMAs each)      │           │ v_wmma_f32_16x16x16         │
+   └─────────────────────────────┘           │   (one hw matrix instr)     │
+                                             └─────────────────────────────┘
+
+ OUTPUT WRITE                             OUTPUT WRITE
+  K/BLOCK_KN_SIZE blocks contend per        Single block owns the 16x16
+  output position                           output tile
+   atomicCAS-pk (uint32 CAS retry           direct store to global C
+   loop -- gfx11 has no v_global_           (lanes 0..15 store EVEN rows
+   atomic_pk_add_{f16,bf16})                 lanes 16..31 store ODD rows)
+
+
+================================================================================
+                            COMPUTE DENSITY COMPARISON
+================================================================================
+| Metric                       | Scalar                   | WMMA                |
+|------------------------------|--------------------------|---------------------|
+| Threads per block            | 256 (8 waves)            | 32 (1 wave)         |
+| Lanes doing distinct work    | 256                      | 16 (rest duplicate) |
+| Block muladds per K=16 step  | ~4096 (256 thr x 16 mad) | 4096 (1 v_wmma op)  |
+| Cycles for those muladds     | ~32-64 (multi-issue)     | ~16                 |
+| Per-wave peak throughput     | 64 packed-FMA muladds/c  | 256 muladds/cycle   |
+| Atomics per output position  | K / BLOCK_KN_SIZE        | 0                   |
+|                              | (16 for K=4096)          |                     |
+| Memory pattern (per block)   | vec int4 weight loads    | coalesced weight    |
+|                              | + LDS A + atomic CAS     | + LDS B broadcast   |
+| Best regime                  | memory-bound, small M,   | compute-bound bf16  |
+|                              | fp16 always              | prefill (M >= 16)   |
+================================================================================
+
+BEST FOR
+  Scalar:                                  WMMA:
+    - decode (M=1) — high concurrency        - bf16 prefill (M >= 16) — bypass
+      across 256 threads x many blocks         the slow __hfma2(bf162_t,...)
+    - fp16 always — bit-trick + free           on gfx11 (no v_pk_fma_bf16 in
+      v_pk_fma_f16 keep it memory-bound        HW; the scalar path falls
+      at ~26 % HBM peak; WMMA can't beat       back to a fp32 widen path)
+      that on this kernel                    - 1.5-2x scalar at M=16..256
+    - any small M < 16 — too little          - direct store to C, no atomic
+      work to fill a WMMA tile                 CAS retries
+                                             - fp16 prefill DOESN'T win here
+                                               yet — see "Why WMMA helps
+                                               bf16..." below
+================================================================================
+```
+
+### RDNA3 wave32 fragment layout (lane × slot mapping)
+
+This is the part that took the longest to nail down. AMD's wave32 WMMA
+uses a "doubled" input convention — lanes 16..31 hold a copy of lanes
+0..15. The output, in contrast, is split between halves.
+
+```
+A frag input (16 fp16/bf16 elements per lane):
+═══════════════════════════════════════════════
+  lane t holds:   a_frag[i] = A[lane_lo][k = i]
+                  with lane_lo = t & 15
+
+  Lane axis encodes M (A's row index)
+  Slot axis encodes K (depth axis aligned with B)
+
+       slot 0  slot 1  slot 2  ... slot 15
+       ──────  ──────  ──────  ── ──────
+  L 0  A[0][0] A[0][1] A[0][2] ... A[0][15]   ┐
+  L 1  A[1][0] A[1][1] A[1][2] ... A[1][15]   │ lanes 0..15
+  ...                                          │ hold rows 0..15
+  L15  A[15][0] ......         ... A[15][15]  ┘
+  L16  A[0][0] ........        ... A[0][15]   ┐
+  L17  A[1][0]                     A[1][15]   │ lanes 16..31
+  ...                                          │ DUPLICATE 0..15
+  L31  A[15][0] .....          ... A[15][15]  ┘
+
+
+B frag input (16 elements per lane, COL-major):
+════════════════════════════════════════════════
+  lane t holds:   b_frag[i] = B[k = i][lane_lo]
+                  with lane_lo = t & 15
+
+  Lane axis encodes N (B's column index)
+  Slot axis encodes K (same as A — enables per-lane inner products)
+
+       slot 0  slot 1  slot 2  ... slot 15
+       ──────  ──────  ──────  ── ──────
+  L 0  B[0][0] B[1][0] B[2][0] ... B[15][0]   ┐
+  L 1  B[0][1] B[1][1] B[2][1] ... B[15][1]   │ cols 0..15
+  ...                                          │
+  L15  B[0][15] ........        ... B[15][15] ┘
+  L16  B[0][0] ............     ... B[15][0]  ┐ DUPLICATE
+  ...                                          │
+  L31  B[0][15] ............    ... B[15][15] ┘
+
+
+C frag output after WMMA (8 fp32 values per lane):
+═══════════════════════════════════════════════════
+  lane t, slot i  →  C[m = 2*i + lane_hi][n = lane_lo]
+  with lane_hi = t >> 4 ∈ {0, 1}, lane_lo = t & 15
+
+  Lane axis encodes N (output column)
+  Slot axis encodes M (output row, with hi-bit interleave)
+
+       slot 0   slot 1   slot 2   ...  slot 7
+       ──────   ──────   ──────   ──   ──────
+  L 0  C[0][0]  C[2][0]  C[4][0]  ...  C[14][0]    ┐ lane_hi=0
+  L 1  C[0][1]  C[2][1]  C[4][1]  ...  C[14][1]    │ → EVEN rows
+  ...                                               │ {0,2,4,...,14}
+  L15  C[0][15] C[2][15] C[4][15] ...  C[14][15]   ┘
+  L16  C[1][0]  C[3][0]  C[5][0]  ...  C[15][0]    ┐ lane_hi=1
+  L17  C[1][1]  C[3][1]  C[5][1]  ...  C[15][1]    │ → ODD rows
+  ...                                               │ {1,3,5,...,15}
+  L31  C[1][15] C[3][15] C[5][15] ...  C[15][15]   ┘
+```
+
+### Why this layout matters (mode 1 vs the alternatives)
+
+The probe op (`gptq_gemm_rdna3_wmma_probe`) tests four hypotheses for
+how A and B fragments map to memory:
+
+```
+mode 0:  A row-major, B row-major    → computes  A @ B^T
+mode 1:  A row-major, B col-major    → computes  A @ B    ✓
+mode 2:  A col-major, B row-major    → computes  A^T @ B^T
+mode 3:  A col-major, B col-major    → computes  A^T @ B
+```
+
+Tests with `A = identity` pass for both mode 0 and mode 1 because the
+K-axis sum collapses, masking the bug. Random-A tests reveal mode 1
+as the unique correct choice. Hardcoded across the kernel — flipping
+B's load axis would silently corrupt prefill output.
+
+### Why WMMA helps bf16 but not fp16 (current state)
+
+```
+bf16 scalar (gfx11):       fp16 scalar (gfx11):
+═══════════════════        ═══════════════════
+  v_pk_fma_bf16  ✗           v_pk_fma_f16  ✓ full rate
+   → fallback to             → 1 cycle per packed FMA
+     v_fma_f32 + cvt          → kernel becomes memory-bound
+   → ~2× slower per FMA       → ~26 % HBM peak (already good)
+   → COMPUTE-BOUND
+   → WMMA wins by avoiding   bit-trick dequant 0x6400:
+     per-element FMAs         → 5 ops + 4 FMAs per int32
+     (1.5-2× scalar)          → essentially free
+
+bf16 dispatch  → WMMA at M ≥ 16  ✓
+fp16 dispatch  → ALWAYS scalar (WMMA underperforms at
+                 ~10 % CU occupancy with the current
+                 1-wave-per-block / 16×16 tile)
+```
+
+### Concrete scaling — qkv-square (K = N = 4096) on a 96-CU GPU
+
+```
+Decode (M=1):
+  Scalar: 64 blocks x 8 waves = 512 waves  -> ~17 % of 96 CUs at peak
+  WMMA:   256 blocks x 1 wave  = 256 waves -> only 8 CUs busy + wastes
+                                              15/16 of the M tile
+  -> SCALAR wins easily on tiny M (matches microbench)
+
+Prefill (M=64):
+  Scalar: 4 col-blocks x 8 row-blocks (M_COUNT=8) x 16 K-splits
+          = 512 blocks x 8 waves
+  WMMA:   256 col-blocks x 4 row-blocks x 1 wave
+          = 1024 blocks x 1 wave
+  -> WMMA wins on bf16 (compute-bound), ties or loses on fp16
+     (kernel still memory-bound; bit-trick keeps scalar competitive)
+```
+
+## Performance reference (RX 7900 XTX, Qwen3.6-27B-GPTQ-W4A16-G32, tp=2)
+
+End-to-end decode throughput (vLLM `--max_model_len 262144`):
+
+| dtype | Before this branch | After |
+| --- | --- | --- |
+| fp16 (`--dtype float16`) | 54 tk/s | **54 tk/s** (unchanged baseline) |
+| bf16 native | 36 tk/s | **50 tk/s** (+39%) |
+
+Microbench `gptq_gemm_rdna3` scalar at M=1 (fp16 / bf16, μs/call):
+
+| Shape (K → N) | fp16 | bf16 |
+| --- | --- | --- |
+| 4096 → 4096 (qkv-square) | 32 | ~26 |
+| 4096 → 11008 (gate/up) | 24 | ~37 |
+| 11008 → 4096 (down) | 25 | ~36 |
+| 5120 → 5120 (qwen-14B-qkv) | 20 | ~28 |
+| 5120 → 13824 (qwen-14B-up) | 29 | ~50 |
+
+bf16 still pays ~25-50% over fp16 because `v_pk_fma_bf16` is absent on
+gfx11 (see below); fp16 hits its peak via `v_pk_fma_f16` at full rate and
+the bit-trick `(qa & 0x000F000F) | 0x64006400` dequant.
+
+## Diagnostic ops (registered, callable from Python)
+
+For kernel correctness debugging only — not used in production paths:
+
+* `torch.ops._C.gptq_gemm_rdna3_wmma_probe(a, b, mode)` — runs one WMMA on
+  fp16 16×16 inputs under `mode ∈ {0..3}` fragment-load hypotheses, dumps
+  per-lane c_acc to fp32[32, 8]. Used to identify the wave32 fragment
+  layout (mode 1: A row-major + B col-major + output `[m=2*i+lane_hi]
+  [n=lane_lo]`).
+* `torch.ops._C.gptq_gemm_rdna3_wmma_dump(...)` — full-pipeline c_acc
+  dump from a single 16×16 output tile after dequant + LDS + WMMA.
+* `torch.ops._C.gptq_gemm_rdna3_wmma_lds_check(...)` — dequant + LDS-write
+  only, dumps the b_lds tile back as fp16 for visual sanity check.
+
+## Tools (`tools/` subdirectory)
+
+Scripts used during development of these kernels. Preserved here as
+backup so future regression work can reuse them without rebuilding from
+scratch. All run inside the container where vLLM is installed
+(`python3 tools/<script>.py`).
+
+### Benchmarks
+
+| Script | Purpose |
+| --- | --- |
+| `bench_wmma_threshold.py` | M-sweep `{1,4,8,16,24,32,48,64,96,128,256}` × 5 Qwen-class shapes × `{fp16, bf16}`. Calls both `gptq_gemm_rdna3` (scalar path for fp16, dispatches to WMMA for bf16 M≥16) and `gptq_gemm_rdna3_wmma` directly to compare. Median of 50 iters with `cuda.Event` timing. Produces the table that justifies the bf16-only WMMA gating decision and lets us decide if a kernel change wins or regresses. |
+| `bench_fp16_decode.py` | Focused single-dtype, M=1 only, 5 shapes × 200 iters. Designed as a stable, repeatable target for `rocprof` (large stable hot loop with no shape variation noise per iteration). Use this when you want HW counter data on fp16 decode specifically. |
+| `bench_scalar.py` | Minimal scalar-only microbench (one shape, hardcoded). Bypasses vLLM dispatch entirely via `torch.ops._C.gptq_gemm_rdna3`. Useful as a smoke test that the C++ extension loaded and the kernel runs at all. |
+| `bench_full_decode.py` | Simulates one full decode token (~32 layers × 7 linears = 224 GEMM calls). Times three call paths: direct `torch.ops._C`, the Python `ops.gptq_gemm_rdna3` wrapper, and the full `RDNA3W4A16LinearKernel.apply_weights`. Used historically to localise a 7× decode regression to the apply_weights dispatch logic vs. the kernel itself. |
+
+For shape exploration the benchmarks call `gptq_gemm_rdna3_wmma`
+directly (regardless of dtype) so the WMMA path can be timed independently
+of the dispatch in `gptq_gemm_rdna3`.
+
+### Profiling
+
+| Script | Purpose |
+| --- | --- |
+| `rocprof_counters.txt` | PMC counter spec for gfx1100 (`pmc:` lines). Lists the SQ_* counters known to register on RDNA3. Used as `-i` input to rocprofv2 / rocprofv3. NOTE: most non-SQ_BUSY_CYCLES / SQ_WAVES counters return 0 on gfx1100 even when listed by `--list-counters` — see "Known limitations" below. |
+| `analyze_profile.py` | Aggregates a rocprof v1 trace CSV (`--hip-trace --hsa-trace`) by kernel basename, prints top 20 by total time. Works even without HW counters — pure timing. Useful to confirm where wall-clock time goes. |
+| `analyze_counters.py` | Reads rocprofv2 `results_pmc1.csv` + `results_pmc2.csv` (wide format) and computes derived metrics: VALU%, LDS%, WaitRatio%, VMEM%. Loosely v2-specific; the on-disk paths v2 generates are unpredictable, so check `find` first. |
+| `analyze_v3.py` | Reads the rocprofv3 long-format `<pid>_counter_collection.csv` (one row per `(dispatch, counter)` tuple). Pivots to `(kernel, grid)` keys and prints the same derived metrics as `analyze_counters.py`. Preferred — rocprofv3 is the only profiler that worked reliably for us on gfx1100 (v1 is unsupported on RDNA3, v2 has output-path bugs). |
+
+### Recommended profiling workflow on gfx1100
+
+1. Run `bench_fp16_decode.py` once standalone to confirm the bench
+   finishes without errors.
+2. Single-pass with up to 4 SQ counters (avoids hardware multiplexing):
+   ```
+   rocprofv3 --pmc SQ_BUSY_CYCLES SQ_WAVES SQ_WAVE_CYCLES SQ_WAIT_ANY \
+             -d /tmp/profile_v3 \
+             --output-format csv \
+             -- python3 tools/bench_fp16_decode.py
+   ```
+3. Analyse with `python3 tools/analyze_v3.py /tmp/profile_v3/<host>/<pid>_counter_collection.csv`.
+4. For a second pass with instruction mix:
+   ```
+   rocprofv3 --pmc SQ_INSTS_WAVE32 SQ_INSTS_WAVE32_VALU SQ_INSTS_WAVE32_LDS SQ_INST_CYCLES_VMEM \
+             -d /tmp/profile_v3_p2 \
+             --output-format csv \
+             -- python3 tools/bench_fp16_decode.py
+   ```
+   These counters are documented to exist on gfx1100 but in practice may
+   return 0 — verify with the analysis script before trusting them.
+
+### 1. The bf16 fp32 dequant fix is essential
+
+`__hfma2(bf162_t, bf162_t, bf162_t)` lowers to a slow fallback on gfx11
+(no `v_pk_fma_bf16` instruction). Per-element it's ~2× the cycle count of
+`v_pk_fma_f16`. The bf16 scalar path was decode-bound on this until two
+fixes:
+
+* `dot22_8_f` widens bf16 → fp32 via free `(bits<<16)` left-shift and
+  accumulates with `v_fma_f32` (full rate on RDNA3).
+* `dequant_4bit_8_bf16_f32` produces fp32 output directly from the int4
+  unpack, bypassing a second round of slow bf16 FMAs.
+
+Both bf16 paths use fp32 throughout for compute; only the I/O is bf16.
+Net: bf16 decode 36 → 50 tk/s on Qwen3.6-27B.
+
+The fp16 path keeps `__hfma2(half2,...)` because `v_pk_fma_f16` IS native
+and full rate; widening to fp32 would just cost more VGPRs without speed.
+
+### 2. Dispatch lives in C++, not Python
+
+An earlier attempt put `if x.size(0) >= 16: wmma_op(...) else: scalar(...)`
+inside `apply_weights`. torch.compile / Dynamo broke decode 7× — the
+size-comparison guard triggered graph break/recompile on every layer.
+Fix: branch in `gptq_gemm_rdna3`'s C++ entry; Python sees a single op.
+
+The same constraint kills `print()` for debugging — Dynamo can't trace
+builtin print in fullgraph mode. Use vLLM's startup logs or
+`process_weights_after_loading` (called outside compile) for diagnostics.
+
+### 3. WMMA fragment layout is mode 1, not mode 0
+
+A diagonal-A test passes for both `B row-major` and `B col-major` fragment
+loadings because A=I makes the K-axis sum collapse. Random-A reveals only
+mode 1 (`A row, B col, output [m=2*i+lane_hi][n=lane_lo]`) implements
+A·B; the others compute A·Bᵀ or worse. The `gptq_gemm_rdna3_wmma_probe`
+op was built specifically to disambiguate this empirically.
+
+### 4. WMMA TU lives in its own file
+
+A monolithic TU with both scalar and WMMA kernels miscompiled the M=1
+scalar path even when the WMMA template was never instantiated for M=1.
+hipcc appears to scope some optimizer decisions (register file / SGPR
+pressure heuristics) at the TU level. Splitting into separate
+translation units (linked via standard cross-TU calls) restores scalar
+binary identity to its tuned baseline.
+
+### 5. BLOCK_KN_SIZE = 256 is the sweet spot
+
+Tried 512 to halve atomic CAS count per output. bf16 gained 5-10% at
+large M, but fp16 decode regressed up to 40% on `qkv-square` (M=1, only
+~8 of 96 CUs saturated due to 16-wave blocks). Reverted; comment in
+`q_gemm_rdna3.cu` records the experiment.
+
+### 6. Atomic accumulation via packed CAS, no fp32 buffer
+
+gfx11 has no `v_global_atomic_pk_add_{f16,bf16}`. The kernel writes to
+fp16/bf16 output directly via `atomicCAS`-on-uint32 retry loop. Saves
+M*N*4 bytes allocation + memset + epilogue cast pass that an fp32-
+accumulator design would need (~5-10 μs/call, 11-22% of decode budget at
+50 tk/s). The CAS retries are rarely triggered because each output
+position's K-splits finish at different rates.
+
+## Known limitations / future work
+
+* **fp16 prefill is scalar.** WMMA fp16 is gated off until the kernel is
+  competitive with scalar. Likely needs: 16M×128N tile, LDS-shared A
+  across waves, K-pipelining (double-buffered LDS), `uint4` vector loads
+  for weights. Estimated 3-5× to reach scalar parity at M≥64.
+
+* **No fp16 → fp32-output-buffer experiment.** Replacing `atomicCAS` with
+  fp32 atomic-add + epilogue cast might save 5-15% on fp16 decode if CAS
+  retries are dominant. Untested.
+
+* **`rocprof` on gfx1100 returns 0 for most useful counters.**
+  Attempted: `rocprof v1` (unsupported on RDNA3), `rocprofv2` (works
+  but writes CSVs to unpredictable paths and silently drops some
+  counters), `rocprofv3` (cleanest, but only `SQ_BUSY_CYCLES` and
+  `SQ_WAVES` return non-zero values on the GPTQ kernel — the
+  instruction-mix and cycle-accounting counters listed in
+  `--list-counters` register but report 0). Without compute-vs-memory
+  telemetry, optimisation decisions are blind. The remaining ~74% gap
+  to HBM peak (fp16 scalar at ~26%) could be atomic CAS contention,
+  LDS bank conflicts, instruction-issue stalls, or occupancy — but we
+  can't tell which without working counters. See `tools/rocprof_counters.txt`
+  for the counter list we tested and `tools/analyze_v3.py` for the parser.
+
+* **bf16 dequant could be merged with dot product.** Currently
+  `dequant_4bit_8_bf16_f32` produces a `float[8]` array consumed
+  immediately by `dot22_8_f(float[8], ...)`. A fused kernel that
+  interleaves dequant and FMA at the instruction level could avoid the
+  intermediate VGPR storage (32 floats per dq), potentially recovering
+  some occupancy lost to register pressure.
