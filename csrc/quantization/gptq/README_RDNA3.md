@@ -272,26 +272,38 @@ Prefill (M=64):
 
 ## Performance reference (RX 7900 XTX, Qwen3.6-27B-GPTQ-W4A16-G32, tp=2)
 
-End-to-end decode throughput (vLLM `--max_model_len 262144`):
+End-to-end throughput on `evalscope perf openqa` (50 reqs, max-num-seqs=8):
 
-| dtype | Before this branch | After |
-| --- | --- | --- |
-| fp16 (`--dtype float16`) | 54 tk/s | **54 tk/s** (unchanged baseline) |
-| bf16 native | 36 tk/s | **50 tk/s** (+39%) |
+| Config                                      | Concurrency 1 | Concurrency 100 |
+| ---                                         | ---           | ---             |
+| ExLlama fp16 (no bf16 support)              | (baseline)    | 255 tk/s        |
+| Triton W4A16 fp16                           | —             | 83 tk/s         |
+| Triton W4A16 bf16                           | —             | 82 tk/s         |
+| **RDNA3 W4A16 fp16**                        | par fp16      | **247 tk/s**    |
+| **RDNA3 W4A16 bf16** (initial branch)       | par fp16      | ~100 tk/s       |
+| **RDNA3 W4A16 bf16** (after this PR)        | par fp16      | **234 tk/s**    |
 
-Microbench `gptq_gemm_rdna3` scalar at M=1 (fp16 / bf16, μs/call):
+The bf16 path under load was the last gap. Three stacked changes closed it
+(see lessons 7–8 below): packed atomic CAS-64, factored scale/zb fold for
+M_COUNT=1 decode, and col-outer `#pragma unroll 1` to free VGPR pressure
+in the M_COUNT=4/8 templates (decode batched). Net: bf16 gained +134%
+under load and now sits at ~95% of the best fp16 baseline (ExLlama).
 
-| Shape (K → N) | fp16 | bf16 |
-| --- | --- | --- |
-| 4096 → 4096 (qkv-square) | 32 | ~26 |
-| 4096 → 11008 (gate/up) | 24 | ~37 |
-| 11008 → 4096 (down) | 25 | ~36 |
-| 5120 → 5120 (qwen-14B-qkv) | 20 | ~28 |
-| 5120 → 13824 (qwen-14B-up) | 29 | ~50 |
+VGPR / spill audit at gfx1100 (`.note.AMDGPU.metadata` from the .so):
 
-bf16 still pays ~25-50% over fp16 because `v_pk_fma_bf16` is absent on
-gfx11 (see below); fp16 hits its peak via `v_pk_fma_f16` at full rate and
-the bit-trick `(qa & 0x000F000F) | 0x64006400` dequant.
+| Kernel       | VGPR before | VGPR after | Spill before     | Spill after |
+| ---          | ---         | ---        | ---              | ---         |
+| bf16 M=1     | 82          | 41         | 0                | 0           |
+| bf16 M=2     | 138         | 56         | 0                | 0           |
+| bf16 M=4     | 192 (cap)   | 82         | 38 VGPR / 156 B  | **0**       |
+| bf16 M=8     | 192 (cap)   | 130        | 144 VGPR / 580 B | **0**       |
+| fp16 M=*     | unchanged   | unchanged  | 0                | 0           |
+
+bf16 M=8 (the decode-batched template under load) went from 5 waves/SIMD
+with 144 VGPRs spilled to scratch every K-iteration, to ~7 waves/SIMD
+with zero scratch traffic. The fp16 path was already register-clean
+thanks to the `0x6400` bit-trick + `v_pk_fma_f16` (1 cycle/packed-FMA),
+and only the atomic-64 swap applies there.
 
 ## Diagnostic ops (registered, callable from Python)
 
@@ -414,11 +426,75 @@ large M, but fp16 decode regressed up to 40% on `qkv-square` (M=1, only
 ### 6. Atomic accumulation via packed CAS, no fp32 buffer
 
 gfx11 has no `v_global_atomic_pk_add_{f16,bf16}`. The kernel writes to
-fp16/bf16 output directly via `atomicCAS`-on-uint32 retry loop. Saves
-M*N*4 bytes allocation + memset + epilogue cast pass that an fp32-
-accumulator design would need (~5-10 μs/call, 11-22% of decode budget at
-50 tk/s). The CAS retries are rarely triggered because each output
-position's K-splits finish at different rates.
+fp16/bf16 output directly via an `atomicCAS`-retry loop. Saves M*N*4
+bytes allocation + memset + epilogue cast pass that an fp32-accumulator
+design would need (~5-10 μs/call, 11-22% of decode budget at 50 tk/s).
+The CAS retries are rarely triggered because each output position's
+K-splits finish at different rates.
+
+The CAS targets a 64-bit word (`global_atomic_cmpswap_b64`) covering all
+4 output lanes per row in a single atomic operation. Earlier versions
+issued two `b32` CAS calls (one per (lo, hi) half2/bf162); merging them
+halves the atomic instruction count and the contention window per
+output position. Alignment is guaranteed by `can_implement()` requiring
+`partition_weight_shape[1] % 8 == 0` and `n` always a multiple of 4.
+
+### 7. bf16 M_COUNT=1 decode: factor scale/zb out of dequant
+
+The default per-col dequant computes `dq[i] = q_f32[i] * scale + zb`
+(8 fp32 FMAs per int32 weight × 4 N cols = 32 dequant FMAs), then dot
+adds 8 fp32 FMAs per (m, n_col). At M_COUNT=1 this reduces to:
+
+```
+accum = sum_i (q_f32[i] * scale + zb) * a[i]
+      = scale * sum_i (q_f32[i] * a[i]) + zb * sum_i a[i]
+```
+
+Compute `sum_a = Σa[i]` once per K=8 step (shared across all 4 N cols)
+and a per-col `partial = Σ(q_f32 * a)`, then fold scale and zb_neg into
+the accumulator with 2 FMAs per col. Drops 64 → 47 FMAs per int32
+weight at M_COUNT=1 (−27%). Break-even at M_COUNT=2, so guarded behind
+`if constexpr (M_COUNT == 1)`.
+
+The new `dequant_4bit_8_bf16_q_only` produces unscaled fp32 q-values
+directly from the bf16 bit-trick (0x4300 magic) — zero FMAs in the
+dequant itself. Numerically safe because the entire factored path runs
+in fp32 (the gfx11 widen sidestep means we already pay fp32 acc).
+
+This trick does **not** apply to fp16: the +1024 bias in the `0x6400`
+bit-trick would cause catastrophic cancellation when subtracting
+`(1024+zero)*scale*sum_a` from `scale*Σ(q_h2*a)` in fp16-precision
+accumulators. Keep fp16 with its native bit-trick + `v_pk_fma_f16`.
+
+### 8. VGPR pressure trumps ILP at the cap — `#pragma unroll 1` on col-loops
+
+The bf16 j-loop originally declared `float dq[4][8]` outside the m-loop
+(all 4 cols' dequant results alive simultaneously across the m-loop).
+At M_COUNT=4/8 this hit the 192-VGPR cap with 38 / 144 VGPRs spilled
+to scratch, costing ~580B of v_writelane/v_readlane traffic per
+K-iteration and pinning occupancy at 5 waves/SIMD.
+
+Restructured to col-outer with `dq` declared inside the col loop —
+expecting the compiler to free the registers between iterations.
+**It didn't.** With `#pragma unroll`, the AMDGPU optimizer expanded the
+4 cols into a straight-line block where all 4 dq arrays remained
+alive simultaneously to maximize ILP across cols. VGPR count was
+unchanged.
+
+Adding `#pragma unroll 1` on the col loop forces a real 4-iteration
+loop. The register allocator is then bound to recycle VGPRs across
+iterations — `dq` lives only within one col-iter. Inner loops (m, i)
+stay `#pragma unroll`d for FMA pipelining within a col.
+
+Outcome: bf16 M_COUNT=8 went from 192 VGPRs + 144 spilled / 580 B
+scratch to 130 VGPRs / 0 spilled / 0 scratch. ~7 waves/SIMD vs 5
+previously; no more scratch IO in the inner loop. End-to-end bf16
+under load went from ~100 tk/s to 234 tk/s.
+
+The same trick applied to the M_COUNT=1 factored path (`q_f32[8]`
+inside the col loop instead of `q_f32[4][8]` outside): VGPRs dropped
+82 → 41. Generally: when scope-inside-loop alone doesn't reduce
+pressure on AMDGPU, force a real loop with `#pragma unroll 1`.
 
 ## Known limitations / future work
 
@@ -444,9 +520,14 @@ position's K-splits finish at different rates.
   can't tell which without working counters. See `tools/rocprof_counters.txt`
   for the counter list we tested and `tools/analyze_v3.py` for the parser.
 
-* **bf16 dequant could be merged with dot product.** Currently
-  `dequant_4bit_8_bf16_f32` produces a `float[8]` array consumed
-  immediately by `dot22_8_f(float[8], ...)`. A fused kernel that
-  interleaves dequant and FMA at the instruction level could avoid the
-  intermediate VGPR storage (32 floats per dq), potentially recovering
-  some occupancy lost to register pressure.
+* **fp16 decode CU saturation.** At `K=N=4096, M=1` the scalar fp16
+  kernel launches 64 blocks (`(N/1024) * (M/M_COUNT) * (K/256)`)
+  against 96 CUs — only ~17% of wave slots utilized. The kernel is
+  memory-bound at ~26% HBM peak, and increasing block count would
+  give the load/store scheduler more outstanding requests in flight.
+  Reducing `THREADS_X` from 256 to 128 (with `BLOCK_KN_SIZE=256`
+  unchanged, each thread loading 2 K elements) would double
+  `gridDim.x`. Expected ~+10-20% on fp16 decode; no expected
+  regression on prefill (M_COUNT=8 still has plenty of work per
+  block). Not yet implemented because the M_COUNT=1/2/4/8 templates
+  would need re-tuning together.
