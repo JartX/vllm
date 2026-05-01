@@ -40,6 +40,9 @@ def reshape_and_cache_kernel_flash(
     FP8_KV_CACHE: tl.constexpr,
     # INT8 per-tensor flag
     INT8_KV_CACHE: tl.constexpr,
+    # Platform
+    IS_ROCM: tl.constexpr,
+    IS_CUDA: tl.constexpr,
     # tune parameters
     TILE_SIZE: tl.constexpr,
 ):
@@ -95,10 +98,14 @@ def reshape_and_cache_kernel_flash(
     if INT8_KV_CACHE:
         # INT8 per-tensor: quantize to [-128, 127]
         k_scale_val = tl.load(k_scale)
-        key_tile = tl.clamp(
-            tl.floor(key_load.to(tl.float32) / k_scale_val + 0.5),
-            -128.0, 127.0
-        ).to(tl.int8)
+        k_scaled = key_load.to(tl.float32) / k_scale_val
+        if IS_ROCM:
+            k_rounded = tl.extra.hip.libdevice.nearbyint(k_scaled)
+        elif IS_CUDA:
+            k_rounded = tl.extra.cuda.libdevice.rint(k_scaled)
+        else:
+            k_rounded = tl.floor(k_scaled + 0.5)
+        key_tile = tl.clamp(k_rounded, -128.0, 127.0).to(tl.int8)
     elif FP8_KV_CACHE:
         # tl.store will do the correct implicit cast to fp8,
         # based on the key_cache_ptr.dtype.element_ty
@@ -113,10 +120,14 @@ def reshape_and_cache_kernel_flash(
     if INT8_KV_CACHE:
         # INT8 per-tensor: quantize to [-128, 127]
         v_scale_val = tl.load(v_scale)
-        value_tile = tl.clamp(
-            tl.floor(value_load.to(tl.float32) / v_scale_val + 0.5),
-            -128.0, 127.0
-        ).to(tl.int8)
+        v_scaled = value_load.to(tl.float32) / v_scale_val
+        if IS_ROCM:
+            v_rounded = tl.extra.hip.libdevice.nearbyint(v_scaled)
+        elif IS_CUDA:
+            v_rounded = tl.extra.cuda.libdevice.rint(v_scaled)
+        else:
+            v_rounded = tl.floor(v_scaled + 0.5)
+        value_tile = tl.clamp(v_rounded, -128.0, 127.0).to(tl.int8)
     elif FP8_KV_CACHE:
         if value_load.dtype.is_fp8():
             value_tile = value_load
@@ -438,6 +449,8 @@ def triton_reshape_and_cache_flash(
         USE_HEAD_MAJOR_LAYOUT=use_head_major_layout,
         FP8_KV_CACHE=FP8_KV_CACHE,
         INT8_KV_CACHE=INT8_KV_CACHE,
+        IS_ROCM=current_platform.is_rocm(),
+        IS_CUDA=current_platform.is_cuda(),
         # autotune parameters
         TILE_SIZE=TILE_SIZE,
         num_warps=num_warps,
