@@ -96,7 +96,7 @@ def reshape_and_cache_kernel_flash(
         # INT8 per-tensor: quantize to [-128, 127]
         k_scale_val = tl.load(k_scale)
         key_tile = tl.clamp(
-            tl.extra.hip.libdevice.nearbyint(key_load.to(tl.float32) / k_scale_val),
+            tl.floor(key_load.to(tl.float32) / k_scale_val + 0.5),
             -128.0, 127.0
         ).to(tl.int8)
     elif FP8_KV_CACHE:
@@ -114,7 +114,7 @@ def reshape_and_cache_kernel_flash(
         # INT8 per-tensor: quantize to [-128, 127]
         v_scale_val = tl.load(v_scale)
         value_tile = tl.clamp(
-            tl.extra.hip.libdevice.nearbyint(value_load.to(tl.float32) / v_scale_val),
+            tl.floor(value_load.to(tl.float32) / v_scale_val + 0.5),
             -128.0, 127.0
         ).to(tl.int8)
     elif FP8_KV_CACHE:
