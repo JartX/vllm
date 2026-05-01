@@ -275,6 +275,16 @@ torch::Tensor gptq_gemm_rdna3_wmma_lds_check(torch::Tensor b_q_weight,
                                              torch::Tensor b_scales,
                                              bool use_v2_format);
 
+// Paged prefill attention kernel for AMD RDNA3 (gfx1100). Replaces the
+// Triton context_attention_fwd path for ROCM_ATTN with a hand-tuned
+// WMMA implementation. fp16/bf16, head_size == 128 (v1).
+// See csrc/attention/paged_prefill_attn_rdna3.cu for details.
+void paged_prefill_attn_rdna3(
+    torch::Tensor& out, torch::Tensor q, torch::Tensor k_chunk,
+    torch::Tensor v_chunk, torch::Tensor k_cache, torch::Tensor v_cache,
+    torch::Tensor block_table, torch::Tensor cu_seqlens_q,
+    torch::Tensor seq_lens, double sm_scale, bool causal);
+
 void static_scaled_fp8_quant(
     torch::Tensor& out, torch::Tensor const& input, torch::Tensor const& scale,
     std::optional<std::tuple<int64_t, int64_t>> group_shape = std::nullopt);

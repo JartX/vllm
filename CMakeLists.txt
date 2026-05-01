@@ -301,6 +301,8 @@ set(VLLM_EXT_SRC
   "csrc/quantization/gptq/q_gemm.cu"
   "csrc/quantization/gptq/q_gemm_rdna3.cu"
   "csrc/quantization/gptq/q_gemm_rdna3_wmma.cu"
+  "csrc/attention/paged_prefill_attn_rdna3.cu"
+  "csrc/attention/paged_prefill_attn_rdna3_v2.cu"
   "csrc/quantization/w8a8/int8/scaled_quant.cu"
   "csrc/quantization/w8a8/fp8/common.cu"
   "csrc/quantization/fused_kernels/fused_layernorm_dynamic_per_token_quant.cu"
