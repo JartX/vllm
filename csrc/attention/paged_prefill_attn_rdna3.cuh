@@ -62,6 +62,13 @@ __device__ __forceinline__ v8i32 wmma_mma_iu8(v16i8 a_signed, v16u8 b_unsigned,
       /*signA=*/true, a_signed, /*signB=*/false, b_unsigned, c, /*clamp=*/false);
 }
 
+// Both A and B signed (for INT4 centered: nibble - zp → range [-15, 15]).
+__device__ __forceinline__ v8i32 wmma_mma_ii8(v16i8 a_signed, v16i8 b_signed,
+                                              v8i32 c) {
+  return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(
+      /*signA=*/true, a_signed, /*signB=*/true, b_signed, c, /*clamp=*/false);
+}
+
 template <typename T>
 struct WmmaNative;
 template <>

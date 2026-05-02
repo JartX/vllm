@@ -46,6 +46,7 @@ using vllm::prefill_attn_rdna3::v16i8;
 using vllm::prefill_attn_rdna3::v16u8;
 using vllm::prefill_attn_rdna3::wmma_mma;
 using vllm::prefill_attn_rdna3::wmma_mma_iu8;
+using vllm::prefill_attn_rdna3::wmma_mma_ii8;
 using vllm::prefill_attn_rdna3::WmmaNative;
 
 constexpr int K_TILE = 16;
@@ -91,19 +92,19 @@ __device__ __forceinline__ ScaleZP extract_scale_zp(float raw) {
 }
 
 // ---------------------------------------------------------------------------
-// INT4 K cache load into LDS as UINT8 (for v_wmma_i32_16x16x16_iu8).
+// INT4 K cache load into LDS as SIGNED INT8 (centered: nibble - zp).
 // K cache layout: [blocks, slots, heads, dim//2] (nibble-packed).
 //
-// Strategy: 128 threads, slot=tid/8, d_chunk=tid%8. Each chunk = 8 packed
-// bytes = 16 nibble values → stored as 16 uint8 in K_lds_u8.
+// Each thread loads its slot's scale+zp from global (L1 cached) and
+// subtracts zp during unpack. Result: signed int8 in [-15, 15].
+// This eliminates ALL zero-point correction from the attn_step.
 //
-// K_lds_u8 layout: [D_HIGH=8][K_TILE=16][16] where 16 is the WMMA K-dim.
-// Same as K_lds_raw in bf16 kernel but uint8 per element (half the LDS!).
+// K_lds_i8 layout: [D_HIGH=8][K_TILE=16][16] for WMMA B-fragment.
 // ---------------------------------------------------------------------------
 
 template <int HEAD_SIZE>
 __device__ __forceinline__ void load_k_tile_paged_int4_coop(
-    uint8_t* __restrict__ K_lds_u8,  // [D_HIGH][K_TILE][16]
+    int8_t* __restrict__ K_lds_i8,   // [D_HIGH][K_TILE][16] SIGNED
     const uint8_t* __restrict__ k_cache_u8,
     const float* __restrict__ k_scale_cache,
     const int* __restrict__ block_table,
@@ -111,15 +112,12 @@ __device__ __forceinline__ void load_k_tile_paged_int4_coop(
     int block_size, int max_blocks_per_seq,
     int64_t stride_kc_block, int64_t stride_kc_slot, int64_t stride_kc_head,
     int64_t stride_ks_blk, int64_t stride_ks_slot, int64_t stride_ks_head,
-    float* __restrict__ k_scale_lds,  // [K_TILE] scales
-    float* __restrict__ k_zp_lds,     // [K_TILE] zero-points
+    float* __restrict__ k_scale_lds,  // [K_TILE] scales (clean, no zp)
     int tid) {
-  constexpr int BYTES_PER_CHUNK = 8;  // 16 nibbles packed in 8 bytes
-  constexpr int D_HIGH [[maybe_unused]] = HEAD_SIZE / 16;  // = 8
+  constexpr int BYTES_PER_CHUNK = 8;
 
-  // 128 threads: slot = tid / 8 (0..15), d_chunk = tid % 8 (0..7)
-  const int my_k_idx = tid >> 3;   // slot within tile
-  const int my_dh = tid & 7;       // dim chunk
+  const int my_k_idx = tid >> 3;
+  const int my_dh = tid & 7;
 
   const int abs_k = start_n + my_k_idx;
   const bool valid_k = abs_k < seq_ctx_len;
@@ -128,20 +126,24 @@ __device__ __forceinline__ void load_k_tile_paged_int4_coop(
   const int p_block =
       valid_k ? block_table[seq_idx * max_blocks_per_seq + log_block] : 0;
 
-  // Load scale + zp (thread with d_chunk==0 loads it)
-  if (my_dh == 0 && valid_k) {
+  // EVERY thread loads its slot's scale+zp (L1 cached from first access).
+  // This avoids needing __syncthreads between scale write and nibble unpack.
+  int my_zp = 0;
+  if (valid_k) {
     float raw = k_scale_cache[p_block * stride_ks_blk +
                               slot * stride_ks_slot +
                               kv_head_idx * stride_ks_head];
     ScaleZP sz = extract_scale_zp(raw);
-    k_scale_lds[my_k_idx] = sz.scale;
-    k_zp_lds[my_k_idx] = sz.zp;
-  } else if (my_dh == 0 && !valid_k) {
+    my_zp = (int)sz.zp;
+    // Thread d_chunk==0 writes the clean scale to LDS for attn_step
+    if (my_dh == 0) {
+      k_scale_lds[my_k_idx] = sz.scale;
+    }
+  } else if (my_dh == 0) {
     k_scale_lds[my_k_idx] = 0.0f;
-    k_zp_lds[my_k_idx] = 0.0f;
   }
 
-  // Load 8 packed bytes = 16 nibble values
+  // Load 8 packed bytes
   const int d_base_packed = my_dh * BYTES_PER_CHUNK;
   const uint8_t* src = k_cache_u8 +
                        (int64_t)p_block * stride_kc_block +
@@ -157,22 +159,24 @@ __device__ __forceinline__ void load_k_tile_paged_int4_coop(
     for (int i = 0; i < BYTES_PER_CHUNK; ++i) k_packed[i] = 0;
   }
 
-  // Unpack nibbles to uint8 [0..15] and store to K_lds_u8[dh][k_idx][0..15]
-  uint8_t unpacked[16];
+  // Unpack nibbles and CENTER by subtracting zp → signed int8 [-15, 15]
+  int8_t centered[16];
   #pragma unroll
   for (int i = 0; i < BYTES_PER_CHUNK; ++i) {
-    unpacked[2 * i] = k_packed[i] & 0xF;
-    unpacked[2 * i + 1] = (k_packed[i] >> 4) & 0xF;
+    int lo = (int)(k_packed[i] & 0xF) - my_zp;
+    int hi = (int)((k_packed[i] >> 4) & 0xF) - my_zp;
+    centered[2 * i] = (int8_t)lo;
+    centered[2 * i + 1] = (int8_t)hi;
   }
 
-  // Store: K_lds_u8[my_dh][my_k_idx][0..15] = unpacked[0..15]
-  // Layout: contiguous 16 uint8 per (dh, k_idx) entry for WMMA B-fragment load
-  *(int4*)&K_lds_u8[my_dh * (K_TILE * 16) + my_k_idx * 16] = *(int4*)unpacked;
+  *(int4*)&K_lds_i8[my_dh * (K_TILE * 16) + my_k_idx * 16] = *(int4*)centered;
 }
 
 // ---------------------------------------------------------------------------
-// INT4 V cache load + unpack nibbles to LDS as FP16 (for bf16 WMMA on PV).
-// Same packed layout as K. V_lds target: [HEAD_SIZE][K_TILE] (transpose).
+// INT4 V cache load + unpack CENTERED nibbles to LDS as FP16.
+// Each thread loads its slot's v_zp and subtracts during fp16 conversion.
+// Result: dequanted = (nibble - zp) as fp16. Scale applied later in attn_step.
+// V_lds target: [HEAD_SIZE][K_TILE] (transpose for WMMA column access).
 // ---------------------------------------------------------------------------
 
 template <typename T, int HEAD_SIZE>
@@ -185,8 +189,7 @@ __device__ __forceinline__ void load_v_tile_paged_int4_coop(
     int block_size, int max_blocks_per_seq,
     int64_t stride_vc_block, int64_t stride_vc_slot, int64_t stride_vc_head,
     int64_t stride_vs_blk, int64_t stride_vs_slot, int64_t stride_vs_head,
-    float* __restrict__ v_scale_lds,  // [K_TILE] v_scales
-    float* __restrict__ v_zp_lds,     // [K_TILE] v_zero_points
+    float* __restrict__ v_scale_lds,  // [K_TILE] v_scales (clean, no zp)
     int tid) {
   constexpr int BYTES_PER_CHUNK = 8;
 
@@ -195,28 +198,28 @@ __device__ __forceinline__ void load_v_tile_paged_int4_coop(
   const int p_block = block_table[seq_idx * max_blocks_per_seq + log_block];
   const int valid_k_count = max(0, min(K_TILE, seq_ctx_len - start_n));
 
-  // Load V scales+zp for this tile (threads 0..15)
-  if (tid < K_TILE) {
-    const int slot = slot_base + tid;
-    if (tid < valid_k_count) {
-      float raw = v_scale_cache[p_block * stride_vs_blk +
-                                slot * stride_vs_slot +
-                                kv_head_idx * stride_vs_head];
-      ScaleZP sz = extract_scale_zp(raw);
-      v_scale_lds[tid] = sz.scale;
-      v_zp_lds[tid] = sz.zp;
-    } else {
-      v_scale_lds[tid] = 0.0f;
-      v_zp_lds[tid] = 0.0f;
-    }
-  }
-
   // 128 threads: slot = tid / 8, d_chunk = tid % 8
   const int my_slot_offset = tid >> 3;
   const int my_d_chunk = tid & 7;
   const int d_base_packed = my_d_chunk * BYTES_PER_CHUNK;
   const int abs_slot = slot_base + my_slot_offset;
   const bool valid = my_slot_offset < valid_k_count;
+
+  // Every thread loads its slot's scale+zp (L1 cached).
+  int my_v_zp = 0;
+  if (valid) {
+    float raw = v_scale_cache[p_block * stride_vs_blk +
+                              abs_slot * stride_vs_slot +
+                              kv_head_idx * stride_vs_head];
+    ScaleZP sz = extract_scale_zp(raw);
+    my_v_zp = (int)sz.zp;
+    // Thread d_chunk==0 writes clean scale to LDS for attn_step
+    if (my_d_chunk == 0) {
+      v_scale_lds[my_slot_offset] = sz.scale;
+    }
+  } else if (my_d_chunk == 0) {
+    v_scale_lds[my_slot_offset] = 0.0f;
+  }
 
   uint8_t v_packed[BYTES_PER_CHUNK];
   if (valid) {
@@ -231,68 +234,62 @@ __device__ __forceinline__ void load_v_tile_paged_int4_coop(
     for (int i = 0; i < BYTES_PER_CHUNK; ++i) v_packed[i] = 0;
   }
 
-  // Unpack to fp16 and transpose-store to V_lds[d][k]
+  // Unpack, CENTER (subtract zp), convert to fp16, transpose-store
   const int d_base = my_d_chunk * 16;
   #pragma unroll
   for (int i = 0; i < BYTES_PER_CHUNK; ++i) {
-    uint8_t byte = v_packed[i];
-    uint8_t lo = byte & 0xF;
-    uint8_t hi = (byte >> 4) & 0xF;
+    int lo = (int)(v_packed[i] & 0xF) - my_v_zp;
+    int hi = (int)((v_packed[i] >> 4) & 0xF) - my_v_zp;
     V_lds[(d_base + 2 * i) * K_TILE + my_slot_offset] = to_T<T>((float)lo);
     V_lds[(d_base + 2 * i + 1) * K_TILE + my_slot_offset] = to_T<T>((float)hi);
   }
 }
 
 // ---------------------------------------------------------------------------
-// attn_step for INT4 per-token-head using INT8 WMMA for Q×K.
+// attn_step for INT4 per-token-head — ZERO-OVERHEAD version.
 //
-// Q×K path:
-//   Uses v_wmma_i32_16x16x16_iu8 with Q in int8 (pre-quantized) and
-//   K in uint8 (raw nibbles). i32 result rescaled post-matmul:
-//   S[m][n] = (i32_dot[m][n] - Q_int_sum[m] * k_zp[n])
-//             * q_scale[m] * k_scale[n] * sm_scale
+// K is pre-centered (nibble - zp) in the loader → signed int8 [-15,15].
+// V is pre-centered (nibble - zp) in the loader → fp16.
+// NO zero-point correction needed in attn_step at all!
 //
-// P×V path:
-//   Uses bf16 WMMA (same as INT8 kernel). V nibbles dequanted to fp16.
-//   P_scaled = P * v_scale, then: O -= Pv_zp_sum (per-row correction).
+// Q×K: v_wmma_i32_16x16x16_iu8 (both A,B signed).
+//   S[m][n] = i32_dot[m][n] * q_scale[m] * k_scale[n] * sm_scale
+//
+// P×V: bf16 WMMA. P fused with v_scale.
+//   O[m][d] += (P * v_scale) @ V_centered[d]   (V already centered)
 // ---------------------------------------------------------------------------
 
 template <typename T, int HEAD_SIZE, int X, bool CAUSAL_MASK>
 __device__ __forceinline__ void attn_step_wave_int4(
-    const uint8_t* __restrict__ K_lds_u8,  // [D_HIGH][K_TILE][16] uint8
-    const T* __restrict__ V_lds,           // [HEAD_SIZE][K_TILE] fp16
+    const int8_t* __restrict__ K_lds_i8,   // [D_HIGH][K_TILE][16] signed
+    const T* __restrict__ V_lds,           // [HEAD_SIZE][K_TILE] fp16 (centered)
     T* __restrict__ P_lds_wave,
-    const float* __restrict__ k_scale_lds,
-    const float* __restrict__ k_zp_lds,
-    const float* __restrict__ v_scale_lds,
-    const float* __restrict__ v_zp_lds,
-    v16i8 (&q_int8_frags)[HEAD_SIZE / 16],  // Q quantized to int8
-    typename WmmaNative<T>::v16 (&q_fp_frags)[HEAD_SIZE / 16],  // Q in fp16 (for PV)
+    const float* __restrict__ k_scale_lds, // [K_TILE] k_scales
+    const float* __restrict__ v_scale_lds, // [K_TILE] v_scales
+    v16i8 (&q_int8_frags)[HEAD_SIZE / 16],
     v8fp32 (&out_acc)[HEAD_SIZE / 16],
     float (&m_state)[8], float (&l_state)[8],
     float q_scale,       // per-row Q quantization scale
-    float q_int_sum,     // sum of Q_int8 elements for this lane's row
     int wave_q_tile_start, int start_n, int valid_q_count, int valid_k_count,
     float sm_scale, int lane, int lane_lo, int lane_hi) {
   using V16 = typename WmmaNative<T>::v16;
   constexpr int FRAGS = HEAD_SIZE / 16;
 
-  // ---- Q × K via INT8 WMMA (8 WMMAs into i32 accumulator) ----
+  // ---- Q × K via INT8 WMMA (both signed, 8 WMMAs) ----
   v8i32 s_i32 = {0, 0, 0, 0, 0, 0, 0, 0};
   #pragma unroll
   for (int dh = 0; dh < FRAGS; ++dh) {
-    // Load K fragment: 16 uint8 values for this lane_lo (B col-major in N)
-    v16u8 b_frag;
-    *(int4*)&b_frag = *(const int4*)&K_lds_u8[dh * (K_TILE * 16) + lane_lo * 16];
-    s_i32 = wmma_mma_iu8(q_int8_frags[dh], b_frag, s_i32);
+    v16i8 b_frag;
+    *(int4*)&b_frag = *(const int4*)&K_lds_i8[dh * (K_TILE * 16) + lane_lo * 16];
+    s_i32 = wmma_mma_ii8(q_int8_frags[dh], b_frag, s_i32);
   }
 
-  // ---- Rescale i32 → float32 + zero-point correction + mask ----
-  // S[m][n] = (i32_dot - Q_int_sum[m] * k_zp[n]) * q_scale[m] * k_scale[n] * sm
+  // ---- Rescale: S = i32_dot * q_scale * k_scale * sm_scale + mask ----
   const float k_sc = k_scale_lds[lane_lo];
-  const float k_zp = k_zp_lds[lane_lo];
   const int abs_k = start_n + lane_lo;
   const bool k_in_seg = (lane_lo < valid_k_count);
+  // Precompute per-column factor (same for all rows in this tile)
+  const float col_factor = k_sc * sm_scale;
 
   float s_acc[8];
   #pragma unroll
@@ -304,12 +301,8 @@ __device__ __forceinline__ void attn_step_wave_int4(
       const int abs_q = wave_q_tile_start + m_row;
       keep = keep && (abs_k <= abs_q);
     }
-    // Get Q_int_sum and q_scale for the actual M row via shuffle
-    float qi_sum_row = __shfl(q_int_sum, m_row);
     float qs_row = __shfl(q_scale, m_row);
-    // Correction: (i32_dot - Q_int_sum * zp) * q_scale * k_scale * sm_scale
-    float raw = (float)s_i32[i] - qi_sum_row * k_zp;
-    s_acc[i] = keep ? (raw * qs_row * k_sc * sm_scale) : -INFINITY;
+    s_acc[i] = keep ? ((float)s_i32[i] * qs_row * col_factor) : -INFINITY;
   }
 
   // ---- Online softmax ----
@@ -332,15 +325,11 @@ __device__ __forceinline__ void attn_step_wave_int4(
     }
   }
 
-  // ---- Fuse v_scale into P + compute Pv_zp_sum ----
+  // ---- Fuse v_scale into P (no zp correction needed!) ----
   const float v_sc = v_scale_lds[lane_lo];
-  const float v_zp = v_zp_lds[lane_lo];
-  float pv_zp_sum[8];
   #pragma unroll
   for (int i = 0; i < 8; ++i) {
-    float p_scaled = p_ij[i] * v_sc;
-    pv_zp_sum[i] = wave16_sum(p_scaled * v_zp);
-    p_ij[i] = p_scaled;
+    p_ij[i] *= v_sc;
   }
 
   // ---- Transpose P → p_frag via WAVE-LOCAL P_lds ----
@@ -356,7 +345,7 @@ __device__ __forceinline__ void attn_step_wave_int4(
   __builtin_memcpy(&p_frag, &p_lo, 16);
   __builtin_memcpy(((char*)&p_frag) + 16, &p_hi, 16);
 
-  // ---- P × V via bf16 WMMA (V nibbles as fp16) + zp correction ----
+  // ---- P × V via bf16 WMMA (V already centered, no correction) ----
   #pragma unroll
   for (int dh = 0; dh < FRAGS; ++dh) {
     V16 v_frag;
@@ -365,15 +354,6 @@ __device__ __forceinline__ void attn_step_wave_int4(
     __builtin_memcpy(&v_frag, &v_lo, 16);
     __builtin_memcpy(((char*)&v_frag) + 16, &v_hi, 16);
     out_acc[dh] = wmma_mma(p_frag, v_frag, out_acc[dh]);
-  }
-
-  // Subtract Pv_zp_sum (same per row, broadcast across all dims)
-  #pragma unroll
-  for (int dh = 0; dh < FRAGS; ++dh) {
-    #pragma unroll
-    for (int i = 0; i < 8; ++i) {
-      out_acc[dh][i] -= pv_zp_sum[i];
-    }
   }
 }
 
@@ -475,7 +455,6 @@ __global__ void paged_prefill_attn_kernel_v2_int4(
   const float q_scale_inv = 1.0f / q_scale;
 
   v16i8 q_int8_frags[FRAGS];
-  float q_int_sum = 0.0f;
   #pragma unroll
   for (int dh = 0; dh < FRAGS; ++dh) {
     #pragma unroll
@@ -484,7 +463,6 @@ __global__ void paged_prefill_attn_kernel_v2_int4(
       int qi = __float2int_rn(qf * q_scale_inv);
       qi = max(-128, min(127, qi));
       q_int8_frags[dh][k] = (int8_t)qi;
-      q_int_sum += (float)qi;
     }
   }
 
@@ -499,41 +477,38 @@ __global__ void paged_prefill_attn_kernel_v2_int4(
   }
 
   // ---- Shared LDS ----
-  // K_lds_u8: uint8 [D_HIGH=8][K_TILE=16][16] = 2 KB (half of bf16!)
+  // K_lds_i8: signed int8 [D_HIGH=8][K_TILE=16][16] = 2 KB
   // V_lds: fp16 [HEAD_SIZE][K_TILE] = 4 KB
   // P_lds: fp16 [4 waves][16 rows][16 cols] = 2 KB
-  // scales: float [K_TILE] × 4 = 256 B
-  __shared__ uint8_t K_lds_u8[FRAGS * K_TILE * 16];     // 2 KB
-  __shared__ T V_lds[HEAD_SIZE * K_TILE];                 // 4 KB
-  __shared__ T P_lds[NUM_WAVES][M_PER_WAVE * K_TILE];     // 2 KB
-  __shared__ float k_scale_lds[K_TILE];                   // 64 B
-  __shared__ float k_zp_lds[K_TILE];                      // 64 B
-  __shared__ float v_scale_lds[K_TILE];                   // 64 B
-  __shared__ float v_zp_lds[K_TILE];                      // 64 B
+  // scales: float [K_TILE] × 2 = 128 B (no zp LDS needed!)
+  __shared__ int8_t K_lds_i8[FRAGS * K_TILE * 16];       // 2 KB
+  __shared__ T V_lds[HEAD_SIZE * K_TILE];                  // 4 KB
+  __shared__ T P_lds[NUM_WAVES][M_PER_WAVE * K_TILE];      // 2 KB
+  __shared__ float k_scale_lds[K_TILE];                    // 64 B
+  __shared__ float v_scale_lds[K_TILE];                    // 64 B
   T* P_lds_wave = &P_lds[wave_id][0];
 
   // ---- PHASE 1: Cached prefix (INT4 paged cache, no causal) ----
   for (int start_n = 0; start_n < ctx_len; start_n += K_TILE) {
     load_k_tile_paged_int4_coop<HEAD_SIZE>(
-        K_lds_u8, k_cache, k_scale_cache, block_table, seq_idx, kv_head_idx,
+        K_lds_i8, k_cache, k_scale_cache, block_table, seq_idx, kv_head_idx,
         start_n, ctx_len, block_size, max_blocks_per_seq,
         stride_kcache_block, stride_kcache_slot, stride_kcache_head,
         stride_ks_blk, stride_ks_slot, stride_ks_head,
-        k_scale_lds, k_zp_lds, tid);
+        k_scale_lds, tid);
     load_v_tile_paged_int4_coop<T, HEAD_SIZE>(
         V_lds, v_cache, v_scale_cache, block_table, seq_idx, kv_head_idx,
         start_n, ctx_len, block_size, max_blocks_per_seq,
         stride_vcache_block, stride_vcache_slot, stride_vcache_head,
         stride_vs_blk, stride_vs_slot, stride_vs_head,
-        v_scale_lds, v_zp_lds, tid);
+        v_scale_lds, tid);
     __syncthreads();
 
     const int valid_k_count = min(K_TILE, ctx_len - start_n);
     attn_step_wave_int4<T, HEAD_SIZE, X_FP16, /*CAUSAL_MASK=*/false>(
-        K_lds_u8, V_lds, P_lds_wave, k_scale_lds, k_zp_lds,
-        v_scale_lds, v_zp_lds,
-        q_int8_frags, q_fp_frags, out_acc, m_state, l_state,
-        q_scale, q_int_sum,
+        K_lds_i8, V_lds, P_lds_wave, k_scale_lds, v_scale_lds,
+        q_int8_frags, out_acc, m_state, l_state,
+        q_scale,
         wave_q_tile_start, start_n, valid_q_count_for_wave, valid_k_count,
         sm_scale, lane, lane_lo, lane_hi);
     __syncthreads();
@@ -636,12 +611,10 @@ __global__ void paged_prefill_attn_kernel_v2_int4(
         }
       }
     }
-    // Scales = identity for chunk (not quantized)
+    // Scales = identity for chunk (not quantized, already centered)
     if (tid < K_TILE) {
       k_scale_lds[tid] = 1.0f;
-      k_zp_lds[tid] = 0.0f;
       v_scale_lds[tid] = 1.0f;
-      v_zp_lds[tid] = 0.0f;
     }
     __syncthreads();
 
