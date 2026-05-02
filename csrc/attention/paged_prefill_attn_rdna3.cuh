@@ -48,6 +48,20 @@ __device__ __forceinline__ v8fp32 wmma_mma(v16bf16 a, v16bf16 b, v8fp32 c) {
   return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, c);
 }
 
+// 16x16x16 INT8 WMMA: A=signed int8, B=unsigned int8, C=int32 accumulator.
+// Used for INT4 Q×K path: Q quantized to int8, K nibbles in [0,15] as uint8.
+// Same 16-cycle throughput as bf16 WMMA on gfx1100.
+using v16i8 = int8_t __attribute__((ext_vector_type(16)));
+using v16u8 = uint8_t __attribute__((ext_vector_type(16)));
+using v8i32 = int __attribute__((ext_vector_type(8)));
+
+__device__ __forceinline__ v8i32 wmma_mma_iu8(v16i8 a_signed, v16u8 b_unsigned,
+                                              v8i32 c) {
+  // signA=true (A is signed), signB=false (B is unsigned), clamp=false
+  return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(
+      /*signA=*/true, a_signed, /*signB=*/false, b_unsigned, c, /*clamp=*/false);
+}
+
 template <typename T>
 struct WmmaNative;
 template <>

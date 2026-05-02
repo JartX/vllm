@@ -834,6 +834,53 @@ class TritonAttentionImpl(AttentionImpl):
                     )
                     return output
 
+                # RDNA3 HIP kernel for INT4 per-token-head prefill.
+                # Asymmetric dequant (zp + scale) with RHT rotation.
+                if (
+                    self._kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD
+                    and current_platform.is_rocm()
+                    and hasattr(torch.ops, "_C")
+                    and hasattr(torch.ops._C, "paged_prefill_attn_rdna3_int4")
+                ):
+                    from vllm.v1.attention.ops.triton_quant_kv._hadamard import (
+                        single_rht,
+                    )
+                    head_size = query.shape[2]
+                    # Rotate Q, K, V into RHT space (cache stores rotated data;
+                    # current-chunk K/V haven't been rotated yet).
+                    q_rotated = single_rht(
+                        query[:num_actual_tokens].float()
+                    ).to(query.dtype)
+                    k_rotated = single_rht(
+                        key[:num_actual_tokens].float()
+                    ).to(key.dtype)
+                    v_rotated = single_rht(
+                        value[:num_actual_tokens].float()
+                    ).to(value.dtype)
+                    int4_scale = self.scale / head_size
+                    torch.ops._C.paged_prefill_attn_rdna3_int4(
+                        output[:num_actual_tokens],
+                        q_rotated,
+                        k_rotated,
+                        v_rotated,
+                        key_cache,
+                        value_cache,
+                        k_scale_cache,
+                        v_scale_cache,
+                        attn_metadata.block_table,
+                        attn_metadata.query_start_loc,
+                        attn_metadata.seq_lens,
+                        attn_metadata.max_query_len,
+                        int4_scale,
+                        True,
+                    )
+                    # Inverse RHT on output
+                    out_f = single_rht(
+                        output[:num_actual_tokens].float(), inverse=True
+                    ) / head_size
+                    output[:num_actual_tokens].copy_(out_f.to(output.dtype))
+                    return output
+
                 num_reqs_pref = attn_metadata.query_start_loc.shape[0] - 1
                 triton_per_token_head_prefill(
                     query=query[:num_actual_tokens],

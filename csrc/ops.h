@@ -254,6 +254,18 @@ void paged_prefill_attn_rdna3_int8(torch::Tensor& out, torch::Tensor q,
                                    int64_t max_query_len, double sm_scale,
                                    bool causal);
 
+// RDNA3 INT4 per-token-head paged prefill attention (gfx1100).
+void paged_prefill_attn_rdna3_int4(torch::Tensor& out, torch::Tensor q,
+                                   torch::Tensor k_chunk, torch::Tensor v_chunk,
+                                   torch::Tensor k_cache, torch::Tensor v_cache,
+                                   torch::Tensor k_scale_cache,
+                                   torch::Tensor v_scale_cache,
+                                   torch::Tensor block_table,
+                                   torch::Tensor cu_seqlens_q,
+                                   torch::Tensor seq_lens,
+                                   int64_t max_query_len, double sm_scale,
+                                   bool causal);
+
 void static_scaled_fp8_quant(
     torch::Tensor& out, torch::Tensor const& input, torch::Tensor const& scale,
     std::optional<std::tuple<int64_t, int64_t>> group_shape = std::nullopt);
