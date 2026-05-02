@@ -442,6 +442,26 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("gptq_shuffle(Tensor! q_weight, Tensor q_perm, int bit) -> ()");
   ops.impl("gptq_shuffle", torch::kCUDA, &gptq_shuffle);
 
+  // RDNA3 INT8 per-token-head paged prefill attention (gfx1100).
+  ops.def(
+      "paged_prefill_attn_rdna3_int8(Tensor! out, Tensor q, Tensor k_chunk, "
+      "Tensor v_chunk, Tensor k_cache, Tensor v_cache, "
+      "Tensor k_scale_cache, Tensor v_scale_cache, Tensor block_table, "
+      "Tensor cu_seqlens_q, Tensor seq_lens, int max_query_len, "
+      "float sm_scale, bool causal) -> ()");
+  ops.impl("paged_prefill_attn_rdna3_int8", torch::kCUDA,
+           &paged_prefill_attn_rdna3_int8);
+
+  // RDNA3 INT4 per-token-head paged prefill attention (gfx1100).
+  ops.def(
+      "paged_prefill_attn_rdna3_int4(Tensor! out, Tensor q, Tensor k_chunk, "
+      "Tensor v_chunk, Tensor k_cache, Tensor v_cache, "
+      "Tensor k_scale_cache, Tensor v_scale_cache, Tensor block_table, "
+      "Tensor cu_seqlens_q, Tensor seq_lens, int max_query_len, "
+      "float sm_scale, bool causal) -> ()");
+  ops.impl("paged_prefill_attn_rdna3_int4", torch::kCUDA,
+           &paged_prefill_attn_rdna3_int4);
+
   // Compute FP8 quantized tensor for given scaling factor.
   // Supports per-tensor, per-channel, per-token, and arbitrary 2D group
   // scaling. Optional group_m/group_n specify the group shape explicitly;
