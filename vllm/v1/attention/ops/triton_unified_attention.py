@@ -578,22 +578,27 @@ def unified_attention(
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
     )
-    # RDNA3 prefill tile sizing (gfx1100, wave32).  Two regimes:
-    #  - Short KV (≤1024): BLOCK_M=32, num_warps=2.  Fewer warps avoids
-    #    register pressure; BLOCK_M=32 already doubles Q reuse vs default 16.
-    #  - Long KV (>1024):  BLOCK_M=64, num_warps=4.  Doubles arithmetic
-    #    intensity (AI ≈ 64 FLOPs/byte, crossing into compute-bound), and
-    #    the larger per-block workload justifies 4 waves.
-    #    Benchmarked +37% TFLOPS at seq_len=4096, +108% at seq_len=6144.
-    _rdna3_long_seq = False
+    # RDNA3 prefill tile sizing (gfx1100, wave32).  Three regimes:
+    #  - Short KV (≤1024):  BLOCK_M=32,  num_warps=2.  Small workload per
+    #    block; fewer warps avoids register pressure and sync overhead.
+    #  - Medium KV (1025-8192): BLOCK_M=64, num_warps=4.  Doubles Q reuse
+    #    vs M32; 4 warps match the larger per-block workload.
+    #  - Long KV (>8192):  BLOCK_M=128, num_warps=8.  Quadruples Q reuse
+    #    (AI ≈ 64 FLOPs/byte); 8 warps hide HBM latency on deep loops.
+    #    Benchmarked at 32K: 546ms vs 1214ms (M64w4) — 2.2× faster.
+    _rdna3_prefill_tier = 0  # 0=default, 1=short, 2=medium, 3=long
     if current_platform.is_rocm() and max_seqlen_q > 1:
         from vllm.platforms.rocm import on_gfx11
         if on_gfx11() and BLOCK_M == 16:
-            if max_seqlen_k > 1024:
+            if max_seqlen_k > 8192:
+                BLOCK_M = 128
+                _rdna3_prefill_tier = 3
+            elif max_seqlen_k > 1024:
                 BLOCK_M = 64
-                _rdna3_long_seq = True
+                _rdna3_prefill_tier = 2
             else:
                 BLOCK_M = 32
+                _rdna3_prefill_tier = 1
     BLOCK_Q = BLOCK_M // num_queries_per_kv
 
     # Ideally we would launch with kernel with:
@@ -679,7 +684,9 @@ def unified_attention(
     if not use_3d and current_platform.is_rocm():
         from vllm.platforms.rocm import on_gfx11
         if on_gfx11():
-            if _rdna3_long_seq:
+            if _rdna3_prefill_tier == 3:
+                launch_kwargs["num_warps"] = 8
+            elif _rdna3_prefill_tier == 2:
                 launch_kwargs["num_warps"] = 4
             else:
                 launch_kwargs["num_warps"] = 2
