@@ -91,16 +91,71 @@ Both are **8× faster** than the equivalent Triton quantized attention path.
 
 ---
 
-## Combined Impact
+## Benchmark Results
 
-Qwen3.6-27B W4A16, TP2, RX 7900 XTX, chunked prefill with 16K context:
+### Test Setup
 
-| Configuration | Prefill tok/s | vs baseline |
-|--------------|---------------|-------------|
-| Baseline (all Triton, FP16 KV) | 727 | — |
-| + Layer 2 (triton tuning) | ~1100 | +51% |
-| + Layer 3 (INT8 HIP kernel) | **1209** | **+66%** |
-| + Layer 3 (INT4 HIP kernel) | **~1150** | **+58%** (75% less VRAM) |
+- **Model**: Qwen3.6-27B GPTQ W4A16, TP2
+- **Hardware**: 2× RX 7900 XTX (48 GB total VRAM)
+- **Config**: chunked prefill, max_num_batched_tokens=2048, enforce_eager
+
+### Kernel-Level (Attention Microbenchmark, ctx=8000 ql=512)
+
+| Kernel | Time | vs Triton baseline |
+|--------|------|--------------------|
+| Triton INT8 per-token-head | ~25 ms | — |
+| **HIP INT8** | **3.03 ms** | **8.3×** |
+| **HIP INT4** | **3.05 ms** | **8.2×** |
+| Triton FP16 (default M16w4) | 11.2 ms | — |
+| Triton FP16 (tuned M64w4) | **3.0 ms** | **3.7×** |
+
+### End-to-End TTFT (Single Request, Prefill → First Token)
+
+| Prompt length | Baseline (FP16) | INT8 full stack | INT4 full stack |
+|--------------|-----------------|-----------------|-----------------|
+| ~2K tokens | 2.81s | 2.74s (-2.5%) | 2.78s (-1%) |
+| ~8K tokens | 11.15s | 10.99s (-1.4%) | 11.25s (+1%) |
+| ~16K tokens | 23.74s | 22.52s (-5.1%) | 22.96s (-3.3%) |
+| ~24K tokens | 38.44s | **34.84s (-9.4%)** | **35.49s (-7.7%)** |
+
+Note: GEMM (W4A16 linear layers) dominates ~80% of total inference time.
+Attention is ~20%. The 8× kernel speedup on 20% of runtime yields ~10% E2E.
+The longer the context, the more attention dominates → larger E2E gains.
+
+### KV Cache Capacity (The Killer Metric)
+
+With identical VRAM budget (33.3 GB available for KV after model load):
+
+| KV dtype | Max context | Concurrent @8K | Concurrent @32K |
+|----------|-------------|----------------|-----------------|
+| FP16 | 136K tokens | 17 requests | 4 requests |
+| INT8 | 273K tokens | **34 requests (2×)** | **8 requests (2×)** |
+| INT4 | **545K tokens** | **68 requests (4×)** | **17 requests (4×)** |
+
+**INT4 serves 4× more concurrent users with the same hardware.**
+Or equivalently: supports 4× longer context (545K vs 136K tokens).
+
+### Throughput Under Load (8 Concurrent Requests, ~2K prompt + 50 gen)
+
+| Config | Total throughput |
+|--------|-----------------|
+| Baseline FP16 | 673 tok/s |
+| INT8 full stack | 672 tok/s |
+| INT4 full stack | 655 tok/s |
+
+At low concurrency (8 reqs), throughput is GEMM-bound and similar. The real
+throughput advantage appears at high concurrency (34-68 reqs) where FP16
+would OOM but INT8/INT4 can still serve.
+
+### Quality
+
+| Mode | Cosine vs FP16 reference | Notes |
+|------|--------------------------|-------|
+| INT8 per-token-head | 1.000000 | Exact (symmetric, no precision loss) |
+| INT4 per-token-head | 0.999995 | Q→int8 quantization noise (~0.001) |
+
+Both produce coherent outputs at temperature=0 on code generation,
+mathematical reasoning, translation, and factual QA.
 
 Layer 1 (W4A16 WMMA) improves decode and short-prompt latency where GEMM
 dominates. Layer 2+3 improve prefill where attention dominates.
