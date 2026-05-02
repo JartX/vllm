@@ -652,6 +652,10 @@ if (VLLM_GPU_LANG STREQUAL "HIP")
   list(APPEND VLLM_EXT_SRC
     "csrc/custom_quickreduce.cu"
   )
+  # RDNA3 INT8 per-token-head paged prefill attention (gfx1100)
+  list(APPEND VLLM_EXT_SRC
+    "csrc/attention/paged_prefill_attn_rdna3_v2_int8.cu"
+  )
 # if ROCM endif
 endif()
 

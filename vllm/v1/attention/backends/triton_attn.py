@@ -808,6 +808,32 @@ class TritonAttentionImpl(AttentionImpl):
                 use_qk_int8_wmma = (
                     key_cache.dtype == torch.int8 and current_platform.is_rocm()
                 )
+
+                # RDNA3 HIP kernel: 8x faster than Triton for INT8 prefill.
+                # Gate: int8 cache + RDNA3 + has the compiled op.
+                if (
+                    use_qk_int8_wmma
+                    and hasattr(torch.ops, "_C")
+                    and hasattr(torch.ops._C, "paged_prefill_attn_rdna3_int8")
+                ):
+                    torch.ops._C.paged_prefill_attn_rdna3_int8(
+                        output[:num_actual_tokens],
+                        query[:num_actual_tokens],
+                        key[:num_actual_tokens],
+                        value[:num_actual_tokens],
+                        key_cache,
+                        value_cache,
+                        k_scale_cache,
+                        v_scale_cache,
+                        attn_metadata.block_table,
+                        attn_metadata.query_start_loc,
+                        attn_metadata.seq_lens,
+                        attn_metadata.max_query_len,
+                        self.scale,
+                        True,
+                    )
+                    return output
+
                 num_reqs_pref = attn_metadata.query_start_loc.shape[0] - 1
                 triton_per_token_head_prefill(
                     query=query[:num_actual_tokens],

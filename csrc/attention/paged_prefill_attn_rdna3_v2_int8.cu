@@ -622,3 +622,97 @@ template void launch_paged_prefill_attn_v2_int8<bf16_t, 128>(
 
 }  // namespace prefill_attn_rdna3_v2_int8
 }  // namespace vllm
+
+// ---------------------------------------------------------------------------
+// Torch-callable entry point (registered in torch_bindings.cpp)
+// ---------------------------------------------------------------------------
+
+#if defined(USE_ROCM)
+void paged_prefill_attn_rdna3_int8(
+    torch::Tensor& out, torch::Tensor q, torch::Tensor k_chunk,
+    torch::Tensor v_chunk, torch::Tensor k_cache, torch::Tensor v_cache,
+    torch::Tensor k_scale_cache, torch::Tensor v_scale_cache,
+    torch::Tensor block_table, torch::Tensor cu_seqlens_q,
+    torch::Tensor seq_lens, int64_t max_query_len, double sm_scale,
+    bool causal) {
+  using namespace vllm::prefill_attn_rdna3_v2_int8;
+
+  const int num_seqs = seq_lens.size(0);
+  const int num_query_heads = q.size(1);
+  const int num_kv_heads = k_scale_cache.size(2);  // [blocks, slots, heads]
+  // k_cache: [blocks, slots, heads, dim] — block_size = k_cache.size(1)
+  const int block_size = k_cache.size(1);
+  const int max_blocks_per_seq = block_table.size(1);
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+
+  TORCH_CHECK(q.dtype() == at::kHalf || q.dtype() == at::kBFloat16,
+              "paged_prefill_attn_rdna3_int8: only fp16/bf16 supported");
+  TORCH_CHECK(k_cache.dtype() == at::kChar, "k_cache must be int8");
+
+  if (q.dtype() == at::kHalf) {
+    using T = half;
+    launch_paged_prefill_attn_v2_int8<T, 128>(
+        (T*)out.data_ptr(), (const T*)q.data_ptr(),
+        (const T*)k_chunk.data_ptr(), (const T*)v_chunk.data_ptr(),
+        (const int8_t*)k_cache.data_ptr(), (const int8_t*)v_cache.data_ptr(),
+        (const float*)k_scale_cache.data_ptr(),
+        (const float*)v_scale_cache.data_ptr(),
+        (const int*)block_table.data_ptr(),
+        (const int*)cu_seqlens_q.data_ptr(),
+        (const int*)seq_lens.data_ptr(),
+        num_seqs, num_query_heads, num_kv_heads,
+        block_size, max_blocks_per_seq, (int)max_query_len,
+        (float)sm_scale, causal,
+        q.stride(0), q.stride(1),
+        k_chunk.stride(0), k_chunk.stride(1),
+        v_chunk.stride(0), v_chunk.stride(1),
+        // K cache 4D [blocks, slots, heads, dim]:
+        // kernel params: (block, head, dhi=unused, slot)
+        k_cache.stride(0), k_cache.stride(2), (int64_t)1, k_cache.stride(1),
+        // V cache 4D [blocks, slots, heads, dim]:
+        v_cache.stride(0), v_cache.stride(2), (int64_t)1, v_cache.stride(1),
+        // Scale caches [blocks, slots, heads]
+        k_scale_cache.stride(0), k_scale_cache.stride(1),
+        k_scale_cache.stride(2),
+        v_scale_cache.stride(0), v_scale_cache.stride(1),
+        v_scale_cache.stride(2),
+        out.stride(0), out.stride(1),
+        stream);
+  } else {
+    using T = vllm::prefill_attn_rdna3::bf16_t;
+    launch_paged_prefill_attn_v2_int8<T, 128>(
+        (T*)out.data_ptr(), (const T*)q.data_ptr(),
+        (const T*)k_chunk.data_ptr(), (const T*)v_chunk.data_ptr(),
+        (const int8_t*)k_cache.data_ptr(), (const int8_t*)v_cache.data_ptr(),
+        (const float*)k_scale_cache.data_ptr(),
+        (const float*)v_scale_cache.data_ptr(),
+        (const int*)block_table.data_ptr(),
+        (const int*)cu_seqlens_q.data_ptr(),
+        (const int*)seq_lens.data_ptr(),
+        num_seqs, num_query_heads, num_kv_heads,
+        block_size, max_blocks_per_seq, (int)max_query_len,
+        (float)sm_scale, causal,
+        q.stride(0), q.stride(1),
+        k_chunk.stride(0), k_chunk.stride(1),
+        v_chunk.stride(0), v_chunk.stride(1),
+        k_cache.stride(0), k_cache.stride(2), (int64_t)1, k_cache.stride(1),
+        v_cache.stride(0), v_cache.stride(2), (int64_t)1, v_cache.stride(1),
+        k_scale_cache.stride(0), k_scale_cache.stride(1),
+        k_scale_cache.stride(2),
+        v_scale_cache.stride(0), v_scale_cache.stride(1),
+        v_scale_cache.stride(2),
+        out.stride(0), out.stride(1),
+        stream);
+  }
+}
+#else
+void paged_prefill_attn_rdna3_int8(
+    torch::Tensor& out, torch::Tensor q, torch::Tensor k_chunk,
+    torch::Tensor v_chunk, torch::Tensor k_cache, torch::Tensor v_cache,
+    torch::Tensor k_scale_cache, torch::Tensor v_scale_cache,
+    torch::Tensor block_table, torch::Tensor cu_seqlens_q,
+    torch::Tensor seq_lens, int64_t max_query_len, double sm_scale,
+    bool causal) {
+  TORCH_CHECK(false, "paged_prefill_attn_rdna3_int8 requires ROCm");
+}
+#endif
