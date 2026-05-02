@@ -89,7 +89,7 @@ __device__ __forceinline__ void load_k_tile_paged_int8_coop(
     T* __restrict__ scale_lds,  // [K_TILE] scales in LDS (shared)
     int tid) {
   constexpr int X_INT8 = 16;
-  constexpr int D_HIGH = HEAD_SIZE / X_INT8;  // = 8
+  constexpr int D_HIGH [[maybe_unused]] = HEAD_SIZE / X_INT8;  // = 8
   constexpr int X_FP16 = 16 / sizeof(T);     // = 8
 
   // 128 threads: slot = tid / 8 (0..15), d_chunk = tid % 8 (0..7)
