@@ -63,14 +63,16 @@ __device__ __forceinline__ float wave16_sum(float v) {
 
 // ---------------------------------------------------------------------------
 // INT8 K cache load + dequant to LDS (fp16/bf16).
-// K cache layout: [blocks, heads, d_high (HEAD_SIZE/X_INT8), slots, X_INT8]
-// where X_INT8 = 16 (16 int8 per 16-byte vec load).
+// K cache layout (per-token-head 4D): [blocks, slots, heads, dim]
+// dim is contiguous (stride=1). Each vec load reads 16 contiguous int8
+// values along dim for a given (block, slot, head).
 //
-// Each 16-byte vec load gives 16 int8 values. After dequant (int8→fp16),
-// we store 16 fp16 values = 32 bytes to LDS. So LDS format is the same
-// as the fp16 v2 kernel.
+// Strategy: K_TILE(16) slots × D_HIGH(8) chunks of 16 int8 = 128 work items.
+// 128 threads → 1 vec load per thread (perfect mapping).
+// Distribution: slot = tid / 8, d_chunk = tid % 8.
 //
-// Per-token scale: one float per (block, slot, kv_head).
+// After dequant (int8→fp16), store to K_lds in the v2 WMMA-friendly layout:
+// K_lds_raw[d_high][k_idx][X_FP16] where X_FP16 = 8 (= 16 bytes per entry).
 // ---------------------------------------------------------------------------
 
 template <typename T, int HEAD_SIZE>
@@ -86,16 +88,13 @@ __device__ __forceinline__ void load_k_tile_paged_int8_coop(
     int64_t stride_ks_blk, int64_t stride_ks_slot, int64_t stride_ks_head,
     T* __restrict__ scale_lds,  // [K_TILE] scales in LDS (shared)
     int tid) {
-  // X_INT8 = 16 (16 int8 values per vec load)
   constexpr int X_INT8 = 16;
-  constexpr int D_HIGH = HEAD_SIZE / X_INT8;  // = 8 for HEAD_SIZE=128
+  constexpr int D_HIGH = HEAD_SIZE / X_INT8;  // = 8
+  constexpr int X_FP16 = 16 / sizeof(T);     // = 8
 
-  // 128 threads × 2 vec loads = 256 work items = K_TILE × D_HIGH × 1
-  // Actually K_TILE(16) × D_HIGH(8) = 128, so 1 vec load per thread.
-  // But we write 16 fp16 (32 bytes) per vec load to LDS.
-  // Total LDS writes: 128 × 32 bytes = 4096 bytes = 4 KB (same as fp16).
-  const int my_k_idx = tid >> 3;         // tid / 8 → 0..15 (K_TILE slots)
-  const int my_dh = tid & 7;             // tid % 8 → 0..7 (D_HIGH chunks)
+  // 128 threads: slot = tid / 8 (0..15), d_chunk = tid % 8 (0..7)
+  const int my_k_idx = tid >> 3;   // slot within tile (0..15)
+  const int my_dh = tid & 7;       // dim chunk (0..7, each = 16 int8)
 
   const int abs_k = start_n + my_k_idx;
   const bool valid_k = abs_k < seq_ctx_len;
@@ -104,8 +103,7 @@ __device__ __forceinline__ void load_k_tile_paged_int8_coop(
   const int p_block =
       valid_k ? block_table[seq_idx * max_blocks_per_seq + log_block] : 0;
 
-  // Load scale for this slot (one thread per slot loads it)
-  // We need K_TILE=16 scales. Thread tid%8==0 for each k_idx loads one.
+  // Load scale (1 per slot, thread with d_chunk==0 loads it)
   if (my_dh == 0 && valid_k) {
     float sc = k_scale_cache[p_block * stride_ks_blk +
                              slot * stride_ks_slot +
@@ -113,51 +111,33 @@ __device__ __forceinline__ void load_k_tile_paged_int8_coop(
     scale_lds[my_k_idx] = to_T<T>(sc);
   }
 
-  // Load 16 int8 values from K cache
+  // Load 16 contiguous int8 from K[p_block, slot, kv_head, d_base..d_base+16]
+  // 4D layout: offset = block*stride_block + slot*stride_slot + head*stride_head + d
+  // stride_kc_dhi repurposed as "16" (chunk stride = 16 int8 per chunk)
+  // stride_kc_slot repurposed as actual slot stride
+  const int d_base = my_dh * X_INT8;
   const int8_t* src = k_cache_i8 + (int64_t)p_block * stride_kc_block +
+                      (int64_t)slot * stride_kc_slot +
                       (int64_t)kv_head_idx * stride_kc_head +
-                      (int64_t)my_dh * stride_kc_dhi +
-                      (int64_t)slot * stride_kc_slot;
+                      (int64_t)d_base;  // dim is contiguous
 
   int8_t k_i8[X_INT8];
   if (valid_k) {
-    // 16-byte aligned vec load
     *(int4*)k_i8 = *(const int4*)src;
   } else {
     #pragma unroll
     for (int i = 0; i < X_INT8; ++i) k_i8[i] = 0;
   }
 
-  // Dequant int8 → fp16/bf16 and store to LDS.
-  // After __syncthreads, scale_lds will be populated.
-  // For now store raw converted values; scale applied in attn_step.
-  // Actually, we can apply scale here since each thread knows its k_idx.
-  // But scale_lds may not be ready yet (race with my_dh==0 stores).
-  // Solution: store unconverted to LDS, apply scale in attn_step.
-  // OR: use a two-phase approach (sync after scale load, then dequant).
-  //
-  // Simplest: store int8→fp16 cast (no scale) to LDS. Apply scale in
-  // attn_step after the WMMA as a post-multiply on S.
-  // This is the "fold scale post-matmul" approach (same as int8_per_tensor).
-  //
-  // K_lds layout: [d_high][k][X_FP16] where X_FP16 = 16/sizeof(T) = 8 for fp16
-  // But we're writing 16 fp16 values per dh... need to split into 2 writes
-  // of 8 fp16 each to match the existing layout.
-  constexpr int X_FP16 = 16 / sizeof(T);  // = 8 for fp16/bf16
+  // Dequant int8 → fp16 (scale applied post-matmul in attn_step)
   T dequant[X_INT8];
   #pragma unroll
   for (int i = 0; i < X_INT8; ++i) {
-    // v_cvt_f16_i16 (1 native instruction on gfx1100)
     dequant[i] = to_T<T>((float)k_i8[i]);
   }
 
-  // Store to LDS in the same layout as the fp16 v2 kernel:
-  // K_lds_raw[d_high * (K_TILE * X_FP16) + k_idx * X_FP16 + elem]
-  // We have 16 values but X_FP16=8, so this maps to 2 d_high entries.
-  // my_dh covers D_HIGH=8 chunks of 16 int8.
-  // After dequant we have 16 fp16 → split into 2 groups of 8:
-  //   group 0 → d_high = my_dh * 2 + 0
-  //   group 1 → d_high = my_dh * 2 + 1
+  // Store to K_lds in v2 layout: K_lds_raw[d_high][k_idx][X_FP16]
+  // 16 fp16 values → 2 groups of 8 fp16 (2 d_high entries)
   *(int4*)&K_lds_raw[(my_dh * 2 + 0) * (K_TILE * X_FP16) + my_k_idx * X_FP16] =
       *(int4*)&dequant[0];
   *(int4*)&K_lds_raw[(my_dh * 2 + 1) * (K_TILE * X_FP16) + my_k_idx * X_FP16] =
@@ -166,8 +146,17 @@ __device__ __forceinline__ void load_k_tile_paged_int8_coop(
 
 // ---------------------------------------------------------------------------
 // INT8 V cache load + dequant to LDS.
-// V cache layout: [blocks, heads, head_size, slots]
-// (slot is innermost — stride=1 for consecutive slots)
+// V cache layout (per-token-head 4D): [blocks, slots, heads, dim]
+// dim is contiguous (stride=1). Slots are strided (stride = heads × dim).
+//
+// Strategy: 128 threads cooperatively load K_TILE=16 slots × HEAD_SIZE=128
+// = 2048 int8 values = 2048 bytes. Each thread loads one 16-byte vec
+// (= 16 int8 values along the dim axis of one slot).
+// Distribution: slot = tid / 8, d_chunk = tid % 8.
+// 16 slots × 8 chunks = 128 thread assignments.
+//
+// V_lds target layout: [HEAD_SIZE][K_TILE] (dim outer, slot inner) to match
+// the WMMA fragment access pattern in attn_step.
 // ---------------------------------------------------------------------------
 
 template <typename T, int HEAD_SIZE>
@@ -202,38 +191,33 @@ __device__ __forceinline__ void load_v_tile_paged_int8_coop(
     v_scale_lds[tid] = to_T<T>(sc);
   }
 
-  // Each thread handles d = tid (0..127). Load K_TILE=16 int8 values.
-  const int d = tid;
-  const int8_t* src = v_cache_i8 + (int64_t)p_block * stride_vc_block +
-                      (int64_t)kv_head_idx * stride_vc_head +
-                      (int64_t)d * stride_vc_d +
-                      (int64_t)slot_base * stride_vc_slot;
+  // 128 threads: slot = tid / 8 (0..15), d_chunk = tid % 8 (0..7)
+  const int my_slot_offset = tid >> 3;  // 0..15
+  const int my_d_chunk = tid & 7;       // 0..7, each chunk = 16 int8
+  const int d_base = my_d_chunk * 16;
+  const int abs_slot = slot_base + my_slot_offset;
+  const bool valid = my_slot_offset < valid_k_count;
 
-  // V is stored with slot as innermost dim, so 16 consecutive int8 values
-  // = 16 bytes = one vec load (if valid and aligned).
-  int8_t v_i8[K_TILE];
-  if (valid_k_count >= K_TILE) {
-    *(int4*)&v_i8[0] = *(const int4*)src;
+  // Load 16 contiguous int8 from V[p_block, abs_slot, kv_head, d_base..d_base+16]
+  int8_t v_i8[16];
+  if (valid) {
+    const int8_t* src = v_cache_i8 + (int64_t)p_block * stride_vc_block +
+                        (int64_t)abs_slot * stride_vc_slot +
+                        (int64_t)kv_head_idx * stride_vc_head +
+                        (int64_t)d_base * stride_vc_d;
+    *(int4*)v_i8 = *(const int4*)src;
   } else {
     #pragma unroll
-    for (int k = 0; k < K_TILE; ++k) {
-      v_i8[k] = (k < valid_k_count) ? src[k] : (int8_t)0;
-    }
+    for (int i = 0; i < 16; ++i) v_i8[i] = 0;
   }
 
-  // Dequant and store to V_lds[d][k] as fp16
-  // Scale applied here (each slot k has its own scale).
-  // We don't have scale_lds ready yet if tid >= 16 (race).
-  // Solution: store raw cast, apply scale in attn_step on P*v_scale.
-  T v_dequant[K_TILE];
+  // Dequant int8 → fp16 and transpose-store to V_lds[d][k]
+  // V_lds layout: [HEAD_SIZE][K_TILE]. We write 16 elements scattered:
+  // for each of the 16 d values, write to V_lds[(d_base+i) * K_TILE + my_slot]
   #pragma unroll
-  for (int k = 0; k < K_TILE; ++k) {
-    v_dequant[k] = to_T<T>((float)v_i8[k]);
+  for (int i = 0; i < 16; ++i) {
+    V_lds[(d_base + i) * K_TILE + my_slot_offset] = to_T<T>((float)v_i8[i]);
   }
-
-  // Store as two 8-element vec writes (16 bytes each)
-  *(int4*)&V_lds[d * K_TILE + 0] = *(int4*)&v_dequant[0];
-  *(int4*)&V_lds[d * K_TILE + 8] = *(int4*)&v_dequant[8];
 }
 
 // ---------------------------------------------------------------------------
