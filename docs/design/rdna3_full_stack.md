@@ -239,14 +239,44 @@ MAX_JOBS=$(nproc) PYTORCH_ROCM_ARCH=gfx1100 python3 setup.py build_ext --inplace
 
 ## Branch Structure
 
+### Independent PR branches (each targets `main`)
+
 ```
 main
-├── perf/rdna3_w4a16_squashed           Layer 1 (PR open)
-├── perf/rdna3_triton_prefill_tuning    Layer 2
-├── refactor/prefill-fastpath-per-token-head-v2
-│   └── feat/rdna3_int8_int4_hip_kernels    Layer 3
+├── perf/rdna3_w4a16_squashed              Layer 1 — W4A16 WMMA GEMM kernel
+├── perf/rdna3_triton_prefill_tuning       Layer 2 — Triton prefill 3-tier adaptive
+├── feat/int8_per_tensor_clean             Layer 4 — INT8 per-tensor KV cache (kv_cache_scheme)
 │
-└── perf/rdna3_full_stack               All layers merged (this branch)
+├── refactor/prefill-fastpath-per-token-head-v2    (upstream dependency, NOT in main)
+│   └── feat/rdna3_int8_int4_hip_kernels           Layer 3 — HIP INT8/INT4 prefill kernels
+│
+└── perf/rdna3_full_stack                  Integration branch (all layers, local testing only)
 ```
 
-Each layer is independently mergeable. No conflicts between them.
+### PR dependency chain
+
+| Branch | PR target | Blocker |
+|--------|-----------|---------|
+| `perf/rdna3_w4a16_squashed` | `main` | None |
+| `perf/rdna3_triton_prefill_tuning` | `main` | None |
+| `feat/int8_per_tensor_clean` | `main` | None |
+| `refactor/prefill-fastpath-per-token-head-v2` | `main` | None (upstream) |
+| `feat/rdna3_int8_int4_hip_kernels` | `main` | Requires `refactor/prefill-fastpath-pth-v2` merged first |
+| `perf/rdna3_full_stack` | — | Not for PR; integration branch for E2E testing |
+
+### Integration branch composition (`perf/rdna3_full_stack`)
+
+Built from `main` via successive merges and cherry-picks:
+
+1. merge(`refactor/prefill-fastpath-per-token-head-v2`)
+2. merge(`feat/rdna3_int8_int4_hip_kernels`)
+3. merge(`perf/rdna3_w4a16_squashed`)
+4. merge(`perf/rdna3_triton_prefill_tuning`)
+5. merge(`main`) — rebase to current main
+6. merge(`feat/rdna3_int8_int4_hip_kernels`) — update with HEAD_SIZE fix
+7. merge(`perf/rdna3_triton_prefill_tuning`) — update with latest tuning
+8. cherry-pick: multi HEAD_SIZE HIP kernels + INT8 per-tensor KV cache
+9. cherry-pick: `feat/int8_per_tensor_clean` (attention.py kv_cache_scheme fix)
+
+Layers 1–3 are independently mergeable. Layer 3 depends on the upstream
+refactor branch. Layer 4 (INT8 per-tensor) is independent of all others.
