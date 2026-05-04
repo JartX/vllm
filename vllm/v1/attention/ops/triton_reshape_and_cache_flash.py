@@ -153,8 +153,6 @@ def reshape_and_cache_kernel_flash(
         if value_load.dtype.is_fp8():
             value_tile = value_load
         else:
-            # tl.store will do the correct implicit cast to fp8,
-            #  based on the value_cache_ptr.dtype.element_ty
             value_tile = value_load / tl.load(v_scale)
     else:
         value_tile = value_load
@@ -223,8 +221,6 @@ def triton_reshape_and_cache_flash(
         and key_cache.dtype != kv_cache_torch_dtype
         and is_quantized_kv_cache(kv_cache_dtype)
     ):
-        # to avoid erounous implicit cast in triton kernel (tl.store to uint8)
-        # (e.g. explicit cast to fp8e4m3fnuz is not supported in triton 3.4)
         key_cache = key_cache.view(kv_cache_torch_dtype)
         value_cache = value_cache.view(kv_cache_torch_dtype)
 
