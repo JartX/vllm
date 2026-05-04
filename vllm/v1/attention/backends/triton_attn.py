@@ -392,6 +392,7 @@ class TritonAttentionBackend(AttentionBackend):
         "fp8",
         "fp8_e4m3",
         "fp8_e5m2",
+        "int8_per_tensor",
         "int2_per_token_head",
         "int4_per_token_head",
         "int8_per_token_head",
@@ -809,10 +810,12 @@ class TritonAttentionImpl(AttentionImpl):
                     key_cache.dtype == torch.int8 and current_platform.is_rocm()
                 )
 
-                # RDNA3 HIP kernel: 8x faster than Triton for INT8 prefill.
+                # RDNA3 HIP kernel for INT8 per-token-head prefill.
                 # Gate: int8 cache + RDNA3 + has the compiled op.
+                _head_size = query.shape[2]
                 if (
                     use_qk_int8_wmma
+                    and _head_size in (64, 128, 256)
                     and hasattr(torch.ops, "_C")
                     and hasattr(torch.ops._C, "paged_prefill_attn_rdna3_int8")
                 ):
@@ -838,6 +841,7 @@ class TritonAttentionImpl(AttentionImpl):
                 # Asymmetric dequant (zp + scale) with RHT rotation.
                 if (
                     self._kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD
+                    and _head_size in (64, 128, 256)
                     and current_platform.is_rocm()
                     and hasattr(torch.ops, "_C")
                     and hasattr(torch.ops._C, "paged_prefill_attn_rdna3_int4")
@@ -993,6 +997,7 @@ class TritonAttentionImpl(AttentionImpl):
             k_descale = None
             v_descale = None
 
+
             # Dedicated split-KV kernel for decode + small continuation
             # prefill. Gated on max_query_len ≤ threshold; larger shapes
             # fall through to unified_attention (better BLOCK_Q sharing).
@@ -1034,10 +1039,13 @@ class TritonAttentionImpl(AttentionImpl):
                     kv_quant_mode=self._kv_quant_mode,
                 )
                 return output
-        # FP8 per-tensor / auto path (original flow).
+        # FP8 per-tensor / INT8 per-tensor / auto path (original flow).
         else:
             key_cache, value_cache = kv_cache.unbind(1)
-            if is_quantized_kv_cache(self.kv_cache_dtype):
+            if (
+                is_quantized_kv_cache(self.kv_cache_dtype)
+                and self.kv_cache_dtype != "int8_per_tensor"
+            ):
                 if key_cache.dtype != self.fp8_dtype:
                     key_cache = key_cache.view(self.fp8_dtype)
                     value_cache = value_cache.view(self.fp8_dtype)
@@ -1185,7 +1193,10 @@ class TritonAttentionImpl(AttentionImpl):
             return
         # For decoder and cross-attention, use KV cache as before.
         key_cache, value_cache = kv_cache.unbind(1)
-        if is_quantized_kv_cache(self.kv_cache_dtype):
+        if (
+            is_quantized_kv_cache(self.kv_cache_dtype)
+            and self.kv_cache_dtype != "int8_per_tensor"
+        ):
             key_cache = key_cache.view(self.fp8_dtype)
             value_cache = value_cache.view(self.fp8_dtype)
         triton_reshape_and_cache_flash(

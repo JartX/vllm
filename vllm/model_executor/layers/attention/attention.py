@@ -118,6 +118,7 @@ def set_default_quant_scales(layer: nn.Module, register_buffer: bool = False) ->
     layer.v_range = torch.tensor(envs.V_SCALE_CONSTANT, dtype=torch.float32)
 
 
+
 def _init_kv_cache_quant(
     layer: nn.Module,
     quant_config: QuantizationConfig | None,
@@ -161,6 +162,9 @@ def _init_kv_cache_quant(
 
     # See [Note: Register q/k/v/prob scales in state dict]
     if should_load_quant_weights(quant_method):
+        from vllm.model_executor.layers.quantization.kv_cache import (
+            BaseKVCacheMethod,
+        )
         assert isinstance(quant_method, BaseKVCacheMethod)
         # TODO (mgoin): kv cache dtype should be specified in the FP8
         # checkpoint config and become the "auto" behavior

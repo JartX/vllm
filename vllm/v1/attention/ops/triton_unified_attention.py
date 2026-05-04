@@ -111,10 +111,10 @@ def kernel_unified_attention(
     # to ``[segm_idx, segm_idx+1) × tiles_per_segment`` and writes
     # per-segment partials, finalized by ``reduce_segments``.
     IS_3D: tl.constexpr,
-    # KV cache quantization mode handled inside this kernel.  Modes
-    # NONE (0), FP8_PER_TENSOR (1), INT8_PER_TOKEN_HEAD (2) and
-    # FP8_PER_TOKEN_HEAD (3) all use this kernel via constexpr branches.
-    # Sub-byte packed modes (INT4=4, INT2=5) are dispatched to dedicated
+    # KV cache quantization mode handled inside this kernel via constexpr
+    # branches: NONE (0), FP8_PER_TENSOR (1), INT8_PER_TOKEN_HEAD (2),
+    # FP8_PER_TOKEN_HEAD (3), INT8_PER_TENSOR (5).
+    # Sub-byte packed modes (INT4=4, INT2=6) are dispatched to dedicated
     # factories in ``vllm.v1.attention.ops.triton_quant_kv``.
     KV_QUANT_MODE: tl.constexpr = 0,
     # Use int8 WMMA/MFMA for the QK dot (requires KV_QUANT_MODE==2 and int8 cache)
@@ -127,7 +127,9 @@ def kernel_unified_attention(
     CHUNK_LOOKBACK: tl.constexpr = -1,
     CHUNK_SIZE: tl.constexpr = -1,
 ):
-    USE_PER_TOKEN_HEAD_SCALES: tl.constexpr = KV_QUANT_MODE >= 2
+    USE_PER_TOKEN_HEAD_SCALES: tl.constexpr = (KV_QUANT_MODE == 2) or (
+        KV_QUANT_MODE == 3
+    )
 
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -221,6 +223,12 @@ def kernel_unified_attention(
         CHUNK_LOOKBACK,
         CHUNK_SIZE,
     )
+
+    # INT8 per-tensor: fold k_scale into softmax scale, apply v_scale post-loop
+    if KV_QUANT_MODE == 5:
+        int8_k_scale_val = tl.load(k_scale)
+        int8_v_scale_val = tl.load(v_scale)
+        scale = scale * int8_k_scale_val
 
     # iterate through tiles (now limited to the sliding window range)
     for j in range(loop_lo, loop_hi):
@@ -348,6 +356,10 @@ def kernel_unified_attention(
             acc += tl.dot(P_v, V)
         else:
             acc += tl.dot(P.to(V.dtype), V)
+
+    # INT8 per-tensor: apply v_scale once on accumulated output
+    if KV_QUANT_MODE == 5:
+        acc = acc * int8_v_scale_val
 
     # ---- Epilogue ---------------------------------------------------------
     if IS_3D:

@@ -56,6 +56,9 @@ def cast_kv_tile(data, Q, tensor_scale, KV_QUANT_MODE: tl.constexpr):
         if Q.dtype.is_fp8():
             return data.to(Q.dtype)
         return (data.to(tl.float32) * tl.load(tensor_scale)).to(Q.dtype)
+    if KV_QUANT_MODE == 5:
+        # INT8 per-tensor: plain cast, scale folded into softmax_scale
+        return data.to(Q.dtype)
     return data.to(Q.dtype)
 
 
