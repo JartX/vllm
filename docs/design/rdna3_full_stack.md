@@ -264,19 +264,125 @@ main
 | `feat/rdna3_int8_int4_hip_kernels` | `main` | Requires `refactor/prefill-fastpath-pth-v2` merged first |
 | `perf/rdna3_full_stack` | — | Not for PR; integration branch for E2E testing |
 
-### Integration branch composition (`perf/rdna3_full_stack`)
+### Rebuilding the integration branch (`perf/rdna3_full_stack`)
 
-Built from `main` via successive merges and cherry-picks:
+The integration branch can be reconstructed from `main` plus the five
+dependency branches.  Merge order matters — later merges depend on context
+introduced by earlier ones.
 
-1. merge(`refactor/prefill-fastpath-per-token-head-v2`)
-2. merge(`feat/rdna3_int8_int4_hip_kernels`)
-3. merge(`perf/rdna3_w4a16_squashed`)
-4. merge(`perf/rdna3_triton_prefill_tuning`)
-5. merge(`main`) — rebase to current main
-6. merge(`feat/rdna3_int8_int4_hip_kernels`) — update with HEAD_SIZE fix
-7. merge(`perf/rdna3_triton_prefill_tuning`) — update with latest tuning
-8. cherry-pick: multi HEAD_SIZE HIP kernels + INT8 per-tensor KV cache
-9. cherry-pick: `feat/int8_per_tensor_clean` (attention.py kv_cache_scheme fix)
+```bash
+git checkout -b perf/rdna3_full_stack_rebuild main
 
-Layers 1–3 are independently mergeable. Layer 3 depends on the upstream
-refactor branch. Layer 4 (INT8 per-tensor) is independent of all others.
+# Layer 1 — clean merge
+git merge perf/rdna3_w4a16_squashed
+
+# Layer 2 — CONFLICT in triton_unified_attention.py (see §Conflict 1)
+git merge perf/rdna3_triton_prefill_tuning
+
+# Upstream dep for Layer 3 — clean merge
+git merge refactor/prefill-fastpath-per-token-head-v2
+
+# Layer 3 — CONFLICT in csrc/ops.h, csrc/torch_bindings.cpp (see §Conflict 2)
+git merge feat/rdna3_int8_int4_hip_kernels
+
+# Layer 4 — CONFLICT in 4 files (see §Conflict 3)
+git merge feat/int8_per_tensor_clean
+
+# Own commits (docs, multi HEAD_SIZE) — cherry-pick from old full_stack
+git cherry-pick <docs-commits> <multi-headsize-commit>
+# The multi HEAD_SIZE cherry-pick has minor conflicts (see §Conflict 4)
+```
+
+### Known merge conflicts and resolutions
+
+These conflicts are **expected and unavoidable**.  Each PR branch targets
+`main` independently — they cannot be pre-aligned to each other without
+rewriting pushed history, and doing so would break them against `main`
+(where the other branches don't exist yet).
+
+#### Conflict 1: Layer 1 × Layer 2 — `triton_unified_attention.py`
+
+**File**: `vllm/v1/attention/ops/triton_unified_attention.py` (3 hunks)
+
+**Cause**: Layer 1 (`w4a16_squashed`) adds a simple RDNA3 prefill override
+(`BLOCK_M=32`, `num_warps=2`).  Layer 2 (`triton_prefill_tuning`) replaces
+that same block with the full 3-tier adaptive logic (M32/M64/M128 with
+2/4/8 warps).  Both insert at the same location after `BLOCK_M = 16 if ...`.
+
+**Resolution**: Take Layer 2's version for all 3 hunks — it is the superset.
+Layer 1's M32+2warps is Layer 2's "short KV" tier.
+
+#### Conflict 2: Layer 3 — `csrc/ops.h`, `csrc/torch_bindings.cpp`
+
+**Files**: `csrc/ops.h`, `csrc/torch_bindings.cpp` (1 hunk each)
+
+**Cause**: Layer 1 adds GPTQ RDNA3 function declarations after
+`gptq_shuffle`.  Layer 3 adds HIP INT8/INT4 attention declarations at
+the same insertion point.  Git can't merge two independent additions at
+the same location.
+
+**Resolution**: Keep both blocks.  Order doesn't matter — they are
+independent function declarations.  Convention: GPTQ ops first, then
+attention ops.
+
+#### Conflict 3: Layer 4 — 4 files
+
+**Files** (1 hunk each unless noted):
+
+| File | Hunks | Cause |
+|------|-------|-------|
+| `vllm/utils/torch_utils.py` | 1 | Layer 4 adds `"int8_per_tensor"`, upstream refactor adds `"int2/int4_per_token_head"` — same insertion point |
+| `vllm/v1/kv_cache_interface.py` | 2 | (a) Enum numbering: Layer 4 uses `INT8_PER_TENSOR=5, NVFP4=4` but upstream refactor already assigned 4=INT4, 5=INT2, 6=NVFP4. (b) `get_kv_quant_mode()`: both add entries at the same spot |
+| `vllm/v1/attention/ops/triton_unified_attention.py` | 1 | Layer 4 adds `_cast_kv_tile` inline; upstream refactor moved it to `triton_attention_helpers.py` (with mode 5 already supported) |
+| `vllm/v1/attention/backends/triton_attn.py` | 1 | `supported_kv_cache_dtypes`: same insertion point for `"int8_per_tensor"` vs `"int2/int4_per_token_head"` |
+
+**Why Layer 4 can't be pre-fixed**: `feat/int8_per_tensor_clean` targets
+`main`, where `refactor/prefill-fastpath-per-token-head-v2` doesn't exist
+yet.  On `main`, enum value 5 is free and `_cast_kv_tile` doesn't exist in
+helpers.  If we changed Layer 4 to use enum=7 and skip the inline helper,
+it would break against `main`.
+
+**Resolution**:
+- `torch_utils.py` / `triton_attn.py`: Keep both sides (add all entries).
+- `kv_cache_interface.py`: Renumber to `INT8_PER_TENSOR=5, INT2=6, NVFP4=7`
+  (or any consistent numbering). Add `int8_per_tensor` mapping to
+  `get_kv_quant_mode()`.
+- `triton_unified_attention.py`: Drop the inline `_cast_kv_tile` — it's
+  already in `triton_attention_helpers.py` with mode 5 support.
+
+#### Conflict 4: multi HEAD_SIZE cherry-pick — 2 files
+
+**Files**: `vllm/v1/attention/ops/triton_reshape_and_cache_flash.py` (5
+trivial hunks), `vllm/v1/kv_cache_interface.py` (1 hunk)
+
+**Cause**: This commit was authored on the old `full_stack` where the
+enum numbering and comments differed from the freshly-merged state.
+
+**Resolution**:
+- `triton_reshape_and_cache_flash.py`: Keep the comments from the
+  cherry-pick (they add useful context: "INT8 per-tensor: quantize to
+  [-128, 127]", "Platform", etc.).
+- `kv_cache_interface.py`: Keep the numbering from HEAD (consistent with
+  Conflict 3 resolution).
+
+### Why the branches can't be conflict-free
+
+Each PR branch is designed to merge cleanly into `main` on its own.
+They share no common ancestor beyond `main` itself, yet they touch
+overlapping files:
+
+- `triton_unified_attention.py` is modified by Layers 1, 2, and 4
+- `kv_cache_interface.py` is modified by the upstream refactor and Layer 4
+- `csrc/ops.h` / `torch_bindings.cpp` are modified by Layers 1 and 3
+- `triton_attn.py` and `torch_utils.py` are modified by the refactor and Layer 4
+
+Making them conflict-free against each other would require either:
+1. **Rewriting history** on pushed branches — breaks collaboration
+2. **Pre-aligning to unreleased code** — breaks the branch against `main`
+3. **Merging in a fixed order** and rebasing later branches — creates
+   artificial dependencies between independent features
+
+Option 3 is what `perf/rdna3_full_stack` effectively does as an
+integration branch.  The individual PR branches stay clean against
+`main`, and the documented conflict resolutions above make reconstruction
+deterministic.
