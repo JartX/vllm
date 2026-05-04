@@ -809,10 +809,12 @@ class TritonAttentionImpl(AttentionImpl):
                     key_cache.dtype == torch.int8 and current_platform.is_rocm()
                 )
 
-                # RDNA3 HIP kernel: 8x faster than Triton for INT8 prefill.
+                # RDNA3 HIP kernel for INT8 per-token-head prefill.
                 # Gate: int8 cache + RDNA3 + has the compiled op.
+                _head_size = query.shape[2]
                 if (
                     use_qk_int8_wmma
+                    and _head_size in (64, 128, 256)
                     and hasattr(torch.ops, "_C")
                     and hasattr(torch.ops._C, "paged_prefill_attn_rdna3_int8")
                 ):
@@ -838,6 +840,7 @@ class TritonAttentionImpl(AttentionImpl):
                 # Asymmetric dequant (zp + scale) with RHT rotation.
                 if (
                     self._kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD
+                    and _head_size in (64, 128, 256)
                     and current_platform.is_rocm()
                     and hasattr(torch.ops, "_C")
                     and hasattr(torch.ops._C, "paged_prefill_attn_rdna3_int4")

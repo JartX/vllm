@@ -40,10 +40,9 @@ using vllm::prefill_attn_rdna3::wmma_mma;
 using vllm::prefill_attn_rdna3::WmmaNative;
 
 constexpr int K_TILE = 16;
-constexpr int NUM_WAVES = 4;
 constexpr int M_PER_WAVE = 16;
-constexpr int BLOCK_M_V2 = NUM_WAVES * M_PER_WAVE;  // = 64
-constexpr int THREADS = NUM_WAVES * 32;             // = 128
+// THREADS = HEAD_SIZE, NUM_WAVES = HEAD_SIZE/32, BLOCK_M = NUM_WAVES*16.
+// These are derived per-template inside the kernel/functions.
 
 __device__ __forceinline__ float wave16_max(float v) {
   v = fmaxf(v, __shfl_xor(v, 1));
@@ -86,15 +85,15 @@ __device__ __forceinline__ void load_k_tile_paged_int8_coop(
     int64_t stride_kc_block, int64_t stride_kc_head,
     int64_t stride_kc_dhi, int64_t stride_kc_slot,
     int64_t stride_ks_blk, int64_t stride_ks_slot, int64_t stride_ks_head,
-    T* __restrict__ scale_lds,  // [K_TILE] scales in LDS (shared)
+    float* __restrict__ scale_lds,  // [K_TILE] scales in LDS (fp32)
     int tid) {
   constexpr int X_INT8 = 16;
-  constexpr int D_HIGH [[maybe_unused]] = HEAD_SIZE / X_INT8;  // = 8
-  constexpr int X_FP16 = 16 / sizeof(T);     // = 8
+  constexpr int D_CHUNKS = HEAD_SIZE / X_INT8;  // chunks per head (8 for 128, 16 for 256)
+  constexpr int X_FP16 = 16 / sizeof(T);        // = 8
 
-  // 128 threads: slot = tid / 8 (0..15), d_chunk = tid % 8 (0..7)
-  const int my_k_idx = tid >> 3;   // slot within tile (0..15)
-  const int my_dh = tid & 7;       // dim chunk (0..7, each = 16 int8)
+  // HEAD_SIZE threads: slot = tid / D_CHUNKS, d_chunk = tid % D_CHUNKS
+  const int my_k_idx = tid / D_CHUNKS;
+  const int my_dh = tid % D_CHUNKS;
 
   const int abs_k = start_n + my_k_idx;
   const bool valid_k = abs_k < seq_ctx_len;
@@ -104,11 +103,13 @@ __device__ __forceinline__ void load_k_tile_paged_int8_coop(
       valid_k ? block_table[seq_idx * max_blocks_per_seq + log_block] : 0;
 
   // Load scale (1 per slot, thread with d_chunk==0 loads it)
-  if (my_dh == 0 && valid_k) {
-    float sc = k_scale_cache[p_block * stride_ks_blk +
-                             slot * stride_ks_slot +
-                             kv_head_idx * stride_ks_head];
-    scale_lds[my_k_idx] = to_T<T>(sc);
+  if (my_dh == 0) {
+    float sc = valid_k
+        ? k_scale_cache[p_block * stride_ks_blk +
+                        slot * stride_ks_slot +
+                        kv_head_idx * stride_ks_head]
+        : 0.0f;
+    scale_lds[my_k_idx] = sc;
   }
 
   // Load 16 contiguous int8 from K[p_block, slot, kv_head, d_base..d_base+16]
@@ -170,33 +171,39 @@ __device__ __forceinline__ void load_v_tile_paged_int8_coop(
     int64_t stride_vc_block, int64_t stride_vc_head,
     int64_t stride_vc_d, int64_t stride_vc_slot,
     int64_t stride_vs_blk, int64_t stride_vs_slot, int64_t stride_vs_head,
-    T* __restrict__ v_scale_lds,  // [K_TILE] v_scales in LDS
+    float* __restrict__ v_scale_lds,  // [K_TILE] v_scales in LDS (fp32)
     int tid) {
-  static_assert(HEAD_SIZE == THREADS,
-                "v2 V load assumes HEAD_SIZE == THREADS (128)");
+  constexpr int D_CHUNKS = HEAD_SIZE / 16;  // chunks per head
 
-  const int log_block = start_n / block_size;
-  const int slot_base = start_n - log_block * block_size;
-  const int p_block = block_table[seq_idx * max_blocks_per_seq + log_block];
   const int valid_k_count = max(0, min(K_TILE, seq_ctx_len - start_n));
 
   // Load V scales for this tile (16 slots). Thread 0..15 each load one.
+  // Per-slot block lookup to handle tiles that cross a block boundary.
   if (tid < K_TILE) {
-    const int slot = slot_base + tid;
-    float sc = (tid < valid_k_count)
-        ? v_scale_cache[p_block * stride_vs_blk +
+    const int abs_k = start_n + tid;
+    const bool valid_s = tid < valid_k_count;
+    const int log_blk = abs_k / block_size;
+    const int slot = abs_k - log_blk * block_size;
+    const int p_blk =
+        valid_s ? block_table[seq_idx * max_blocks_per_seq + log_blk] : 0;
+    float sc = valid_s
+        ? v_scale_cache[p_blk * stride_vs_blk +
                         slot * stride_vs_slot +
                         kv_head_idx * stride_vs_head]
         : 0.0f;
-    v_scale_lds[tid] = to_T<T>(sc);
+    v_scale_lds[tid] = sc;
   }
 
-  // 128 threads: slot = tid / 8 (0..15), d_chunk = tid % 8 (0..7)
-  const int my_slot_offset = tid >> 3;  // 0..15
-  const int my_d_chunk = tid & 7;       // 0..7, each chunk = 16 int8
+  // HEAD_SIZE threads: slot = tid / D_CHUNKS, d_chunk = tid % D_CHUNKS
+  const int my_slot_offset = tid / D_CHUNKS;
+  const int my_d_chunk = tid % D_CHUNKS;
   const int d_base = my_d_chunk * 16;
-  const int abs_slot = slot_base + my_slot_offset;
+  const int abs_k = start_n + my_slot_offset;
   const bool valid = my_slot_offset < valid_k_count;
+  const int log_block = abs_k / block_size;
+  const int abs_slot = abs_k - log_block * block_size;
+  const int p_block =
+      valid ? block_table[seq_idx * max_blocks_per_seq + log_block] : 0;
 
   // Load 16 contiguous int8 from V[p_block, abs_slot, kv_head, d_base..d_base+16]
   int8_t v_i8[16];
@@ -230,8 +237,8 @@ template <typename T, int HEAD_SIZE, int X, bool CAUSAL_MASK>
 __device__ __forceinline__ void attn_step_wave_int8(
     const T* __restrict__ K_lds_raw, const T* __restrict__ V_lds,
     T* __restrict__ P_lds_wave,
-    const T* __restrict__ k_scale_lds,  // [K_TILE] k_scales
-    const T* __restrict__ v_scale_lds,  // [K_TILE] v_scales
+    const float* __restrict__ k_scale_lds,  // [K_TILE] k_scales (fp32)
+    const float* __restrict__ v_scale_lds,  // [K_TILE] v_scales (fp32)
     typename WmmaNative<T>::v16 (&q_frags)[HEAD_SIZE / 16],
     v8fp32 (&out_acc)[HEAD_SIZE / 16], float (&m_state)[8], float (&l_state)[8],
     int wave_q_tile_start, int start_n, int valid_q_count, int valid_k_count,
@@ -256,7 +263,7 @@ __device__ __forceinline__ void attn_step_wave_int8(
   // ---- Apply k_scale per token + softmax scale + mask ----
   // k_scale_lds[lane_lo] contains the scale for the k-token at position lane_lo.
   // S[m][n] = Q[m] @ K[n] * k_scale[n] * sm_scale
-  const float k_sc = to_f(k_scale_lds[lane_lo]);
+  const float k_sc = k_scale_lds[lane_lo];
   const int abs_k = start_n + lane_lo;
   const bool k_in_seg = (lane_lo < valid_k_count);
   #pragma unroll
@@ -295,7 +302,7 @@ __device__ __forceinline__ void attn_step_wave_int8(
   // ---- Fuse v_scale into P before transpose ----
   // P[m][k] *= v_scale[k] (multiply each column of P by the v_scale of that
   // token). lane_lo corresponds to the k position.
-  const float v_sc = to_f(v_scale_lds[lane_lo]);
+  const float v_sc = v_scale_lds[lane_lo];
   #pragma unroll
   for (int i = 0; i < 8; ++i) {
     p_ij[i] *= v_sc;
@@ -368,6 +375,9 @@ __global__ void paged_prefill_attn_kernel_v2_int8(
   using E = typename WmmaNative<T>::elem;
   constexpr int FRAGS = HEAD_SIZE / 16;
   constexpr int X_FP16 = 16 / sizeof(T);  // = 8
+  constexpr int THREADS = HEAD_SIZE;
+  constexpr int NUM_WAVES = THREADS / 32;
+  constexpr int BLOCK_M = NUM_WAVES * M_PER_WAVE;
 
   const int seq_idx = blockIdx.x;
   const int head_idx = blockIdx.y;
@@ -385,7 +395,7 @@ __global__ void paged_prefill_attn_kernel_v2_int8(
   const int seq_len = seq_lens[seq_idx];
   const int ctx_len = seq_len - query_len;
 
-  const int q_tile_start = q_tile_idx * BLOCK_M_V2;
+  const int q_tile_start = q_tile_idx * BLOCK_M;
   if (q_tile_start >= query_len) return;
 
   const int wave_q_offset = wave_id * M_PER_WAVE;
@@ -428,9 +438,9 @@ __global__ void paged_prefill_attn_kernel_v2_int8(
   // ---- Shared LDS ----
   __shared__ T K_lds_raw[FRAGS * 2 * K_TILE * X_FP16];  // 4 KB
   __shared__ T V_lds[HEAD_SIZE * K_TILE];                // 4 KB
-  __shared__ T P_lds[NUM_WAVES][M_PER_WAVE * K_TILE];    // 2 KB
-  __shared__ T k_scale_lds[K_TILE];                      // 32 B
-  __shared__ T v_scale_lds[K_TILE];                      // 32 B
+  __shared__ T P_lds[NUM_WAVES][M_PER_WAVE * K_TILE];
+  __shared__ float k_scale_lds[K_TILE];                   // 64 B
+  __shared__ float v_scale_lds[K_TILE];                   // 64 B
   T* P_lds_wave = &P_lds[wave_id][0];
 
   // ---- PHASE 1: Cached prefix (INT8 paged cache, no causal) ----
@@ -463,7 +473,7 @@ __global__ void paged_prefill_attn_kernel_v2_int8(
   // Reuse the fp16 v2 loaders and the original attn_step (no int8 scales).
   // Import from the v2 namespace.
   const int valid_q_count_for_block =
-      max(0, min(BLOCK_M_V2, query_len - q_tile_start));
+      max(0, min(BLOCK_M, query_len - q_tile_start));
   const int causal_k_upper =
       causal ? (q_tile_start + valid_q_count_for_block) : query_len;
   const int phase2_k_end = min(query_len, causal_k_upper);
@@ -474,8 +484,9 @@ __global__ void paged_prefill_attn_kernel_v2_int8(
     // K chunk: load cooperatively into K_lds_raw (same format as fp16 v2)
     {
       constexpr int X = X_FP16;
-      const int my_k_idx = tid >> 3;
-      const int my_dh_base = (tid & 7) * 2;
+      constexpr int D_CHUNKS = HEAD_SIZE / 16;  // threads per slot
+      const int my_k_idx = tid / D_CHUNKS;
+      const int my_dh_base = (tid % D_CHUNKS) * 2;
       const int abs_k = start_n + my_k_idx;
       const bool valid_k = abs_k < query_len;
       const T* row = valid_k
@@ -496,10 +507,11 @@ __global__ void paged_prefill_attn_kernel_v2_int8(
     }
     // V chunk
     {
+      constexpr int TPS = HEAD_SIZE / K_TILE;  // threads per slot
       #pragma unroll
       for (int p = 0; p < 2; ++p) {
-        const int my_k = tid >> 3;
-        const int my_dc = (tid & 7) + p * 8;
+        const int my_k = tid / TPS;
+        const int my_dc = (tid % TPS) + p * TPS;
         const int d_base = my_dc * 8;
         const int abs_k = start_n + my_k;
         const bool valid = abs_k < query_len;
@@ -522,8 +534,8 @@ __global__ void paged_prefill_attn_kernel_v2_int8(
     }
     // Scales = 1.0 for chunk (not quantized yet)
     if (tid < K_TILE) {
-      k_scale_lds[tid] = to_T<T>(1.0f);
-      v_scale_lds[tid] = to_T<T>(1.0f);
+      k_scale_lds[tid] = 1.0f;
+      v_scale_lds[tid] = 1.0f;
     }
     __syncthreads();
 
@@ -578,7 +590,10 @@ void launch_paged_prefill_attn_v2_int8(
     int64_t stride_vs_blk, int64_t stride_vs_slot, int64_t stride_vs_head,
     int64_t stride_o_token, int64_t stride_o_head,
     cudaStream_t stream) {
-  const int q_blocks = (max_query_len + BLOCK_M_V2 - 1) / BLOCK_M_V2;
+  constexpr int THREADS = HEAD_SIZE;
+  constexpr int NUM_WAVES = THREADS / 32;
+  constexpr int BLOCK_M = NUM_WAVES * M_PER_WAVE;
+  const int q_blocks = (max_query_len + BLOCK_M - 1) / BLOCK_M;
   dim3 block(THREADS);
   dim3 grid(num_seqs, num_query_heads, q_blocks);
   paged_prefill_attn_kernel_v2_int8<T, HEAD_SIZE><<<grid, block, 0, stream>>>(
@@ -649,61 +664,57 @@ void paged_prefill_attn_rdna3_int8(
               "paged_prefill_attn_rdna3_int8: only fp16/bf16 supported");
   TORCH_CHECK(k_cache.dtype() == at::kChar, "k_cache must be int8");
 
+  // Derive head_size from cache layout: padded_hs - scale_pad(4)
+  const int head_size = q.size(2);
+
+  // Macro to reduce boilerplate for head_size dispatch
+  #define LAUNCH_INT8(T, HS)                                                   \
+    launch_paged_prefill_attn_v2_int8<T, HS>(                                  \
+        (T*)out.data_ptr(), (const T*)q.data_ptr(),                            \
+        (const T*)k_chunk.data_ptr(), (const T*)v_chunk.data_ptr(),            \
+        (const int8_t*)k_cache.data_ptr(), (const int8_t*)v_cache.data_ptr(),  \
+        (const float*)k_scale_cache.data_ptr(),                                \
+        (const float*)v_scale_cache.data_ptr(),                                \
+        (const int*)block_table.data_ptr(),                                    \
+        (const int*)cu_seqlens_q.data_ptr(),                                   \
+        (const int*)seq_lens.data_ptr(),                                       \
+        num_seqs, num_query_heads, num_kv_heads,                               \
+        block_size, max_blocks_per_seq, (int)max_query_len,                    \
+        (float)sm_scale, causal,                                               \
+        q.stride(0), q.stride(1),                                              \
+        k_chunk.stride(0), k_chunk.stride(1),                                  \
+        v_chunk.stride(0), v_chunk.stride(1),                                  \
+        k_cache.stride(0), k_cache.stride(2), (int64_t)1, k_cache.stride(1),  \
+        v_cache.stride(0), v_cache.stride(2), (int64_t)1, v_cache.stride(1),  \
+        k_scale_cache.stride(0), k_scale_cache.stride(1),                     \
+        k_scale_cache.stride(2),                                               \
+        v_scale_cache.stride(0), v_scale_cache.stride(1),                     \
+        v_scale_cache.stride(2),                                               \
+        out.stride(0), out.stride(1),                                          \
+        stream)
+
   if (q.dtype() == at::kHalf) {
     using T = half;
-    launch_paged_prefill_attn_v2_int8<T, 128>(
-        (T*)out.data_ptr(), (const T*)q.data_ptr(),
-        (const T*)k_chunk.data_ptr(), (const T*)v_chunk.data_ptr(),
-        (const int8_t*)k_cache.data_ptr(), (const int8_t*)v_cache.data_ptr(),
-        (const float*)k_scale_cache.data_ptr(),
-        (const float*)v_scale_cache.data_ptr(),
-        (const int*)block_table.data_ptr(),
-        (const int*)cu_seqlens_q.data_ptr(),
-        (const int*)seq_lens.data_ptr(),
-        num_seqs, num_query_heads, num_kv_heads,
-        block_size, max_blocks_per_seq, (int)max_query_len,
-        (float)sm_scale, causal,
-        q.stride(0), q.stride(1),
-        k_chunk.stride(0), k_chunk.stride(1),
-        v_chunk.stride(0), v_chunk.stride(1),
-        // K cache 4D [blocks, slots, heads, dim]:
-        // kernel params: (block, head, dhi=unused, slot)
-        k_cache.stride(0), k_cache.stride(2), (int64_t)1, k_cache.stride(1),
-        // V cache 4D [blocks, slots, heads, dim]:
-        v_cache.stride(0), v_cache.stride(2), (int64_t)1, v_cache.stride(1),
-        // Scale caches [blocks, slots, heads]
-        k_scale_cache.stride(0), k_scale_cache.stride(1),
-        k_scale_cache.stride(2),
-        v_scale_cache.stride(0), v_scale_cache.stride(1),
-        v_scale_cache.stride(2),
-        out.stride(0), out.stride(1),
-        stream);
+    switch (head_size) {
+      case 64:  LAUNCH_INT8(T, 64);  break;
+      case 128: LAUNCH_INT8(T, 128); break;
+      case 256: LAUNCH_INT8(T, 256); break;
+      default:
+        TORCH_CHECK(false, "paged_prefill_attn_rdna3_int8: unsupported head_size=",
+                    head_size, " (supported: 64, 128, 256)");
+    }
   } else {
     using T = vllm::prefill_attn_rdna3::bf16_t;
-    launch_paged_prefill_attn_v2_int8<T, 128>(
-        (T*)out.data_ptr(), (const T*)q.data_ptr(),
-        (const T*)k_chunk.data_ptr(), (const T*)v_chunk.data_ptr(),
-        (const int8_t*)k_cache.data_ptr(), (const int8_t*)v_cache.data_ptr(),
-        (const float*)k_scale_cache.data_ptr(),
-        (const float*)v_scale_cache.data_ptr(),
-        (const int*)block_table.data_ptr(),
-        (const int*)cu_seqlens_q.data_ptr(),
-        (const int*)seq_lens.data_ptr(),
-        num_seqs, num_query_heads, num_kv_heads,
-        block_size, max_blocks_per_seq, (int)max_query_len,
-        (float)sm_scale, causal,
-        q.stride(0), q.stride(1),
-        k_chunk.stride(0), k_chunk.stride(1),
-        v_chunk.stride(0), v_chunk.stride(1),
-        k_cache.stride(0), k_cache.stride(2), (int64_t)1, k_cache.stride(1),
-        v_cache.stride(0), v_cache.stride(2), (int64_t)1, v_cache.stride(1),
-        k_scale_cache.stride(0), k_scale_cache.stride(1),
-        k_scale_cache.stride(2),
-        v_scale_cache.stride(0), v_scale_cache.stride(1),
-        v_scale_cache.stride(2),
-        out.stride(0), out.stride(1),
-        stream);
+    switch (head_size) {
+      case 64:  LAUNCH_INT8(T, 64);  break;
+      case 128: LAUNCH_INT8(T, 128); break;
+      case 256: LAUNCH_INT8(T, 256); break;
+      default:
+        TORCH_CHECK(false, "paged_prefill_attn_rdna3_int8: unsupported head_size=",
+                    head_size, " (supported: 64, 128, 256)");
+    }
   }
+  #undef LAUNCH_INT8
 }
 #else
 void paged_prefill_attn_rdna3_int8(
