@@ -302,15 +302,21 @@ rewriting pushed history, and doing so would break them against `main`
 
 #### Conflict 1: Layer 1 × Layer 2 — `triton_unified_attention.py`
 
-**File**: `vllm/v1/attention/ops/triton_unified_attention.py` (3 hunks)
+**File**: `vllm/v1/attention/ops/triton_unified_attention.py` (2 hunks)
 
 **Cause**: Layer 1 (`w4a16_squashed`) adds a simple RDNA3 prefill override
 (`BLOCK_M=32`, `num_warps=2`).  Layer 2 (`triton_prefill_tuning`) replaces
 that same block with the full 3-tier adaptive logic (M32/M64/M128 with
 2/4/8 warps).  Both insert at the same location after `BLOCK_M = 16 if ...`.
 
-**Resolution**: Take Layer 2's version for all 3 hunks — it is the superset.
-Layer 1's M32+2warps is Layer 2's "short KV" tier.
+**Resolution**: Take Layer 1's simple `BLOCK_M=32, num_warps=2` for both
+hunks. Validated empirically post-V7 WMMA: 27B prefill at 8192 tokens
+(8× the 3-tier "long" threshold) runs in 14.483 s and beats Hybrid 1.93×
+— attention is *not* the bottleneck at long context on gfx1100; the V7
+W4A16 GEMM kernel is. The 3-tier preventive scaling (M64/M128 + 4/8 warps
+for "compute-bound long") was designed pre-V7 when the balance was
+different. M32+2warps scales fine because once GEMM saturates the WMMA
+unit, larger attention tiles only add register pressure for no payoff.
 
 #### Conflict 2: Layer 3 — `csrc/ops.h`, `csrc/torch_bindings.cpp`
 
