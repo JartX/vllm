@@ -277,31 +277,38 @@ __global__ void gemm_q4_kernel_rdna3(
   // For M_COUNT > 1 with size_m not a multiple of M_COUNT, slots past size_m
   // are zero-padded so the dot product contribution is 0 (we then skip the
   // atomic write for those rows below).
+  //
+  // M=1 fast path: skip LDS staging + __syncthreads entirely. All 256 threads
+  // read the SAME 8-element A window per inner step (a_off is uniform across
+  // the block), so the cache-line broadcast through L1 makes global reads as
+  // cheap as LDS reads. Measured: ~1% on 4B b=1, ~6% on 27B b=1 in=128.
   static_assert(BLOCK_KN_SIZE == THREADS_X,
                 "BLOCK_KN_SIZE must equal THREADS_X (1 K element per thread)");
-  if (offset_k + t < end_k) {
+  constexpr bool USE_LDS_A = (M_COUNT > 1);
+  if constexpr (USE_LDS_A) {
+    if (offset_k + t < end_k) {
 #pragma unroll
-    for (int m = 0; m < M_COUNT; ++m) {
-      T av;
-      if (offset_m + m < size_m) {
-        const T* a_row = a + (offset_m + m) * size_k;
-        if (b_q_perm)
-          av = a_row[b_q_perm[offset_k + t]];
-        else
-          av = a_row[offset_k + t];
-      } else {
-        av = tzero<T>();  // zero-pad invalid M rows
+      for (int m = 0; m < M_COUNT; ++m) {
+        T av;
+        if (offset_m + m < size_m) {
+          const T* a_row = a + (offset_m + m) * size_k;
+          if (b_q_perm)
+            av = a_row[b_q_perm[offset_k + t]];
+          else
+            av = a_row[offset_k + t];
+        } else {
+          av = tzero<T>();  // zero-pad invalid M rows
+        }
+        block_a[m][t] = av;
       }
-      block_a[m][t] = av;
     }
-  }
 
-  // Threads beyond the right edge of N have nothing to do. Note: we must NOT
-  // return before __syncthreads() if any thread in the block participates in
-  // the LDS load above — but here all THREADS_X (=256) threads always do,
-  // regardless of whether their `n` is in bounds. The early return below is
-  // safe because the LDS load doesn't depend on `n`, only on `t`/`offset_k`.
-  __syncthreads();
+    // Threads beyond the right edge of N have nothing to do. Note: we must NOT
+    // return before __syncthreads() if any thread in the block participates in
+    // the LDS load above — but here all THREADS_X (=256) threads always do,
+    // regardless of whether their `n` is in bounds.
+    __syncthreads();
+  }
   if (n >= size_n) return;
 
   // Group bookkeeping. We require size_k % groups == 0 (groupsize divides K).
@@ -402,84 +409,164 @@ __global__ void gemm_q4_kernel_rdna3(
           block_c[m][3] += dot22_8_f(dq[3], a_ptr);
         }
       } else if constexpr (M_COUNT == 1) {
-        // Factored path (bf16 decode, M=1). The dequant produces q_f32 only
-        // (free bit-trick — 0 FMAs). We compute sum_a once across all 4 N
-        // cols and fold scale/zb_neg into the accumulator with 2 FMAs per
-        // col instead of paying the 8-FMA dequant per col. Net: 47 FMAs per
-        // int32 weight vs 64 in the per-col-dequant path (~27% reduction).
-        // Only profitable at M_COUNT=1; break-even is M_COUNT=2.
+        // bf16 decode (M=1), v_dot2_f32_bf16 path. Mirrors the data-flow of
+        // Hybrid PR #40977's wvSplitK_int4 kernel exactly so clang's
+        // InstCombine cannot fold the bf16→fp32 widening (LLVM #76000):
+        //   * activations and magic-value weights share a fp32-aliased
+        //     union (bytes written as uint32, read as bf16x2_t for the
+        //     dot — pointer-cast opacity defeats the fold)
+        //   * sum_a computed via a *second* v_dot2 with bf162(1,1) as the
+        //     second operand, avoiding any explicit bf16→fp32 widen of A
+        //   * bias correction y_b_f * partial + z_b_f * sum_a, identical
+        //     to the previous fp32-FMA-chain path
         //
-        // Col-outer scoping: q_f32[8] is declared inside the col loop so
-        // the compiler can reuse the same 8 VGPRs across all 4 col
-        // iterations instead of holding [4][8] = 32 fp32 alive at once.
+        // Net: 20 v_dot2_f32_bf16 + 8 fp32 FMA per int32 weight vs the
+        // previous 40 fp32 FMA. v_dot2 runs at full rate on gfx1100, so
+        // the substitution is ~2× cheaper for the inner accumulator.
+        typedef short __attribute__((ext_vector_type(2))) bf16x2_t;
+        constexpr uint32_t BF16_MAGIC = 0x43004300u;  // bf162(128, 128)
+        constexpr uint32_t BF16_ONES = 0x3F803F80u;   // bf162(1.0, 1.0)
+        union pack4 {
+          float f[4];
+          uint32_t u[4];
+        };
+
         uint32_t w[4];
         __builtin_memcpy(w, &b_w[j], sizeof(int4));
 
-        const bf16_t* a_ptr =
-            reinterpret_cast<const bf16_t*>(&block_a[0][a_off]);
-        // Widen 8 bf16 → fp32 once (free shifts), shared across all 4 N cols.
-        float a_f[8];
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-          uint32_t aw;
-          __builtin_memcpy(&aw, a_ptr + 2 * i, sizeof(uint32_t));
-          a_f[2 * i + 0] = __uint_as_float((aw & 0xFFFFu) << 16);
-          a_f[2 * i + 1] = __uint_as_float(aw & 0xFFFF0000u);
+        // Load 8 bf16 activations as 4 uint32s (= 4 bf16x2 pairs) into a
+        // fp32-aliased union. Storing as uint32 keeps the IR-level type
+        // opaque so the inner v_dot2 cannot be folded to fp32 widening.
+        //
+        // A is read direct from global (no LDS staging — see USE_LDS_A above).
+        pack4 a_pack;
+        {
+          const uint32_t* a_words =
+              reinterpret_cast<const uint32_t*>(a + offset_k + a_off);
+          a_pack.u[0] = a_words[0];
+          a_pack.u[1] = a_words[1];
+          a_pack.u[2] = a_words[2];
+          a_pack.u[3] = a_words[3];
         }
-        // sum_a = Σa[i], computed once and reused across all 4 N cols.
-        // 7 fp32 adds (vs 4 cols × 8 FMAs of dequant = 32 FMAs saved).
-        float sum_a = a_f[0] + a_f[1] + a_f[2] + a_f[3] + a_f[4] + a_f[5] +
-                      a_f[6] + a_f[7];
-        // unroll 1 forces a real loop so the compiler must free q_f32 at
-        // each col-iter boundary instead of expanding the 4 cols into a
-        // straight-line block where all 4 q_f32 arrays are alive at once
-        // for ILP — that defeats the col-outer scoping. Loop overhead
-        // (counter + branch × 4) is negligible vs the dot FMAs.
+
+        // sum_a = Σ a[i]. Computed via 4× v_dot2_f32_bf16 with bf162(1,1) as
+        // the second operand — every bf16 pair contributes 1·a_lo + 1·a_hi.
+        // No fp32 widening of activations: the bytes go straight from LDS
+        // through v_dot2 into the fp32 accumulator.
+        float sum_a = 0.0f;
+#pragma unroll
+        for (int b = 0; b < 4; ++b) {
+          sum_a = __builtin_amdgcn_fdot2_f32_bf16(
+              *((bf16x2_t*)(&a_pack.f[b])), *((const bf16x2_t*)&BF16_ONES),
+              sum_a, /*clamp=*/false);
+        }
+
+        // unroll 1 keeps q_pack alive only one col at a time (8 fp32 VGPRs
+        // recycled across cols), avoiding straight-line expansion that
+        // would inflate live-range to 32 VGPRs.
 #pragma unroll 1
         for (int col = 0; col < 4; ++col) {
-          float q_f32[8];
-          dequant_4bit_8_bf16_q_only(w[col], q_f32);
+          // Build dequant magic values bf16(128 + nibble) directly into a
+          // fp32-aliased union via uint32 stores. No fp32 in the data flow
+          // until v_dot2 consumes the bytes.
+          pack4 q_pack;
+          const uint32_t qa = w[col];
+          q_pack.u[0] = ((qa >> 0) & 0x000F000Fu) | BF16_MAGIC;
+          q_pack.u[1] = ((qa >> 4) & 0x000F000Fu) | BF16_MAGIC;
+          q_pack.u[2] = ((qa >> 8) & 0x000F000Fu) | BF16_MAGIC;
+          q_pack.u[3] = ((qa >> 12) & 0x000F000Fu) | BF16_MAGIC;
+
+          // partial = Σ (128 + nibble[i]) · a[i], via 4× v_dot2_f32_bf16.
           float partial = 0.0f;
 #pragma unroll
-          for (int i = 0; i < 8; ++i) {
-            partial = __fmaf_rn(q_f32[i], a_f[i], partial);
+          for (int b = 0; b < 4; ++b) {
+            partial = __builtin_amdgcn_fdot2_f32_bf16(
+                *((bf16x2_t*)(&a_pack.f[b])), *((bf16x2_t*)(&q_pack.f[b])),
+                partial, /*clamp=*/false);
           }
-          // block_c += y_b_f[col] * partial + z_b_f[col] * sum_a
-          //   y_b_f[col] = scale            (per-col scale)
-          //   z_b_f[col] = -(128+zero)*scale (per-col negative bias)
-          // Nested fmaf_rn keeps the dependency chain on 1 accumulator VGPR.
+
+          // block_c += y_b_f * partial + z_b_f * sum_a
+          //   y_b_f = scale, z_b_f = -(128+zero)*scale
+          // partial holds (128 + nibble) · a; subtracting (128+zero)·sum_a
+          // and scaling yields scale · (nibble - zero) · a as required.
           block_c[0][col] =
               __fmaf_rn(y_b_f[col], partial,
                         __fmaf_rn(z_b_f[col], sum_a, block_c[0][col]));
         }
       } else {
-        // fp32 dequant: avoids the slow packed bf16 FMA on gfx11. dq is a
-        // flat fp32[8] per int32 weight (one element per K position).
-        // Resolved overload of dot22_8_f picks the float[8] variant.
-        //
-        // Col-outer scoping: dq is declared inside the col loop so the
-        // compiler can reuse the same 8 fp32 VGPRs across all 4 col
-        // iterations instead of holding [4][8] = 32 fp32 alive across
-        // the m-loop. Targets the M_COUNT=4/8 spills observed in the
-        // VGPR audit (38/144 VGPRs spilled to scratch with the previous
-        // all-cols-alive structure, hitting the 192-VGPR cap).
+        // bf16 M_COUNT > 1 path with v_dot2_f32_bf16. Same opacity trick as
+        // the M=1 branch: activations + magic-value weights stored in
+        // fp32-aliased unions, dot via __builtin_amdgcn_fdot2_f32_bf16 with
+        // pointer-cast to bf16x2_t. sum_a[m] computed via second v_dot2
+        // with BF16_ONES; bias correction (y_b_f * partial + z_b_f * sum_a)
+        // applied after the dot. Magic values built once per col and reused
+        // across all M rows — amortizes dequant cost across M_COUNT.
+        typedef short __attribute__((ext_vector_type(2))) bf16x2_t;
+        constexpr uint32_t BF16_MAGIC = 0x43004300u;  // bf162(128, 128)
+        constexpr uint32_t BF16_ONES = 0x3F803F80u;   // bf162(1.0, 1.0)
+        union pack4 {
+          float f[4];
+          uint32_t u[4];
+        };
+
         uint32_t w[4];
         __builtin_memcpy(w, &b_w[j], sizeof(int4));
-        // unroll 1 forces a real loop so the compiler must free dq at each
-        // col-iter boundary instead of expanding the 4 cols into a
-        // straight-line block where all 4 dq arrays are alive at once for
-        // ILP — that defeats the col-outer scoping that targets the
-        // M_COUNT=4/8 spills. Loop overhead is negligible vs the m-loop's
-        // dot FMAs.
+
+        // Load M_COUNT × 8 bf16 activations as 4 uint32s each into pack4
+        // unions. Stored as uint32 to keep IR-level types opaque (defeats
+        // InstCombine fold). At M_COUNT=8 this is 32 fp32 VGPRs — within RDNA3
+        // budget.
+        pack4 a_pack[M_COUNT];
+#pragma unroll
+        for (int m = 0; m < M_COUNT; ++m) {
+          const uint32_t* a_words =
+              reinterpret_cast<const uint32_t*>(&block_a[m][a_off]);
+          a_pack[m].u[0] = a_words[0];
+          a_pack[m].u[1] = a_words[1];
+          a_pack[m].u[2] = a_words[2];
+          a_pack[m].u[3] = a_words[3];
+        }
+
+        // sum_a[m] = Σ a[m][i] via 4× v_dot2 with bf162(1,1) — no fp32 widen.
+        float sum_a[M_COUNT];
+#pragma unroll
+        for (int m = 0; m < M_COUNT; ++m) {
+          float s = 0.0f;
+#pragma unroll
+          for (int b = 0; b < 4; ++b) {
+            s = __builtin_amdgcn_fdot2_f32_bf16(*((bf16x2_t*)(&a_pack[m].f[b])),
+                                                *((const bf16x2_t*)&BF16_ONES),
+                                                s, /*clamp=*/false);
+          }
+          sum_a[m] = s;
+        }
+
+        // Per col: build magic-value pack, dot against all M activations.
+        // unroll 1 keeps q_pack live one col at a time (8 fp32 VGPRs recycled)
+        // — same register-pressure trick as the previous fp32 path.
 #pragma unroll 1
         for (int col = 0; col < 4; ++col) {
-          float dq[8];
-          dequant_4bit_8_bf16_f32(w[col], dq, z_b_f[col], y_b_f[col]);
+          pack4 q_pack;
+          const uint32_t qa = w[col];
+          q_pack.u[0] = ((qa >> 0) & 0x000F000Fu) | BF16_MAGIC;
+          q_pack.u[1] = ((qa >> 4) & 0x000F000Fu) | BF16_MAGIC;
+          q_pack.u[2] = ((qa >> 8) & 0x000F000Fu) | BF16_MAGIC;
+          q_pack.u[3] = ((qa >> 12) & 0x000F000Fu) | BF16_MAGIC;
+
 #pragma unroll
           for (int m = 0; m < M_COUNT; ++m) {
-            const bf16_t* a_ptr =
-                reinterpret_cast<const bf16_t*>(&block_a[m][a_off]);
-            block_c[m][col] += dot22_8_f(dq, a_ptr);
+            float partial = 0.0f;
+#pragma unroll
+            for (int b = 0; b < 4; ++b) {
+              partial = __builtin_amdgcn_fdot2_f32_bf16(
+                  *((bf16x2_t*)(&a_pack[m].f[b])), *((bf16x2_t*)(&q_pack.f[b])),
+                  partial, /*clamp=*/false);
+            }
+            // block_c += y_b_f * partial + z_b_f * sum_a (same correction as
+            // M=1)
+            block_c[m][col] =
+                __fmaf_rn(y_b_f[col], partial,
+                          __fmaf_rn(z_b_f[col], sum_a[m], block_c[m][col]));
           }
         }
       }
