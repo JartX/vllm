@@ -21,7 +21,6 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
-from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import (
@@ -119,7 +118,6 @@ def set_default_quant_scales(layer: nn.Module, register_buffer: bool = False) ->
     layer.v_range = torch.tensor(envs.V_SCALE_CONSTANT, dtype=torch.float32)
 
 
-
 def _init_kv_cache_quant(
     layer: nn.Module,
     quant_config: QuantizationConfig | None,
@@ -166,6 +164,7 @@ def _init_kv_cache_quant(
         from vllm.model_executor.layers.quantization.kv_cache import (
             BaseKVCacheMethod,
         )
+
         assert isinstance(quant_method, BaseKVCacheMethod)
         # TODO (mgoin): kv cache dtype should be specified in the FP8
         # checkpoint config and become the "auto" behavior

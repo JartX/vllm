@@ -849,18 +849,19 @@ class TritonAttentionImpl(AttentionImpl):
                     from vllm.v1.attention.ops.triton_quant_kv._hadamard import (
                         single_rht,
                     )
+
                     head_size = query.shape[2]
                     # Rotate Q, K, V into RHT space (cache stores rotated data;
                     # current-chunk K/V haven't been rotated yet).
-                    q_rotated = single_rht(
-                        query[:num_actual_tokens].float()
-                    ).to(query.dtype)
-                    k_rotated = single_rht(
-                        key[:num_actual_tokens].float()
-                    ).to(key.dtype)
-                    v_rotated = single_rht(
-                        value[:num_actual_tokens].float()
-                    ).to(value.dtype)
+                    q_rotated = single_rht(query[:num_actual_tokens].float()).to(
+                        query.dtype
+                    )
+                    k_rotated = single_rht(key[:num_actual_tokens].float()).to(
+                        key.dtype
+                    )
+                    v_rotated = single_rht(value[:num_actual_tokens].float()).to(
+                        value.dtype
+                    )
                     int4_scale = self.scale / head_size
                     torch.ops._C.paged_prefill_attn_rdna3_int4(
                         output[:num_actual_tokens],
@@ -879,9 +880,10 @@ class TritonAttentionImpl(AttentionImpl):
                         True,
                     )
                     # Inverse RHT on output
-                    out_f = single_rht(
-                        output[:num_actual_tokens].float(), inverse=True
-                    ) / head_size
+                    out_f = (
+                        single_rht(output[:num_actual_tokens].float(), inverse=True)
+                        / head_size
+                    )
                     output[:num_actual_tokens].copy_(out_f.to(output.dtype))
                     return output
 
@@ -996,7 +998,6 @@ class TritonAttentionImpl(AttentionImpl):
                 value_cache = value_cache.view(self.fp8_dtype)
             k_descale = None
             v_descale = None
-
 
             # Dedicated split-KV kernel for decode + small continuation
             # prefill. Gated on max_query_len ≤ threshold; larger shapes

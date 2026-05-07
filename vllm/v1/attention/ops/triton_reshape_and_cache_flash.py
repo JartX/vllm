@@ -256,7 +256,6 @@ def triton_reshape_and_cache_flash(
         triton.cdiv(n, meta["TILE_SIZE"]),
     )
 
-
     reshape_and_cache_kernel_flash[grid](
         key_ptr=key,
         value_ptr=value,
