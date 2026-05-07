@@ -1783,13 +1783,13 @@ __global__ void gemm_q4_wmma_kernel_v8(
   __shared__ T b_lds[2][64][34];
 
   // All 8 waves dequant. Waves 0-3 fill K[0:15], waves 4-7 fill K[16:31].
-  const int dq_wave4 = wave_id & 3;          // 0-3 for both halves
+  const int dq_wave4 = wave_id & 3;  // 0-3 for both halves
   const int dq_k_half = (wave_id >= 4) ? 1 : 0;
   const int dq_n = dq_wave4 * 16 + lane_lo;  // N position 0..63
   const int dq_an = n_tile + dq_n;
   const bool dq_ok = (dq_an < size_n);
-  const int dq_oct = lane_hi + dq_k_half * 2; // K octet 0-3
-  const int dq_kb = dq_oct * 8;               // K base 0,8,16,24
+  const int dq_oct = lane_hi + dq_k_half * 2;  // K octet 0-3
+  const int dq_kb = dq_oct * 8;                // K base 0,8,16,24
   half2 ch_z = {}, ch_y = {};
   float cf_z = 0, cf_y = 0;
   int cached_g = -1;
@@ -1860,9 +1860,9 @@ __global__ void gemm_q4_wmma_kernel_v8(
       __builtin_memcpy(&a_frag_lo, a_row_ptr + k_tile, sizeof(V16));
       __builtin_memcpy(&a_frag_hi, a_row_ptr + k_tile + 16, sizeof(V16));
     } else {
-#pragma unroll
+  #pragma unroll
       for (int i = 0; i < 16; i++) a_frag_lo[i] = (E)0;
-#pragma unroll
+  #pragma unroll
       for (int i = 0; i < 16; i++) a_frag_hi[i] = (E)0;
     }
 
@@ -1899,7 +1899,7 @@ __global__ void gemm_q4_wmma_kernel_v8(
     if (gridDim.z > 1) {
       const bool is_even_lane = (lane_lo & 1) == 0;
       const int out_n_pair = n_base + lane_lo;
-#pragma unroll
+  #pragma unroll
       for (int i = 0; i < 8; i++) {
         float other_f = __shfl_xor(acc[i], 1);
         if (!is_even_lane) continue;
@@ -1922,7 +1922,7 @@ __global__ void gemm_q4_wmma_kernel_v8(
     } else {
       const int out_n = n_base + lane_lo;
       if (out_n >= size_n) return;
-#pragma unroll
+  #pragma unroll
       for (int i = 0; i < 8; i++) {
         const int out_m = m_tile_wave + 2 * i + lane_hi;
         if (out_m < size_m) {
@@ -1965,8 +1965,7 @@ void launch_gemm_q4_wmma_v5(const T* a, const uint32_t* b_q_weight,
     const int groupsize = size_k / groups;
     dim3 block(256);
     dim3 grid((size_n + 63) / 64, (size_m + 127) / 128, k_split);
-    if (size_k % 32 == 0 && groupsize >= 32 &&
-        (size_k / k_split) % 32 == 0) {
+    if (size_k % 32 == 0 && groupsize >= 32 && (size_k / k_split) % 32 == 0) {
       gemm_q4_wmma_kernel_v8<T><<<grid, block, 0, stream>>>(
           a, b_q_weight, b_qzeros, b_scales, c, size_m, size_n, size_k, groups,
           zero_offset, b_q_perm);
@@ -2247,8 +2246,28 @@ torch::Tensor gptq_gemm_rdna3_wmma(torch::Tensor a, torch::Tensor b_q_weight,
   // for K_SPLIT > 1). In that case the output must be pre-zeroed because
   // multiple K-segments add into each cell. For K_SPLIT == 1 the kernel
   // does a direct write per cell and an empty buffer is fine.
-  const bool need_zero_init =
-      vllm::gptq_rdna3_wmma::compute_wmma_k_split(size_k) > 1;
+  //
+  // Must match the actual k_split the launcher will use (M/N-aware
+  // heuristic), not the K-only heuristic which is overly conservative and
+  // zero-fills unnecessarily for large grids (e.g. gate_up 34816×8192
+  // wasted 570 MB of zeroing per call).
+  int actual_k_split;
+  if (size_m >= 128 && size_n >= 64) {
+    actual_k_split = vllm::gptq_rdna3_wmma::compute_wmma_k_split_mn(
+        size_m, size_n, size_k, 128, 64);
+  } else if (size_m >= 64 && size_n >= 64) {
+    actual_k_split = vllm::gptq_rdna3_wmma::compute_wmma_k_split_mn(
+        size_m, size_n, size_k, 64, 64);
+  } else if (size_m >= 64 && size_n >= 32) {
+    actual_k_split = vllm::gptq_rdna3_wmma::compute_wmma_k_split_mn(
+        size_m, size_n, size_k, 64, 32);
+  } else if (size_m >= 64) {
+    actual_k_split = vllm::gptq_rdna3_wmma::compute_wmma_k_split_mn(
+        size_m, size_n, size_k, 64, 16);
+  } else {
+    actual_k_split = vllm::gptq_rdna3_wmma::compute_wmma_k_split(size_k);
+  }
+  const bool need_zero_init = actual_k_split > 1;
   at::Tensor c = need_zero_init ? torch::zeros({size_m, size_n}, opts)
                                 : torch::empty({size_m, size_n}, opts);
 
