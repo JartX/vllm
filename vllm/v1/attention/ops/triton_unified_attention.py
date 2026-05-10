@@ -113,7 +113,7 @@ def kernel_unified_attention(
     IS_3D: tl.constexpr,
     # KV cache quantization mode handled inside this kernel via constexpr
     # branches: NONE (0), FP8_PER_TENSOR (1), INT8_PER_TOKEN_HEAD (2),
-    # FP8_PER_TOKEN_HEAD (3), INT8_PER_TENSOR (5).
+    # FP8_PER_TOKEN_HEAD (3), .
     # Sub-byte packed modes (INT4=4, INT2=6) are dispatched to dedicated
     # factories in ``vllm.v1.attention.ops.triton_quant_kv``.
     KV_QUANT_MODE: tl.constexpr = 0,

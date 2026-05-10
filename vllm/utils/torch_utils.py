@@ -39,7 +39,6 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "fp8_e4m3": torch.uint8,
     "fp8_e5m2": torch.uint8,
     "int8": torch.int8,
-    "int8_per_tensor": torch.int8,
     "int2_per_token_head": torch.uint8,
     "int4_per_token_head": torch.uint8,
     "int8_per_token_head": torch.int8,
@@ -353,8 +352,6 @@ def get_kv_cache_scheme_dtype(
         return None
     scheme_type = scheme.get("type", "float")
     num_bits = scheme.get("num_bits")
-    if scheme_type == "int" and num_bits == 8:
-        return "int8_per_tensor"
     if scheme_type == "float" and num_bits == 8:
         return "fp8"
     return None

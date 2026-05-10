@@ -40,9 +40,8 @@ class KVQuantMode(IntEnum):
     INT8_PER_TOKEN_HEAD = 2  # per-token-head dynamic scales for int8
     FP8_PER_TOKEN_HEAD = 3  # per-token-head dynamic scales for fp8
     INT4_PER_TOKEN_HEAD = 4  # packed 2×int4/byte, RHT + asymmetric zp
-    INT8_PER_TENSOR = 5  # per-tensor scales with int8 storage
-    INT2_PER_TOKEN_HEAD = 6  # Hadamard + Lloyd-Max 4 centroids, 4×int2/byte
-    NVFP4 = 7  # packed fp4 data + fp8 block scales
+    INT2_PER_TOKEN_HEAD = 5  # Hadamard + Lloyd-Max 4 centroids, 4×int2/byte
+    NVFP4 = 6  # packed fp4 data + fp8 block scales
 
     @property
     def is_per_token_head(self) -> bool:
@@ -80,8 +79,6 @@ class KVQuantMode(IntEnum):
 
 def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
     """Map a ``kv_cache_dtype`` string to a :class:`KVQuantMode`."""
-    if kv_cache_dtype == "int8_per_tensor":
-        return KVQuantMode.INT8_PER_TENSOR
     if kv_cache_dtype == "int2_per_token_head":
         return KVQuantMode.INT2_PER_TOKEN_HEAD
     if kv_cache_dtype == "int4_per_token_head":
@@ -90,8 +87,6 @@ def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
         return KVQuantMode.INT8_PER_TOKEN_HEAD
     if kv_cache_dtype == "fp8_per_token_head":
         return KVQuantMode.FP8_PER_TOKEN_HEAD
-    if kv_cache_dtype == "int8_per_tensor":
-        return KVQuantMode.INT8_PER_TENSOR
     if kv_cache_dtype == "nvfp4":
         return KVQuantMode.NVFP4
     if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("fp8"):

@@ -207,25 +207,20 @@ def triton_reshape_and_cache_flash(
     assert kv_cache_dtype == "auto" or is_quantized_kv_cache(kv_cache_dtype), (
         f"unsupported kv_cache_dtype (str), got {kv_cache_dtype}."
     )
-    is_int8_per_tensor = kv_cache_dtype == "int8_per_tensor"
-    is_int8 = kv_cache_dtype.startswith("int8")
-    if is_int8:
-        kv_cache_torch_dtype = torch.int8
-    elif is_quantized_kv_cache(kv_cache_dtype):
+    if is_quantized_kv_cache(kv_cache_dtype):
         kv_cache_torch_dtype = current_platform.fp8_dtype()
     else:
         kv_cache_torch_dtype = key_cache.dtype
 
     if (
-        not is_int8
-        and key_cache.dtype != kv_cache_torch_dtype
+        key_cache.dtype != kv_cache_torch_dtype
         and is_quantized_kv_cache(kv_cache_dtype)
     ):
         key_cache = key_cache.view(kv_cache_torch_dtype)
         value_cache = value_cache.view(kv_cache_torch_dtype)
 
-    FP8_KV_CACHE = is_quantized_kv_cache(kv_cache_dtype) and not is_int8
-    INT8_KV_CACHE = is_int8_per_tensor
+    FP8_KV_CACHE = is_quantized_kv_cache(kv_cache_dtype)
+    INT8_KV_CACHE = False
 
     assert (not FP8_KV_CACHE) or kv_cache_torch_dtype in [
         torch.float8_e4m3fn,

@@ -245,7 +245,6 @@ MAX_JOBS=$(nproc) PYTORCH_ROCM_ARCH=gfx1100 python3 setup.py build_ext --inplace
 main
 ├── perf/rdna3_w4a16_squashed              Layer 1 — W4A16 WMMA GEMM kernel
 ├── perf/rdna3_triton_prefill_tuning       Layer 2 — Triton prefill 3-tier adaptive
-├── feat/int8_per_tensor_clean             Layer 4 — INT8 per-tensor KV cache (kv_cache_scheme)
 │
 ├── refactor/prefill-fastpath-per-token-head-v2    (upstream dependency, NOT in main)
 │   └── feat/rdna3_int8_int4_hip_kernels           Layer 3 — HIP INT8/INT4 prefill kernels
@@ -259,7 +258,6 @@ main
 |--------|-----------|---------|
 | `perf/rdna3_w4a16_squashed` | `main` | None |
 | `perf/rdna3_triton_prefill_tuning` | `main` | None |
-| `feat/int8_per_tensor_clean` | `main` | None |
 | `refactor/prefill-fastpath-per-token-head-v2` | `main` | None (upstream) |
 | `feat/rdna3_int8_int4_hip_kernels` | `main` | Requires `refactor/prefill-fastpath-pth-v2` merged first |
 | `perf/rdna3_full_stack` | — | Not for PR; integration branch for E2E testing |
@@ -286,7 +284,6 @@ git merge refactor/prefill-fastpath-per-token-head-v2
 git merge feat/rdna3_int8_int4_hip_kernels
 
 # Layer 4 — CONFLICT in 4 files (see §Conflict 3)
-git merge feat/int8_per_tensor_clean
 
 # Own commits (docs, multi HEAD_SIZE) — cherry-pick from old full_stack
 git cherry-pick <docs-commits> <multi-headsize-commit>
@@ -337,12 +334,8 @@ attention ops.
 
 | File | Hunks | Cause |
 |------|-------|-------|
-| `vllm/utils/torch_utils.py` | 1 | Layer 4 adds `"int8_per_tensor"`, upstream refactor adds `"int2/int4_per_token_head"` — same insertion point |
-| `vllm/v1/kv_cache_interface.py` | 2 | (a) Enum numbering: Layer 4 uses `INT8_PER_TENSOR=5, NVFP4=4` but upstream refactor already assigned 4=INT4, 5=INT2, 6=NVFP4. (b) `get_kv_quant_mode()`: both add entries at the same spot |
 | `vllm/v1/attention/ops/triton_unified_attention.py` | 1 | Layer 4 adds `_cast_kv_tile` inline; upstream refactor moved it to `triton_attention_helpers.py` (with mode 5 already supported) |
-| `vllm/v1/attention/backends/triton_attn.py` | 1 | `supported_kv_cache_dtypes`: same insertion point for `"int8_per_tensor"` vs `"int2/int4_per_token_head"` |
 
-**Why Layer 4 can't be pre-fixed**: `feat/int8_per_tensor_clean` targets
 `main`, where `refactor/prefill-fastpath-per-token-head-v2` doesn't exist
 yet.  On `main`, enum value 5 is free and `_cast_kv_tile` doesn't exist in
 helpers.  If we changed Layer 4 to use enum=7 and skip the inline helper,
@@ -350,8 +343,6 @@ it would break against `main`.
 
 **Resolution**:
 - `torch_utils.py` / `triton_attn.py`: Keep both sides (add all entries).
-- `kv_cache_interface.py`: Renumber to `INT8_PER_TENSOR=5, INT2=6, NVFP4=7`
-  (or any consistent numbering). Add `int8_per_tensor` mapping to
   `get_kv_quant_mode()`.
 - `triton_unified_attention.py`: Drop the inline `_cast_kv_tile` — it's
   already in `triton_attention_helpers.py` with mode 5 support.
