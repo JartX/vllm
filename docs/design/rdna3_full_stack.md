@@ -157,6 +157,67 @@ would OOM but INT8/INT4 can still serve.
 Both produce coherent outputs at temperature=0 on code generation,
 mathematical reasoning, translation, and factual QA.
 
+---
+
+### Updated sweep: prefill + decode tok/s, 1K → 128K
+
+Apples-to-apples sweep across all KV cache modes on the same hardware
+session. CUDA graphs enabled, batch=1.
+
+#### Prefill tok/s
+
+| Seqlen | FP16¹ | FP8¹ | INT8 per-tensor (Triton, removed)¹ | INT8 per-token-head (HIP) | INT4 per-token-head (HIP) |
+|--------|-------|------|------------------------------------|---------------------------|---------------------------|
+| 1K     | 1405  | 1420 | 1377                               | **1462**                  | 1461                      |
+| 4K     | 1381  | 1401 | 1331                               | 1433                      | **1450**                  |
+| 8K     | 1343  | 1340 | 1233                               | 1373                      | **1388**                  |
+| 16K    | 1277  | 1291 | 1112                               | 1322                      | **1333**                  |
+| 32K    | 1180  | 1204 | 929                                | 1233                      | **1240**                  |
+| 64K    | —     | —    | —                                  | **1101**                  | 1095                      |
+| 128K   | —     | —    | —                                  | **868**                   | 864                       |
+
+#### Decode tok/s (128 output tokens)
+
+| Seqlen | INT8 per-tensor (Triton, removed)¹ | INT8 per-token-head (split-KV) | INT4 per-token-head (split-KV) |
+|--------|-----------------------------------|--------------------------------|--------------------------------|
+| 1K     | 51.8                              | **43.3**                       | 43.5                           |
+| 4K     | 49.7                              | 25.2                           | **25.3**                       |
+| 8K     | 45.9                              | 16.2                           | **16.3**                       |
+| 16K    | 43.6                              | **9.5**                        | 9.5                            |
+| 32K    | 37.1                              | **5.2**                        | 5.2                            |
+| 64K    | —                                 | **2.7**                        | 2.7                            |
+| 128K   | —                                 | **1.4**                        | 1.4                            |
+
+¹ FP16 / FP8 / per-tensor columns: prior-session data, same hardware.
+
+### Key findings
+
+1. **All HIP kernels converge to ±1% in prefill** — the K-loop is HBM-bound,
+   not LDS-bound. Scale-array overhead (per-token-head) and scale folding
+   (per-tensor) are both latency-hidden behind the ~21 global loads per
+   K-loop iteration. INT4 / INT8 / FP8 all run at the same speed.
+
+2. **INT8 per-token-head wins prefill at long context** — beats per-tensor
+   Triton by +12 % at 16K, +33 % at 32K. The HIP kernel's cooperative
+   4-wave K/V loads + native int8→fp16 cast (1 instr) eliminate the
+   Triton path's tile heuristic and register pressure issues.
+
+3. **Decode is weight-bound, not KV-bound** — at 128K context, KV cache
+   reads are ~3.8 GB/step (INT8) or ~1.9 GB/step (INT4), versus 6.75 GB
+   for the W4A16 model weights. Per the breakdown, KV cache is <1 % of
+   the 714 ms/token decode time. INT4 ≡ INT8 in decode throughput
+   because the difference is invisible behind weight bandwidth.
+
+4. **Per-token-head split-KV wins decode** — dedicated kernel that splits
+   each query across `NUM_KV_SPLITS` segments and reduces partial outputs.
+   M=1 doesn't saturate the 96 CUs on gfx1100 without splitting.
+   Per-tensor decode (now removed) had no equivalent path and lost
+   5–12 % at long contexts.
+
+5. **INT4 vs INT8: choose by VRAM, not speed** — INT4 saves 75 % VRAM
+   (vs 50 % for INT8) but offers no measured speed advantage. Use INT4
+   only when you need the extra context length or concurrency headroom.
+
 Layer 1 (W4A16 WMMA) improves decode and short-prompt latency where GEMM
 dominates. Layer 2+3 improve prefill where attention dominates.
 
@@ -262,6 +323,11 @@ main
 | `feat/rdna3_int8_int4_hip_kernels` | `main` | Requires `refactor/prefill-fastpath-pth-v2` merged first |
 | `perf/rdna3_full_stack` | — | Not for PR; integration branch for E2E testing |
 
+> **Note:** `int8_per_tensor` (formerly Layer 4) was evaluated and removed.
+> Benchmarks showed it tied per-token-head HIP in prefill (HBM-bound, scale
+> overhead latency-hidden) and lost in decode (no dedicated split-KV kernel).
+> Per-token-head wins on all axes — use `int8_per_token_head` exclusively.
+
 ### Rebuilding the integration branch (`perf/rdna3_full_stack`)
 
 The integration branch can be reconstructed from `main` plus the five
@@ -283,11 +349,8 @@ git merge refactor/prefill-fastpath-per-token-head-v2
 # Layer 3 — CONFLICT in csrc/ops.h, csrc/torch_bindings.cpp (see §Conflict 2)
 git merge feat/rdna3_int8_int4_hip_kernels
 
-# Layer 4 — CONFLICT in 4 files (see §Conflict 3)
-
 # Own commits (docs, multi HEAD_SIZE) — cherry-pick from old full_stack
 git cherry-pick <docs-commits> <multi-headsize-commit>
-# The multi HEAD_SIZE cherry-pick has minor conflicts (see §Conflict 4)
 ```
 
 ### Known merge conflicts and resolutions
@@ -328,50 +391,15 @@ the same location.
 independent function declarations.  Convention: GPTQ ops first, then
 attention ops.
 
-#### Conflict 3: Layer 4 — 4 files
-
-**Files** (1 hunk each unless noted):
-
-| File | Hunks | Cause |
-|------|-------|-------|
-| `vllm/v1/attention/ops/triton_unified_attention.py` | 1 | Layer 4 adds `_cast_kv_tile` inline; upstream refactor moved it to `triton_attention_helpers.py` (with mode 5 already supported) |
-
-`main`, where `refactor/prefill-fastpath-per-token-head-v2` doesn't exist
-yet.  On `main`, enum value 5 is free and `_cast_kv_tile` doesn't exist in
-helpers.  If we changed Layer 4 to use enum=7 and skip the inline helper,
-it would break against `main`.
-
-**Resolution**:
-- `torch_utils.py` / `triton_attn.py`: Keep both sides (add all entries).
-  `get_kv_quant_mode()`.
-- `triton_unified_attention.py`: Drop the inline `_cast_kv_tile` — it's
-  already in `triton_attention_helpers.py` with mode 5 support.
-
-#### Conflict 4: multi HEAD_SIZE cherry-pick — 2 files
-
-**Files**: `vllm/v1/attention/ops/triton_reshape_and_cache_flash.py` (5
-trivial hunks), `vllm/v1/kv_cache_interface.py` (1 hunk)
-
-**Cause**: This commit was authored on the old `full_stack` where the
-enum numbering and comments differed from the freshly-merged state.
-
-**Resolution**:
-- `triton_reshape_and_cache_flash.py`: Keep the comments from the
-  cherry-pick (they add useful context: "INT8 per-tensor: quantize to
-  [-128, 127]", "Platform", etc.).
-- `kv_cache_interface.py`: Keep the numbering from HEAD (consistent with
-  Conflict 3 resolution).
-
 ### Why the branches can't be conflict-free
 
 Each PR branch is designed to merge cleanly into `main` on its own.
 They share no common ancestor beyond `main` itself, yet they touch
 overlapping files:
 
-- `triton_unified_attention.py` is modified by Layers 1, 2, and 4
-- `kv_cache_interface.py` is modified by the upstream refactor and Layer 4
+- `triton_unified_attention.py` is modified by Layers 1 and 2
 - `csrc/ops.h` / `torch_bindings.cpp` are modified by Layers 1 and 3
-- `triton_attn.py` and `torch_utils.py` are modified by the refactor and Layer 4
+- `triton_attn.py` is modified by the upstream refactor
 
 Making them conflict-free against each other would require either:
 1. **Rewriting history** on pushed branches — breaks collaboration
