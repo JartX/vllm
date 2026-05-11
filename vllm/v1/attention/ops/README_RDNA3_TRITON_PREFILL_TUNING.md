@@ -7,6 +7,7 @@ AMD RDNA3 (gfx11xx, wave32). Up to **3.7× faster** prefill on RX 7900 XTX.
 
 Triton's default launch params (BLOCK_M=16, num_warps=4) are tuned for
 large-wave architectures (CDNA, wave64). On RDNA3 wave32:
+
 - BLOCK_M=16 gives only 16 Q rows × 32 K columns = 512 FLOPs per K load.
   Arithmetic intensity ~4 FLOPs/byte — deeply memory-bound.
 - 4 warps on a tiny tile = register pressure + sync overhead for no gain.
@@ -61,6 +62,7 @@ intensity. More warps hide global memory latency on deep tile loops.
 ## Why It Works
 
 RDNA3 (gfx1100) specifics:
+
 - **Wave32**: 32 lanes (not 64). Default Triton assumes wave64 occupancy.
 - **96 CUs**: Need enough blocks to saturate. BLOCK_M=128 with 8 warps still
   yields ~100+ blocks for typical multi-head configs.
@@ -71,6 +73,7 @@ RDNA3 (gfx1100) specifics:
 ## Gating
 
 All changes are gated on:
+
 - `on_gfx11()` — only applies to RDNA3 (gfx1100, gfx1101, gfx1102)
 - Prefill path only (`max_seqlen_q > 1`)
 - Decode (3D path) is untouched — verified no regression

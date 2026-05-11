@@ -59,7 +59,8 @@ __device__ __forceinline__ v8i32 wmma_mma_iu8(v16i8 a_signed, v16u8 b_unsigned,
                                               v8i32 c) {
   // signA=true (A is signed), signB=false (B is unsigned), clamp=false
   return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(
-      /*signA=*/true, a_signed, /*signB=*/false, b_unsigned, c, /*clamp=*/false);
+      /*signA=*/true, a_signed, /*signB=*/false, b_unsigned, c,
+      /*clamp=*/false);
 }
 
 // Both A and B signed (for INT4 centered: nibble - zp → range [-15, 15]).

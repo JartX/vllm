@@ -372,7 +372,7 @@ that same block with the full 3-tier adaptive logic (M32/M64/M128 with
 **Resolution**: Take Layer 1's simple `BLOCK_M=32, num_warps=2` for both
 hunks. Validated empirically post-V7 WMMA: 27B prefill at 8192 tokens
 (8× the 3-tier "long" threshold) runs in 14.483 s and beats Hybrid 1.93×
-— attention is *not* the bottleneck at long context on gfx1100; the V7
+— attention is _not_ the bottleneck at long context on gfx1100; the V7
 W4A16 GEMM kernel is. The 3-tier preventive scaling (M64/M128 + 4/8 warps
 for "compute-bound long") was designed pre-V7 when the balance was
 different. M32+2warps scales fine because once GEMM saturates the WMMA
@@ -402,6 +402,7 @@ overlapping files:
 - `triton_attn.py` is modified by the upstream refactor
 
 Making them conflict-free against each other would require either:
+
 1. **Rewriting history** on pushed branches — breaks collaboration
 2. **Pre-aligning to unreleased code** — breaks the branch against `main`
 3. **Merging in a fixed order** and rebasing later branches — creates

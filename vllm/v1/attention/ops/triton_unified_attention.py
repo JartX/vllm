@@ -655,6 +655,7 @@ def unified_attention(
     _rdna3_prefill_tier = 0  # 0=default, 1=short, 2=medium, 3=long
     if current_platform.is_rocm() and max_seqlen_q > 1:
         from vllm.platforms.rocm import on_gfx11
+
         if on_gfx11() and BLOCK_M == 16:
             if max_seqlen_k > 8192:
                 BLOCK_M = 128
@@ -753,6 +754,7 @@ def unified_attention(
     launch_kwargs: dict[str, int] = {}
     if not use_3d and current_platform.is_rocm():
         from vllm.platforms.rocm import on_gfx11
+
         if on_gfx11():
             if _rdna3_prefill_tier == 3:
                 launch_kwargs["num_warps"] = 8

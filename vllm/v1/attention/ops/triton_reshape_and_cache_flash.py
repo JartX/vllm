@@ -212,9 +212,8 @@ def triton_reshape_and_cache_flash(
     else:
         kv_cache_torch_dtype = key_cache.dtype
 
-    if (
-        key_cache.dtype != kv_cache_torch_dtype
-        and is_quantized_kv_cache(kv_cache_dtype)
+    if key_cache.dtype != kv_cache_torch_dtype and is_quantized_kv_cache(
+        kv_cache_dtype
     ):
         key_cache = key_cache.view(kv_cache_torch_dtype)
         value_cache = value_cache.view(kv_cache_torch_dtype)

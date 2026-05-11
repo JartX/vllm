@@ -96,6 +96,7 @@ Both kernels handle mixed cached + fresh tokens:
 ## Dispatch Conditions
 
 The HIP kernels auto-dispatch when ALL conditions are met:
+
 - Platform is ROCm
 - `torch.ops._C.paged_prefill_attn_rdna3_{int8,int4}` available (gfx1100 build)
 - Pure prefill with continuation chunks (reads from paged cache)

@@ -14,7 +14,6 @@ The kernel handles:
 """
 
 import os
-from typing import Optional
 
 import torch
 
@@ -66,9 +65,7 @@ def _load_module():
 
     for path in cache_paths:
         if os.path.exists(path):
-            spec = importlib.util.spec_from_file_location(
-                "rdna3_int8_attn", path
-            )
+            spec = importlib.util.spec_from_file_location("rdna3_int8_attn", path)
             _module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(_module)  # type: ignore
             logger.info("Loaded RDNA3 INT8 prefill kernel from %s", path)

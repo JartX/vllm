@@ -288,8 +288,7 @@ __global__ void gemm_q4_kernel_rdna3(
   // (the v_dot2_f32_bf16 branch).  The fp16 inner loop still indexes
   // block_a[m][a_off] unconditionally, so for fp16 we MUST stage A through
   // LDS even at M=1 to avoid reading uninitialized shared memory.
-  constexpr bool USE_LDS_A =
-      (M_COUNT > 1) || std::is_same<T, half>::value;
+  constexpr bool USE_LDS_A = (M_COUNT > 1) || std::is_same<T, half>::value;
   if constexpr (USE_LDS_A) {
     if (offset_k + t < end_k) {
 #pragma unroll
@@ -709,8 +708,8 @@ torch::Tensor gptq_gemm_rdna3(torch::Tensor a, torch::Tensor b_q_weight,
   // fp16 M≥64: with WMMA V7 (128M×64N, 8 waves), fp16 WMMA beats scalar
   // by 1.2-2.2× at M≥64 across Qwen-class shapes. Below M=64 the scalar
   // fp16 dequant bit-trick keeps the scalar path faster.
-  if (a.dim() == 2 && b_q_weight.dim() == 2 &&
-      a.size(1) % 16 == 0 && b_q_weight.size(1) % 16 == 0 &&
+  if (a.dim() == 2 && b_q_weight.dim() == 2 && a.size(1) % 16 == 0 &&
+      b_q_weight.size(1) % 16 == 0 &&
       ((a.scalar_type() == torch::kBFloat16 && a.size(0) >= 16) ||
        (a.scalar_type() == torch::kHalf && a.size(0) >= 64))) {
     return gptq_gemm_rdna3_wmma(a, b_q_weight, b_qzeros, b_scales, b_g_idx,

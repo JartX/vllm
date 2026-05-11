@@ -43,6 +43,7 @@ Wave Matrix Multiply-Accumulate. 16×16×16 tiles, wave32.
 | `v_wmma_i32_16x16x16_iu4` | C_i32 += A_i4/u4 × B_i4/u4 | INT4 → INT32 accumulate |
 
 **NOT available on gfx1100:**
+
 - No FP8 WMMA (`v_wmma_f32_16x16x16_fp8` — CDNA3+ only)
 - No SWMMAC (scaled WMMA — gfx1200+ only)
 - No BF8 WMMA
@@ -93,6 +94,7 @@ v_pk_sub_i16          v_pk_sub_u16
 See `README_RDNA3_CVT_ISA.md` for full details with ISA listings.
 
 **Key:**
+
 - Native: INT8/16/32 ↔ FP16/32/64, FP16 ↔ FP32/64
 - Missing: All FP8/BF8, BF16 native, stochastic rounding
 
@@ -101,6 +103,7 @@ See `README_RDNA3_CVT_ISA.md` for full details with ISA listings.
 ## VALU — Vector ALU (247 instructions)
 
 ### Arithmetic (FP32)
+
 ```
 v_add_f32    v_sub_f32    v_subrev_f32    v_mul_f32    v_mul_legacy_f32
 v_mul_dx9_zero_f32    v_fma_f32    v_fma_legacy_f32    v_fma_dx9_zero_f32
@@ -112,6 +115,7 @@ v_mad_i64_i32    v_mad_u64_u32    v_mullit_f32
 ```
 
 ### Arithmetic (FP16)
+
 ```
 v_add_f16    v_sub_f16    v_subrev_f16    v_mul_f16
 v_fma_f16    v_fmac_f16    v_fmaak_f16    v_fmamk_f16
@@ -120,6 +124,7 @@ v_mul_lo_u16
 ```
 
 ### Arithmetic (FP64)
+
 ```
 v_add_f64    v_mul_f64    v_fma_f64    v_min_f64    v_max_f64
 v_ldexp_f64    v_frexp_mant_f64    v_frexp_exp_i32_f64
@@ -129,6 +134,7 @@ v_trunc_f64    v_rndne_f64    v_sqrt_f64    v_rsq_f64    v_rcp_f64
 ```
 
 ### Arithmetic (Integer)
+
 ```
 v_add_nc_u32    v_add_nc_i32    v_add_nc_u16    v_add_nc_i16
 v_sub_nc_u32    v_sub_nc_i32    v_sub_nc_u16    v_sub_nc_i16
@@ -139,6 +145,7 @@ v_add3_u32    v_add_lshl_u32    v_lshl_add_u32    v_xad_u32
 ```
 
 ### Bitwise
+
 ```
 v_and_b32    v_or_b32    v_xor_b32    v_not_b32    v_xnor_b32
 v_and_b16    v_or_b16    v_xor_b16    v_not_b16
@@ -153,6 +160,7 @@ v_ffbh_u32    v_ffbh_i32    v_ffbl_b32
 ```
 
 ### Min/Max/Med/Clamp
+
 ```
 v_min_f32    v_max_f32    v_min_f16    v_max_f16
 v_min_i32    v_max_i32    v_min_u32    v_max_u32
@@ -168,6 +176,7 @@ v_minmax_f16    v_maxmin_f16    v_minmax_u32    v_maxmin_u32
 ```
 
 ### Transcendental / Special
+
 ```
 v_rcp_f32    v_rcp_f16    v_rcp_iflag_f32
 v_rsq_f32    v_rsq_f16    v_sqrt_f32    v_sqrt_f16
@@ -183,6 +192,7 @@ v_cubeid_f32    v_cubema_f32    v_cubesc_f32    v_cubetc_f32
 ```
 
 ### Move / Lane / Permute
+
 ```
 v_mov_b32    v_mov_b16
 v_cndmask_b32    v_cndmask_b16
@@ -193,6 +203,7 @@ v_swaprel_b32    v_swap_b32    v_swap_b16
 ```
 
 ### Mixed-precision FMA
+
 ```
 v_fma_mix_f32       (mixed fp16/f32 inputs → f32 output)
 v_fma_mixlo_f16     (mixed → f16 low)
@@ -200,6 +211,7 @@ v_fma_mixhi_f16     (mixed → f16 high)
 ```
 
 ### DUAL issue (VOPD — two ops in one cycle)
+
 ```
 v_dual_add_f32    v_dual_sub_f32    v_dual_subrev_f32
 v_dual_mul_f32    v_dual_mul_dx9_zero_f32
@@ -210,6 +222,7 @@ v_dual_dot2acc_f32_f16    v_dual_dot2acc_f32_bf16
 ```
 
 ### SAD / Integer reduction
+
 ```
 v_sad_u8    v_sad_hi_u8    v_sad_u16    v_sad_u32
 v_msad_u8    v_qsad_pk_u16_u8    v_mqsad_pk_u16_u8    v_mqsad_u32_u8
@@ -221,6 +234,7 @@ v_lerp_u8    v_sat_pk_u8_i16    v_pack_b32_f16
 ## DS — LDS/GDS Operations (164 instructions)
 
 ### Load (various widths and formats)
+
 ```
 ds_load_b32    ds_load_b64    ds_load_b96    ds_load_b128
 ds_load_2addr_b32    ds_load_2addr_b64
@@ -233,6 +247,7 @@ ds_load_addtid_b32
 ```
 
 ### Store
+
 ```
 ds_store_b32    ds_store_b64    ds_store_b96    ds_store_b128
 ds_store_2addr_b32    ds_store_2addr_b64
@@ -243,6 +258,7 @@ ds_store_addtid_b32
 ```
 
 ### Atomics (LDS)
+
 ```
 ds_add_u32/u64    ds_sub_u32/u64    ds_rsub_u32/u64
 ds_min_i32/i64/u32/u64/f32/f64    ds_max_i32/i64/u32/u64/f32/f64
@@ -251,9 +267,11 @@ ds_inc_u32/u64    ds_dec_u32/u64
 ds_cmpstore_b32/b64/f32/f64    ds_storexchg_rtn_b32/b64
 ds_add_f32    ds_add_rtn_f32    ds_mskor_b32/b64
 ```
+
 (All atomics have `_rtn_` variants that return the old value)
 
 ### Special
+
 ```
 ds_bpermute_b32    ds_permute_b32    ds_swizzle_b32
 ds_append    ds_consume    ds_ordered_count
@@ -266,6 +284,7 @@ ds_bvh_stack_rtn_b32    ds_nop    ds_wrap_rtn_b32
 ## GLOBAL Memory (109 instructions)
 
 ### Loads
+
 ```
 global_load_b32    global_load_b64    global_load_b96    global_load_b128
 global_load_u8     global_load_i8     global_load_u16    global_load_i16
@@ -276,6 +295,7 @@ global_load_addtid_b32
 ```
 
 ### Stores
+
 ```
 global_store_b8    global_store_b16    global_store_b32
 global_store_b64    global_store_b96    global_store_b128
@@ -284,6 +304,7 @@ global_store_addtid_b32
 ```
 
 ### Atomics
+
 ```
 global_atomic_add_u32/u64/f32    global_atomic_sub_u32/u64
 global_atomic_min_i32/i64/u32/u64/f32    global_atomic_max_i32/i64/u32/u64/f32
@@ -298,6 +319,7 @@ global_atomic_csub_u32    global_atomic_fcmpswap    global_atomic_fmax    global
 ## SALU — Scalar ALU (218 instructions)
 
 ### Arithmetic
+
 ```
 s_add_i32    s_sub_i32    s_addc_u32    s_subb_u32
 s_mul_i32    s_mul_hi_u32    s_mul_hi_i32
@@ -307,6 +329,7 @@ s_lshl1_add_u32    s_lshl2_add_u32    s_lshl3_add_u32    s_lshl4_add_u32
 ```
 
 ### Bitwise
+
 ```
 s_and_b32/b64    s_or_b32/b64    s_xor_b32/b64
 s_andn2_b32/b64    s_orn2_b32/b64    s_xnor_b32/b64
@@ -323,6 +346,7 @@ s_pack_ll_b32_b16    s_pack_lh_b32_b16    s_pack_hl_b32_b16    s_pack_hh_b32_b16
 ```
 
 ### Compare
+
 ```
 s_cmp_eq_i32/u32/u64    s_cmp_lg_i32/u32/u64
 s_cmp_gt_i32/u32    s_cmp_ge_i32/u32    s_cmp_lt_i32/u32    s_cmp_le_i32/u32
@@ -330,6 +354,7 @@ s_cmpk_eq/lg/gt/ge/lt/le_i32/u32    s_bitcmp0/1_b32/b64
 ```
 
 ### Move / Select
+
 ```
 s_mov_b32/b64    s_movk_i32    s_cmov_b32/b64    s_cselect_b32/b64
 s_movreld_b32/b64    s_movrels_b32/b64    s_movrelsd_2_b32
@@ -337,6 +362,7 @@ s_sext_i32_i8    s_sext_i32_i16
 ```
 
 ### Control flow
+
 ```
 s_branch    s_cbranch_scc0/scc1/vccz/vccnz/execz/execnz
 s_cbranch_cdbgsys/cdbguser/cdbgsys_and_user/cdbgsys_or_user
@@ -348,6 +374,7 @@ s_sendmsg    s_sendmsghalt    s_sendmsg_rtn_b32/b64
 ```
 
 ### EXEC manipulation (SaveExec family)
+
 ```
 s_and_saveexec_b32/b64    s_or_saveexec_b32/b64    s_xor_saveexec_b32/b64
 s_nand_saveexec_b32/b64    s_nor_saveexec_b32/b64    s_xnor_saveexec_b32/b64
@@ -359,6 +386,7 @@ s_andn1_saveexec_b32/b64    s_orn1_saveexec_b32/b64
 ```
 
 ### Waitcnt / Synchronization
+
 ```
 s_waitcnt    s_waitcnt_vmcnt    s_waitcnt_lgkmcnt
 s_waitcnt_expcnt    s_waitcnt_vscnt    s_waitcnt_depctr
@@ -367,6 +395,7 @@ s_nop    s_code_end    s_pipeflush (via v_pipeflush)
 ```
 
 ### System / Cache
+
 ```
 s_dcache_inv    s_gl1_inv    s_icache_inv
 s_atc_probe    s_atc_probe_buffer
@@ -386,6 +415,7 @@ s_load_b32    s_load_b64    s_load_b128    s_load_b256    s_load_b512
 s_buffer_load_b32    s_buffer_load_b64    s_buffer_load_b128
 s_buffer_load_b256    s_buffer_load_b512
 ```
+
 (Plus legacy aliases: `s_load_dword`, `s_load_dwordx2/4/8/16`, etc.)
 
 ---

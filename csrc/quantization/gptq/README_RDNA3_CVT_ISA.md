@@ -145,7 +145,7 @@ Disassembly: `hipcc -S --cuda-device-only`.
 
 ## Key Findings for KV-Cache Design on RDNA3
 
-### Best paths (native single-instruction):
+### Best paths (native single-instruction)
 
 ```
 INT8  → FP16:  v_cvt_f16_i16_e32      (1 cycle)
@@ -178,13 +178,14 @@ For **signed INT8**: the compiler uses `v_bfe_i32` (sign-extend extract) +
 than unsigned due to sign-extension, but still vastly better than FP8).
 
 **Best KV-cache pattern for UINT8 per-tensor on RDNA3:**
+
 ```
 Load 4 bytes as DWORD → v_cvt_f32_ubyte{0..3} → v_cvt_f16_f32 ×4
 Scale applied post-matmul (0 extra ops in inner loop)
 Total: 2 VALU/element, fully pipelined, zero branches
 ```
 
-### FP8 E5M2 surprise: 1-instruction bitmanip!
+### FP8 E5M2 surprise: 1-instruction bitmanip
 
 E5M2 and FP16 share the same exponent width (5 bits) and bias (15). Conversion
 is a **pure left-shift by 8 bits** — zero-padding the mantissa:
@@ -371,6 +372,7 @@ memory subsystem at no VALU cost:
 | `global_load_u16` | 2 bytes | UINT32 (zero-ext) | Full 32-bit VGPR |
 
 These combine with conversion instructions for the optimal pattern:
+
 ```
 global_load_d16_i8 → v_cvt_f16_i16  (INT8→FP16: 1 load + 1 VALU)
 global_load_i8     → v_cvt_f32_i32  (INT8→FP32: 1 load + 1 VALU)

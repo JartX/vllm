@@ -251,28 +251,22 @@ torch::Tensor gptq_gemm(torch::Tensor a, torch::Tensor b_q_weight,
 void gptq_shuffle(torch::Tensor q_weight, torch::Tensor q_perm, int64_t bit);
 
 // RDNA3 INT8 per-token-head paged prefill attention (gfx1100).
-void paged_prefill_attn_rdna3_int8(torch::Tensor& out, torch::Tensor q,
-                                   torch::Tensor k_chunk, torch::Tensor v_chunk,
-                                   torch::Tensor k_cache, torch::Tensor v_cache,
-                                   torch::Tensor k_scale_cache,
-                                   torch::Tensor v_scale_cache,
-                                   torch::Tensor block_table,
-                                   torch::Tensor cu_seqlens_q,
-                                   torch::Tensor seq_lens,
-                                   int64_t max_query_len, double sm_scale,
-                                   bool causal);
+void paged_prefill_attn_rdna3_int8(
+    torch::Tensor& out, torch::Tensor q, torch::Tensor k_chunk,
+    torch::Tensor v_chunk, torch::Tensor k_cache, torch::Tensor v_cache,
+    torch::Tensor k_scale_cache, torch::Tensor v_scale_cache,
+    torch::Tensor block_table, torch::Tensor cu_seqlens_q,
+    torch::Tensor seq_lens, int64_t max_query_len, double sm_scale,
+    bool causal);
 
 // RDNA3 INT4 per-token-head paged prefill attention (gfx1100).
-void paged_prefill_attn_rdna3_int4(torch::Tensor& out, torch::Tensor q,
-                                   torch::Tensor k_chunk, torch::Tensor v_chunk,
-                                   torch::Tensor k_cache, torch::Tensor v_cache,
-                                   torch::Tensor k_scale_cache,
-                                   torch::Tensor v_scale_cache,
-                                   torch::Tensor block_table,
-                                   torch::Tensor cu_seqlens_q,
-                                   torch::Tensor seq_lens,
-                                   int64_t max_query_len, double sm_scale,
-                                   bool causal);
+void paged_prefill_attn_rdna3_int4(
+    torch::Tensor& out, torch::Tensor q, torch::Tensor k_chunk,
+    torch::Tensor v_chunk, torch::Tensor k_cache, torch::Tensor v_cache,
+    torch::Tensor k_scale_cache, torch::Tensor v_scale_cache,
+    torch::Tensor block_table, torch::Tensor cu_seqlens_q,
+    torch::Tensor seq_lens, int64_t max_query_len, double sm_scale,
+    bool causal);
 
 // W4A16 GPTQ kernels for AMD RDNA3 (gfx1100). See csrc/quantization/gptq/
 // README_RDNA3.md for kernel architecture and diagnostic op usage.
