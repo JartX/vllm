@@ -176,28 +176,68 @@ __device__ __forceinline__ void load_v_tile_paged_coop(
   static_assert(HEAD_SIZE == THREADS,
                 "v2 V load assumes HEAD_SIZE == THREADS (128)");
 
-  const int log_block = start_n / block_size;
-  const int slot_base = start_n - log_block * block_size;
-  const int p_block = block_table[seq_idx * max_blocks_per_seq + log_block];
+  const int log_block_first = start_n / block_size;
+  const int slot_first = start_n - log_block_first * block_size;
   const int valid_k_count = max(0, min(K_TILE, seq_ctx_len - start_n));
 
+  // Detect K_TILE crossing a physical block boundary. Uniform across the
+  // wave (depends only on start_n / block_size), so the branch is
+  // wave-coherent. Fix for the bug originally repaired in int8/int4 V
+  // loaders by commit 44fdf1e4b: a single lookup at start_n/block_size
+  // mis-reads slots past the block boundary from the next physical block,
+  // producing silent attention corruption ("!!!!") at long contexts when
+  // block_size is not a multiple of K_TILE (e.g. block_size=1552).
+  const bool crosses_boundary = (slot_first + K_TILE) > block_size;
+
   const int d = tid;  // tid 0..127 == d 0..127
-  const T* src = v_cache + (int64_t)p_block * stride_vc_block +
-                 (int64_t)kv_head_idx * stride_vc_head +
-                 (int64_t)d * stride_vc_d + (int64_t)slot_base * stride_vc_slot;
   int4 vec_lo, vec_hi;
-  if (valid_k_count >= K_TILE) {
-    vec_lo = *(const int4*)src;
-    vec_hi = *(const int4*)(src + 8);
+
+  if (!crosses_boundary) {
+    // Fast path: tile fully inside one block — keep the vectorized load.
+    const int p_block =
+        block_table[seq_idx * max_blocks_per_seq + log_block_first];
+    const T* src = v_cache + (int64_t)p_block * stride_vc_block +
+                   (int64_t)kv_head_idx * stride_vc_head +
+                   (int64_t)d * stride_vc_d +
+                   (int64_t)slot_first * stride_vc_slot;
+    if (valid_k_count >= K_TILE) {
+      vec_lo = *(const int4*)src;
+      vec_hi = *(const int4*)(src + 8);
+    } else {
+      T tmp[K_TILE];
+  #pragma unroll
+      for (int k = 0; k < K_TILE; ++k) {
+        tmp[k] = (k < valid_k_count) ? src[k] : (T)0;
+      }
+      __builtin_memcpy(&vec_lo, tmp, 16);
+      __builtin_memcpy(&vec_hi, tmp + 8, 16);
+    }
   } else {
+    // Slow path: tile spans two physical blocks. Per-slot block lookup.
+    // Used only when block_size % K_TILE != 0 — uncommon but required for
+    // correctness with non-default block_size values.
     T tmp[K_TILE];
   #pragma unroll
     for (int k = 0; k < K_TILE; ++k) {
-      tmp[k] = (k < valid_k_count) ? src[k] : (T)0;
+      if (k < valid_k_count) {
+        const int abs_k = start_n + k;
+        const int log_block = abs_k / block_size;
+        const int slot = abs_k - log_block * block_size;
+        const int p_block =
+            block_table[seq_idx * max_blocks_per_seq + log_block];
+        const T* src = v_cache + (int64_t)p_block * stride_vc_block +
+                       (int64_t)kv_head_idx * stride_vc_head +
+                       (int64_t)d * stride_vc_d +
+                       (int64_t)slot * stride_vc_slot;
+        tmp[k] = *src;
+      } else {
+        tmp[k] = (T)0;
+      }
     }
     __builtin_memcpy(&vec_lo, tmp, 16);
     __builtin_memcpy(&vec_hi, tmp + 8, 16);
   }
+
   *(int4*)&V_lds[d * K_TILE + 0] = vec_lo;
   *(int4*)&V_lds[d * K_TILE + 8] = vec_hi;
 }
