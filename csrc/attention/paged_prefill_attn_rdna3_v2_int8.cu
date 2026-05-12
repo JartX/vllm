@@ -44,6 +44,35 @@ constexpr int M_PER_WAVE = 16;
 // THREADS = HEAD_SIZE, NUM_WAVES = HEAD_SIZE/32, BLOCK_M = NUM_WAVES*16.
 // These are derived per-template inside the kernel/functions.
 
+// int8 → T conversion specialised to skip the bf16 NaN canonicalisation
+// path. For values in [-128, 127] the bf16 representation is EXACT (mantissa
+// covers 2^7), so truncating the upper 16 bits of the fp32 bit-pattern
+// produces a bit-identical result to __float2bfloat16 — minus the unreachable
+// v_cmp_u_f32 + v_cndmask_b32 pair that __float2bfloat16 always emits to
+// canonicalise potential NaNs. Same pattern that moved -10.4% TTFT on the
+// W4A16 bf16 dequant path (see project_wmma_nan_canon_elimination).
+//
+// fp16 already lowers to a single v_cvt_f16_f32 with no canon overhead, so
+// it keeps the original __float2half_rn path unchanged.
+template <typename T>
+__device__ __forceinline__ T cvt_T_from_int8(int8_t v);
+
+template <>
+__device__ __forceinline__ half cvt_T_from_int8<half>(int8_t v) {
+  return __float2half_rn((float)v);
+}
+
+template <>
+__device__ __forceinline__ bf16_t cvt_T_from_int8<bf16_t>(int8_t v) {
+  float f = (float)v;
+  uint32_t fu;
+  __builtin_memcpy(&fu, &f, 4);
+  uint16_t bf16_bits = (uint16_t)(fu >> 16);
+  bf16_t r;
+  __builtin_memcpy(&r, &bf16_bits, 2);
+  return r;
+}
+
 __device__ __forceinline__ float wave16_max(float v) {
   v = fmaxf(v, __shfl_xor(v, 1));
   v = fmaxf(v, __shfl_xor(v, 2));
@@ -130,11 +159,13 @@ __device__ __forceinline__ void load_k_tile_paged_int8_coop(
     for (int i = 0; i < X_INT8; ++i) k_i8[i] = 0;
   }
 
-  // Dequant int8 → fp16 (scale applied post-matmul in attn_step)
+  // Dequant int8 → fp16/bf16 (scale applied post-matmul in attn_step).
+  // Uses cvt_T_from_int8 to skip the bf16 NaN-canon path on inputs that are
+  // provably in [-128, 127]; fp16 path unchanged.
   T dequant[X_INT8];
   #pragma unroll
   for (int i = 0; i < X_INT8; ++i) {
-    dequant[i] = to_T<T>((float)k_i8[i]);
+    dequant[i] = cvt_T_from_int8<T>(k_i8[i]);
   }
 
   // Store to K_lds in v2 layout: K_lds_raw[d_high][k_idx][X_FP16]
@@ -218,12 +249,13 @@ __device__ __forceinline__ void load_v_tile_paged_int8_coop(
     for (int i = 0; i < 16; ++i) v_i8[i] = 0;
   }
 
-  // Dequant int8 → fp16 and transpose-store to V_lds[d][k]
+  // Dequant int8 → fp16/bf16 and transpose-store to V_lds[d][k].
   // V_lds layout: [HEAD_SIZE][K_TILE]. We write 16 elements scattered:
-  // for each of the 16 d values, write to V_lds[(d_base+i) * K_TILE + my_slot]
+  // for each of the 16 d values, write to V_lds[(d_base+i) * K_TILE + my_slot].
+  // cvt_T_from_int8 skips the bf16 NaN-canon path for inputs in [-128, 127].
   #pragma unroll
   for (int i = 0; i < 16; ++i) {
-    V_lds[(d_base + i) * K_TILE + my_slot_offset] = to_T<T>((float)v_i8[i]);
+    V_lds[(d_base + i) * K_TILE + my_slot_offset] = cvt_T_from_int8<T>(v_i8[i]);
   }
 }
 
