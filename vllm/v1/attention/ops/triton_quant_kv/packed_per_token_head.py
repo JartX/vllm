@@ -28,6 +28,7 @@ import torch
 
 from vllm.v1.attention.ops.triton_quant_kv import register
 from vllm.v1.attention.ops.triton_quant_kv._hadamard import (
+    _get_rht_signs,
     fast_hadamard_transform,
     single_rht,
 )
@@ -101,8 +102,8 @@ class _PackedFactory(QuantKVFactory):
         assert k_scale_cache is not None and v_scale_cache is not None, (
             f"{self.mode.name} requires k_scale_cache / v_scale_cache"
         )
-        key = self._rotate_kv(key.float()).to(key.dtype)
-        value = self._rotate_kv(value.float()).to(value.dtype)
+        key = self._rotate_kv(key)
+        value = self._rotate_kv(value)
         _run_reshape_kernel(
             self._reshape_kernel,
             key=key,
@@ -147,7 +148,7 @@ class _PackedFactory(QuantKVFactory):
         assert k_scale_cache is not None and v_scale_cache is not None
 
         q_orig_dtype = q.dtype
-        q = self._rotate_q(q.float()).to(q_orig_dtype)
+        q = self._rotate_q(q)
         head_size = q.shape[2]
         softmax_scale = self._transform_softmax_scale(softmax_scale, head_size)
 
@@ -190,21 +191,85 @@ class Int4PerTokenHeadFactory(_PackedFactory):
     packing_factor = 2  # 2 × int4 per byte
     _reshape_kernel = _reshape_cache_int4_kernel
 
-    # RHT pre-rotation gaussianizes data → better quantization.  The
-    # forward RHT has norm ``sqrt(head_size)``, so ``softmax_scale`` is
-    # divided by ``head_size`` and the inverse RHT divides the output
-    # by ``head_size`` as well.
-    @staticmethod
-    def _rotate_kv(x: torch.Tensor) -> torch.Tensor:
-        return single_rht(x)
+    # Cached HD1^T matrix for forward RHT and HD1 for inverse, both as
+    # contiguous [D, D] tensors. Using ``x @ hd1t`` directly (no reshape)
+    # leverages PyTorch's batched matmul broadcast: [N, H, D] @ [D, D].
+    # This is ~10 µs per call vs ~41 µs with reshape+matmul+reshape.
+    _hd1t_cache: dict[tuple[int, str, torch.dtype], torch.Tensor] = {}
+    _hd1_cache: dict[tuple[int, str, torch.dtype], torch.Tensor] = {}
 
-    @staticmethod
-    def _rotate_q(q: torch.Tensor) -> torch.Tensor:
-        return single_rht(q)
+    @classmethod
+    def _get_hd1t(cls, d: int, device: torch.device,
+                  dtype: torch.dtype) -> torch.Tensor:
+        """HD1^T for forward RHT: x_rot = x @ HD1^T."""
+        key = (d, str(device), dtype)
+        if key not in cls._hd1t_cache:
+            from vllm.v1.attention.ops.triton_quant_kv._hadamard import (
+                _get_hadamard_matrix,
+                _get_rht_signs,
+            )
+            H = _get_hadamard_matrix(d, dtype, device)
+            D1 = _get_rht_signs(d, 0, device, dtype)
+            hd1 = (H * D1[None, :])
+            cls._hd1t_cache[key] = hd1.T.contiguous()
+            cls._hd1_cache[key] = hd1.contiguous()
+        return cls._hd1t_cache[key]
 
-    @staticmethod
-    def _unrotate_out(out: torch.Tensor, head_size: int) -> torch.Tensor:
-        return single_rht(out.float(), inverse=True) / head_size
+    @classmethod
+    def _get_hd1(cls, d: int, device: torch.device,
+                 dtype: torch.dtype) -> torch.Tensor:
+        """HD1 for inverse RHT: x_unrot = x @ HD1."""
+        key = (d, str(device), dtype)
+        if key not in cls._hd1_cache:
+            cls._get_hd1t(d, device, dtype)  # populates both caches
+        return cls._hd1_cache[key]
+
+    def reshape_and_cache(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        *,
+        k_scale_cache: torch.Tensor | None = None,
+        v_scale_cache: torch.Tensor | None = None,
+    ) -> None:
+        """Fused RHT + INT4 quantize via HIP kernel on RDNA3."""
+        assert k_scale_cache is not None and v_scale_cache is not None
+        from vllm.platforms import current_platform
+
+        if (
+            current_platform.is_rocm()
+            and key.dtype == torch.float16
+            and key.shape[2] == 128
+            and hasattr(torch.ops, "_C")
+            and hasattr(torch.ops._C, "reshape_cache_int4_rdna3")
+        ):
+            rht_signs = _get_rht_signs(
+                key.shape[2], 0, key.device, torch.float32
+            )
+            torch.ops._C.reshape_cache_int4_rdna3(
+                key, value, key_cache, value_cache,
+                k_scale_cache, v_scale_cache, rht_signs, slot_mapping,
+            )
+            return
+        # Fallback: matmul RHT + Triton quantize
+        super().reshape_and_cache(
+            key, value, key_cache, value_cache, slot_mapping,
+            k_scale_cache=k_scale_cache, v_scale_cache=v_scale_cache,
+        )
+
+    def _rotate_kv(self, x: torch.Tensor) -> torch.Tensor:
+        return x @ self._get_hd1t(x.shape[-1], x.device, x.dtype)
+
+    def _rotate_q(self, q: torch.Tensor) -> torch.Tensor:
+        return q @ self._get_hd1t(q.shape[-1], q.device, q.dtype)
+
+    def _unrotate_out(self, out: torch.Tensor,
+                      head_size: int) -> torch.Tensor:
+        return (out @ self._get_hd1(head_size, out.device, out.dtype)
+                ) / head_size
 
     @staticmethod
     def _transform_softmax_scale(scale: float, head_size: int) -> float:
