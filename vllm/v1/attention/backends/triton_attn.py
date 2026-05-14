@@ -510,6 +510,18 @@ class TritonAttentionImpl(AttentionImpl):
     # Per-token-head scale caches (float32 strided views over KV cache bytes).
     _k_scale_cache: torch.Tensor | None = None
     _v_scale_cache: torch.Tensor | None = None
+    _rht_signs: torch.Tensor | None = None
+
+    def _get_rht_signs(self, device: torch.device) -> torch.Tensor:
+        """Cached RHT D₁ signs [head_size] for fused INT4 kernel."""
+        if self._rht_signs is None:
+            from vllm.v1.attention.ops.triton_quant_kv._hadamard import (
+                _get_rht_signs,
+            )
+            self._rht_signs = _get_rht_signs(
+                self.head_size, 0, device
+            )
+        return self._rht_signs
 
     def _ensure_scale_caches(self, kv_cache: torch.Tensor) -> None:
         """Extract per-head scale views from the padded head dimension.
@@ -624,6 +636,21 @@ class TritonAttentionImpl(AttentionImpl):
                 vllm_config.attention_config.tq_max_kv_splits_for_cuda_graph
             )
 
+        # Pre-compute RDNA3 INT4 decode fast-path eligibility once.
+        self._rdna3_int4_decode_ready = (
+            self._kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD
+            and head_size == 128
+            and current_platform.is_rocm()
+            and hasattr(torch.ops, "_C")
+            and hasattr(torch.ops._C, "pth_decode_int4_rdna3")
+            and alibi_slopes is None
+            and not use_alibi_sqrt
+            and sinks is None
+            and logits_soft_cap is None
+            and sliding_window is None
+            and kv_sharing_target_layer_name is None
+        )
+
     def forward(
         self,
         layer: torch.nn.Module,
@@ -670,6 +697,41 @@ class TritonAttentionImpl(AttentionImpl):
         # performance to make sure it does not introduce any overhead.
 
         num_actual_tokens = attn_metadata.num_actual_tokens
+
+        # ---- RDNA3 INT4 fast-path: short-circuit for decode ----
+        # Bypasses ~20 Python ops of gate evaluation per layer.
+        # Must check ALL conditions that the normal path checks, but
+        # with minimal Python overhead (cached attributes, no slicing).
+        if (
+            self._rdna3_int4_decode_ready
+            and self._rht_signs is not None
+            and self._k_scale_cache is not None
+            and attn_metadata.max_query_len <= _CONTINUATION_DECODE_THRESHOLD
+            and attn_metadata.q_to_req is not None
+        ):
+            self._ensure_scale_caches(kv_cache)
+            key_cache, value_cache = kv_cache.unbind(1)
+            mid_o_buf = getattr(layer, "_pth_mid_o_buf", None)
+            if mid_o_buf is None:
+                mid_o_buf = torch.zeros(
+                    query.size(0), self.num_heads,
+                    self.max_num_kv_splits, self.head_size + 2,
+                    dtype=torch.float32, device=query.device)
+                layer._pth_mid_o_buf = mid_o_buf
+            torch.ops._C.pth_decode_int4_rdna3(
+                output[:num_actual_tokens],
+                query[:num_actual_tokens],
+                key_cache, value_cache,
+                self._k_scale_cache, self._v_scale_cache,
+                self._rht_signs,
+                attn_metadata.block_table,
+                attn_metadata.q_to_req,
+                attn_metadata.q_to_klen,
+                mid_o_buf,
+                self.scale / self.head_size,
+                self.max_num_kv_splits,
+            )
+            return output
 
         # Handle encoder attention differently - no KV cache needed
         if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
@@ -837,39 +899,24 @@ class TritonAttentionImpl(AttentionImpl):
                     return output
 
                 # RDNA3 HIP kernel for INT4 per-token-head prefill.
-                # Asymmetric dequant (zp + scale) with RHT rotation.
+                # RDNA3 HIP INT4 kernel: cache-only, fused RHT, bf16 WMMA.
+                # Zero Python-side RHT overhead — identical compute to INT8.
                 if (
                     self._kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD
-                    and _head_size in (64, 128, 256)
+                    and _head_size == 128
                     and current_platform.is_rocm()
                     and hasattr(torch.ops, "_C")
                     and hasattr(torch.ops._C, "paged_prefill_attn_rdna3_int4")
                 ):
-                    from vllm.v1.attention.ops.triton_quant_kv._hadamard import (
-                        single_rht,
-                    )
-                    head_size = query.shape[2]
-                    # Rotate Q, K, V into RHT space (cache stores rotated data;
-                    # current-chunk K/V haven't been rotated yet).
-                    q_rotated = single_rht(
-                        query[:num_actual_tokens].float()
-                    ).to(query.dtype)
-                    k_rotated = single_rht(
-                        key[:num_actual_tokens].float()
-                    ).to(key.dtype)
-                    v_rotated = single_rht(
-                        value[:num_actual_tokens].float()
-                    ).to(value.dtype)
-                    int4_scale = self.scale / head_size
+                    int4_scale = self.scale / _head_size
                     torch.ops._C.paged_prefill_attn_rdna3_int4(
                         output[:num_actual_tokens],
-                        q_rotated,
-                        k_rotated,
-                        v_rotated,
+                        query[:num_actual_tokens],
                         key_cache,
                         value_cache,
                         k_scale_cache,
                         v_scale_cache,
+                        self._get_rht_signs(query.device),
                         attn_metadata.block_table,
                         attn_metadata.query_start_loc,
                         attn_metadata.seq_lens,
@@ -877,11 +924,6 @@ class TritonAttentionImpl(AttentionImpl):
                         int4_scale,
                         True,
                     )
-                    # Inverse RHT on output
-                    out_f = single_rht(
-                        output[:num_actual_tokens].float(), inverse=True
-                    ) / head_size
-                    output[:num_actual_tokens].copy_(out_f.to(output.dtype))
                     return output
 
                 num_reqs_pref = attn_metadata.query_start_loc.shape[0] - 1
@@ -1011,6 +1053,38 @@ class TritonAttentionImpl(AttentionImpl):
                 and attn_metadata.mm_prefix_range_tensor is None
                 and output_scale is None
             ):
+                # RDNA3 HIP decode kernel for INT4 — eliminates Triton
+                # dispatch overhead (~40 µs/call) with fused RHT.
+                if (
+                    self._kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD
+                    and self.head_size == 128
+                    and current_platform.is_rocm()
+                    and hasattr(torch.ops, "_C")
+                    and hasattr(torch.ops._C, "pth_decode_int4_rdna3")
+                ):
+                    mid_o_buf = getattr(layer, "_pth_mid_o_buf", None)
+                    if mid_o_buf is None:
+                        mid_o_buf = torch.zeros(
+                            query.size(0), self.num_heads,
+                            self.max_num_kv_splits, self.head_size + 2,
+                            dtype=torch.float32, device=query.device)
+                        layer._pth_mid_o_buf = mid_o_buf
+                    rht_signs = self._get_rht_signs(query.device)
+                    torch.ops._C.pth_decode_int4_rdna3(
+                        output[:num_actual_tokens],
+                        query[:num_actual_tokens],
+                        key_cache, value_cache,
+                        k_scale_cache, v_scale_cache,
+                        rht_signs,
+                        attn_metadata.block_table,
+                        attn_metadata.q_to_req,
+                        attn_metadata.q_to_klen,
+                        mid_o_buf,
+                        self.scale / self.head_size,
+                        self.max_num_kv_splits,
+                    )
+                    return output
+
                 mid_o_buf = getattr(layer, "_pth_mid_o_buf", None)
                 output_buf = getattr(layer, "_pth_output_buf", None)
                 lse_buf = getattr(layer, "_pth_lse_buf", None)

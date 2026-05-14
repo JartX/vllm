@@ -453,14 +453,71 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
            &paged_prefill_attn_rdna3_int8);
 
   // RDNA3 INT4 per-token-head paged prefill attention (gfx1100).
+  // Cache-only + fused RHT.
   ops.def(
-      "paged_prefill_attn_rdna3_int4(Tensor! out, Tensor q, Tensor k_chunk, "
-      "Tensor v_chunk, Tensor k_cache, Tensor v_cache, "
-      "Tensor k_scale_cache, Tensor v_scale_cache, Tensor block_table, "
+      "paged_prefill_attn_rdna3_int4(Tensor! out, Tensor q, "
+      "Tensor k_cache, Tensor v_cache, "
+      "Tensor k_scale_cache, Tensor v_scale_cache, Tensor rht_signs, "
+      "Tensor block_table, "
       "Tensor cu_seqlens_q, Tensor seq_lens, int max_query_len, "
       "float sm_scale, bool causal) -> ()");
   ops.impl("paged_prefill_attn_rdna3_int4", torch::kCUDA,
            &paged_prefill_attn_rdna3_int4);
+
+  // Fused RHT + INT4 reshape_and_cache for RDNA3.
+  ops.def(
+      "reshape_cache_int4_rdna3(Tensor key, Tensor value, "
+      "Tensor key_cache, Tensor value_cache, "
+      "Tensor k_scale_cache, Tensor v_scale_cache, "
+      "Tensor rht_signs, Tensor slot_mapping) -> ()");
+  ops.impl("reshape_cache_int4_rdna3", torch::kCUDA,
+           &reshape_cache_int4_rdna3);
+
+  // Inplace RHT butterfly for INT4 decode Q rotation / output unrotation.
+  ops.def(
+      "rht_rotate_inplace_rdna3(Tensor! data, Tensor rht_signs, "
+      "bool inverse, float post_scale) -> ()");
+  ops.impl("rht_rotate_inplace_rdna3", torch::kCUDA,
+           &rht_rotate_inplace_rdna3);
+
+  // HIP split-KV decode attention for INT4 per-token-head (RDNA3).
+  ops.def(
+      "pth_decode_int4_rdna3(Tensor! out, Tensor query, "
+      "Tensor key_cache, Tensor value_cache, "
+      "Tensor k_scale_cache, Tensor v_scale_cache, "
+      "Tensor rht_signs, Tensor block_table, "
+      "Tensor q_to_req, Tensor q_to_klen, "
+      "Tensor! mid_o_buf, float sm_scale, int num_kv_splits) -> ()");
+  ops.impl("pth_decode_int4_rdna3", torch::kCUDA,
+           &pth_decode_int4_rdna3);
+
+  // W4A16 GPTQ kernels for AMD RDNA3 (gfx1100).
+  // See csrc/quantization/gptq/README_RDNA3.md.
+  ops.def(
+      "gptq_gemm_rdna3(Tensor a, Tensor b_q_weight, Tensor b_qzeros, "
+      "Tensor b_scales, Tensor b_g_idx, bool use_v2_format) -> Tensor");
+  ops.impl("gptq_gemm_rdna3", torch::kCUDA, &gptq_gemm_rdna3);
+
+  ops.def(
+      "gptq_gemm_rdna3_wmma(Tensor a, Tensor b_q_weight, Tensor b_qzeros, "
+      "Tensor b_scales, Tensor b_g_idx, bool use_v2_format) -> Tensor");
+  ops.impl("gptq_gemm_rdna3_wmma", torch::kCUDA, &gptq_gemm_rdna3_wmma);
+
+  ops.def("gptq_gemm_rdna3_wmma_probe(Tensor a, Tensor b, int mode) -> Tensor");
+  ops.impl("gptq_gemm_rdna3_wmma_probe", torch::kCUDA,
+           &gptq_gemm_rdna3_wmma_probe);
+
+  ops.def(
+      "gptq_gemm_rdna3_wmma_dump(Tensor a, Tensor b_q_weight, Tensor b_qzeros, "
+      "Tensor b_scales, bool use_v2_format) -> Tensor");
+  ops.impl("gptq_gemm_rdna3_wmma_dump", torch::kCUDA,
+           &gptq_gemm_rdna3_wmma_dump);
+
+  ops.def(
+      "gptq_gemm_rdna3_wmma_lds_check(Tensor b_q_weight, Tensor b_qzeros, "
+      "Tensor b_scales, bool use_v2_format) -> Tensor");
+  ops.impl("gptq_gemm_rdna3_wmma_lds_check", torch::kCUDA,
+           &gptq_gemm_rdna3_wmma_lds_check);
 
   // Compute FP8 quantized tensor for given scaling factor.
   // Supports per-tensor, per-channel, per-token, and arbitrary 2D group

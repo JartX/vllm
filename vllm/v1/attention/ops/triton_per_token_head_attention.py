@@ -1785,26 +1785,61 @@ def _packing_factor_for(kv_quant_mode: KVQuantMode) -> int:
     return 1
 
 
+# Cached RHT signs for HIP butterfly kernels.
+_RHT_SIGNS_F32_CACHE: dict[tuple[int, str], torch.Tensor] = {}
+
+
+def _get_rht_signs_f32(d: int, device: torch.device) -> torch.Tensor:
+    """Cached fp32 RHT signs for HIP butterfly kernel."""
+    key = (d, str(device))
+    if key not in _RHT_SIGNS_F32_CACHE:
+        from vllm.v1.attention.ops.triton_quant_kv._hadamard import (
+            _get_rht_signs,
+        )
+        _RHT_SIGNS_F32_CACHE[key] = _get_rht_signs(d, 0, device,
+                                                     torch.float32)
+    return _RHT_SIGNS_F32_CACHE[key]
+
+
 def _maybe_rotate_q(q: torch.Tensor, kv_quant_mode: KVQuantMode) -> torch.Tensor:
-    """RHT for INT4, Hadamard for INT2 — same as the factory does."""
+    """RHT for INT4 via HIP butterfly inplace, Triton Hadamard for INT2."""
     if kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD:
-        return single_rht(q.float()).to(q.dtype)
+        if (
+            q.dtype == torch.float16
+            and q.shape[-1] == 128
+            and hasattr(torch.ops, "_C")
+            and hasattr(torch.ops._C, "rht_rotate_inplace_rdna3")
+        ):
+            signs = _get_rht_signs_f32(q.shape[-1], q.device)
+            torch.ops._C.rht_rotate_inplace_rdna3(q, signs, False, 1.0)
+            return q
+        return single_rht(q)
     if kv_quant_mode == KVQuantMode.INT2_PER_TOKEN_HEAD:
-        return fast_hadamard_transform(q.float()).to(q.dtype)
+        return fast_hadamard_transform(q)
     return q
 
 
 def _maybe_unrotate_out(
     out: torch.Tensor, kv_quant_mode: KVQuantMode, head_size: int
 ) -> torch.Tensor:
-    """Inverse rotation written back into ``out`` for INT4/INT2."""
+    """Inverse RHT via HIP butterfly inplace, Triton for fallback."""
     if kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD:
-        out_f = single_rht(out.float(), inverse=True) / head_size
-        out.copy_(out_f.to(out.dtype))
+        if (
+            out.dtype == torch.float16
+            and head_size == 128
+            and hasattr(torch.ops, "_C")
+            and hasattr(torch.ops._C, "rht_rotate_inplace_rdna3")
+        ):
+            signs = _get_rht_signs_f32(head_size, out.device)
+            torch.ops._C.rht_rotate_inplace_rdna3(
+                out, signs, True, 1.0 / head_size)
+            return out
+        out_f = single_rht(out, inverse=True) / head_size
+        out.copy_(out_f)
         return out
     if kv_quant_mode == KVQuantMode.INT2_PER_TOKEN_HEAD:
-        out_f = fast_hadamard_transform(out.float())
-        out.copy_(out_f.to(out.dtype))
+        out_f = fast_hadamard_transform(out)
+        out.copy_(out_f)
         return out
     return out
 
