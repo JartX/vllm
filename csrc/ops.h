@@ -260,13 +260,35 @@ void paged_prefill_attn_rdna3_int8(
     bool causal);
 
 // RDNA3 INT4 per-token-head paged prefill attention (gfx1100).
+// Cache-only (no k_chunk/v_chunk). RHT fused via rht_signs.
 void paged_prefill_attn_rdna3_int4(
-    torch::Tensor& out, torch::Tensor q, torch::Tensor k_chunk,
-    torch::Tensor v_chunk, torch::Tensor k_cache, torch::Tensor v_cache,
+    torch::Tensor& out, torch::Tensor q,
+    torch::Tensor k_cache, torch::Tensor v_cache,
     torch::Tensor k_scale_cache, torch::Tensor v_scale_cache,
-    torch::Tensor block_table, torch::Tensor cu_seqlens_q,
-    torch::Tensor seq_lens, int64_t max_query_len, double sm_scale,
-    bool causal);
+    torch::Tensor rht_signs, torch::Tensor block_table,
+    torch::Tensor cu_seqlens_q, torch::Tensor seq_lens,
+    int64_t max_query_len, double sm_scale, bool causal);
+
+// Fused RHT + INT4 quantize + nibble pack for RDNA3 reshape_and_cache.
+void reshape_cache_int4_rdna3(
+    torch::Tensor key, torch::Tensor value,
+    torch::Tensor key_cache, torch::Tensor value_cache,
+    torch::Tensor k_scale_cache, torch::Tensor v_scale_cache,
+    torch::Tensor rht_signs, torch::Tensor slot_mapping);
+
+// Inplace RHT butterfly for decode Q rotation / output unrotation.
+void rht_rotate_inplace_rdna3(
+    torch::Tensor data, torch::Tensor rht_signs, bool inverse,
+    double post_scale);
+
+// HIP split-KV decode attention for INT4 per-token-head (RDNA3).
+void pth_decode_int4_rdna3(
+    torch::Tensor out, torch::Tensor query,
+    torch::Tensor key_cache, torch::Tensor value_cache,
+    torch::Tensor k_scale_cache, torch::Tensor v_scale_cache,
+    torch::Tensor rht_signs, torch::Tensor block_table,
+    torch::Tensor q_to_req, torch::Tensor q_to_klen,
+    torch::Tensor mid_o_buf, double sm_scale, int64_t num_kv_splits);
 
 // W4A16 GPTQ kernels for AMD RDNA3 (gfx1100). See csrc/quantization/gptq/
 // README_RDNA3.md for kernel architecture and diagnostic op usage.
