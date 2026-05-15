@@ -86,7 +86,8 @@ __global__ void decode_int4_stage1(
   float q_rot = qs[tid];
 
   // ---- Online softmax + V accumulation ----
-  __shared__ float dot_lds[4];  // partial sums from 4 waves
+  constexpr int NW = HEAD_SIZE / 32;
+  __shared__ float dot_lds[NW];  // partial sums from NW waves
   const int wave_id = tid / 32;
   const int lane = tid & 31;
 
@@ -125,13 +126,12 @@ __global__ void decode_int4_stage1(
     if (lane == 0) dot_lds[wave_id] = partial;
     __syncthreads();
 
-    // Combine 4 waves (only need first 4 threads)
+    // Combine NW waves via tree reduction in first NW threads
     float score = 0;
-    if (tid < 4) score = dot_lds[tid];
-    if (tid < 4) {
-      score += __shfl_xor(score, 1);
-      score += __shfl_xor(score, 2);
-    }
+    if (tid < NW) score = dot_lds[tid];
+    #pragma unroll
+    for (int s = 1; s < NW; s *= 2)
+      if (tid < NW) score += __shfl_xor(score, s);
     // Broadcast score to all threads via LDS
     if (tid == 0) dot_lds[0] = score * k_sc * sm_scale;
     __syncthreads();
@@ -253,49 +253,50 @@ void pth_decode_int4_rdna3(
   const int max_blocks = block_table.size(1);
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
-  TORCH_CHECK(head_size == 128);
+  TORCH_CHECK(head_size == 128 || head_size == 256,
+              "pth_decode_int4_rdna3: head_size must be 128 or 256, got ", head_size);
   TORCH_CHECK(query.dtype() == at::kHalf);
 
-  constexpr int HS = 128;
-  constexpr int BKV = 1;  // process 1 KV token per iteration (simple)
+  constexpr int BKV = 1;
   int ns = (int)num_kv_splits;
-
-  // Ensure mid_o is big enough
   TORCH_CHECK(mid_o_buf.size(2) >= ns);
-  TORCH_CHECK(mid_o_buf.size(3) >= HS + 2);
+  TORCH_CHECK(mid_o_buf.size(3) >= head_size + 2);
 
-  // Stage 1
-  dim3 grid1(num_q, num_q_heads, ns);
-  decode_int4_stage1<HS, BKV><<<grid1, dim3(HS), 0, stream>>>(
-      (const half*)query.data_ptr(),
-      (const uint8_t*)key_cache.data_ptr(),
-      (const uint8_t*)value_cache.data_ptr(),
-      (const float*)k_scale_cache.data_ptr(),
-      (const float*)v_scale_cache.data_ptr(),
-      (const float*)rht_signs.data_ptr(),
-      (const int*)block_table.data_ptr(),
-      (const int*)q_to_req.data_ptr(),
-      (const int*)q_to_klen.data_ptr(),
-      (float*)mid_o_buf.data_ptr(),
-      (float)sm_scale,
-      num_q_heads, num_kv_heads, block_size, max_blocks, ns,
-      query.stride(0), query.stride(1),
-      key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
-      value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),
-      k_scale_cache.stride(0), k_scale_cache.stride(1), k_scale_cache.stride(2),
-      v_scale_cache.stride(0), v_scale_cache.stride(1), v_scale_cache.stride(2),
-      mid_o_buf.stride(0), mid_o_buf.stride(1), mid_o_buf.stride(2));
+  #define LAUNCH(HS) do { \
+    dim3 grid1(num_q, num_q_heads, ns); \
+    decode_int4_stage1<HS, BKV><<<grid1, dim3(HS), 0, stream>>>( \
+        (const half*)query.data_ptr(), \
+        (const uint8_t*)key_cache.data_ptr(), \
+        (const uint8_t*)value_cache.data_ptr(), \
+        (const float*)k_scale_cache.data_ptr(), \
+        (const float*)v_scale_cache.data_ptr(), \
+        (const float*)rht_signs.data_ptr(), \
+        (const int*)block_table.data_ptr(), \
+        (const int*)q_to_req.data_ptr(), \
+        (const int*)q_to_klen.data_ptr(), \
+        (float*)mid_o_buf.data_ptr(), \
+        (float)sm_scale, \
+        num_q_heads, num_kv_heads, block_size, max_blocks, ns, \
+        query.stride(0), query.stride(1), \
+        key_cache.stride(0), key_cache.stride(1), key_cache.stride(2), \
+        value_cache.stride(0), value_cache.stride(1), value_cache.stride(2), \
+        k_scale_cache.stride(0), k_scale_cache.stride(1), k_scale_cache.stride(2), \
+        v_scale_cache.stride(0), v_scale_cache.stride(1), v_scale_cache.stride(2), \
+        mid_o_buf.stride(0), mid_o_buf.stride(1), mid_o_buf.stride(2)); \
+    dim3 grid2(num_q, num_q_heads); \
+    constexpr float inv_hs = 1.0f / (float)HS; \
+    decode_int4_reduce<HS><<<grid2, dim3(HS), 0, stream>>>( \
+        (const float*)mid_o_buf.data_ptr(), \
+        (half*)out.data_ptr(), \
+        (const float*)rht_signs.data_ptr(), \
+        ns, inv_hs, \
+        mid_o_buf.stride(0), mid_o_buf.stride(1), mid_o_buf.stride(2), \
+        out.stride(0), out.stride(1)); \
+  } while(0)
 
-  // Stage 2: reduce + inverse RHT
-  dim3 grid2(num_q, num_q_heads);
-  constexpr float inv_hs = 1.0f / (float)HS;
-  decode_int4_reduce<HS><<<grid2, dim3(HS), 0, stream>>>(
-      (const float*)mid_o_buf.data_ptr(),
-      (half*)out.data_ptr(),
-      (const float*)rht_signs.data_ptr(),
-      ns, inv_hs,
-      mid_o_buf.stride(0), mid_o_buf.stride(1), mid_o_buf.stride(2),
-      out.stride(0), out.stride(1));
+  if (head_size == 128) { LAUNCH(128); }
+  else { LAUNCH(256); }
+  #undef LAUNCH
 }
 
 #else

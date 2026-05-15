@@ -96,12 +96,19 @@ __global__ void reshape_cache_int4_rht_kernel(
   // Quantize
   int k_q = (int)fminf(fmaxf(k_rotated * k_inv + k_zp_f + 0.5f, 0.0f), 15.0f);
 
-  // Pack nibbles: even thread packs with odd partner
-  // Thread 2i writes byte containing nibble[2i] and nibble[2i+1]
-  if ((tid & 1) == 0 && tid < HEAD_SIZE) {
-    int partner_q = __shfl(k_q, tid + 1);
-    uint8_t packed = (uint8_t)((k_q & 0xF) | ((partner_q & 0xF) << 4));
-    key_cache[blk * scb + slot_in_blk * scs + head * sch + tid / 2] = packed;
+  // Pack nibbles via shared memory (safe across wave boundaries).
+  // Reuse s[] as int scratch: thread i writes its quantized nibble,
+  // then even thread 2i reads both nibble[2i] and nibble[2i+1].
+  {
+    __syncthreads();
+    // Reinterpret s[] as int array for nibble exchange
+    int* si = reinterpret_cast<int*>(s);
+    si[tid] = k_q;
+    __syncthreads();
+    if ((tid & 1) == 0) {
+      uint8_t packed = (uint8_t)((si[tid] & 0xF) | ((si[tid + 1] & 0xF) << 4));
+      key_cache[blk * scb + slot_in_blk * scs + head * sch + tid / 2] = packed;
+    }
   }
 
   // Store steganographed scale (thread 0 only)
@@ -158,10 +165,15 @@ __global__ void reshape_cache_int4_rht_kernel(
   int v_zp = (int)v_zp_f;
   int v_q = (int)fminf(fmaxf(v_rotated * v_inv + v_zp_f + 0.5f, 0.0f), 15.0f);
 
-  if ((tid & 1) == 0 && tid < HEAD_SIZE) {
-    int partner_q = __shfl(v_q, tid + 1);
-    uint8_t packed = (uint8_t)((v_q & 0xF) | ((partner_q & 0xF) << 4));
-    value_cache[blk * svb + slot_in_blk * svs + head * svh + tid / 2] = packed;
+  {
+    __syncthreads();
+    int* si = reinterpret_cast<int*>(s);
+    si[tid] = v_q;
+    __syncthreads();
+    if ((tid & 1) == 0) {
+      uint8_t packed = (uint8_t)((si[tid] & 0xF) | ((si[tid + 1] & 0xF) << 4));
+      value_cache[blk * svb + slot_in_blk * svs + head * svh + tid / 2] = packed;
+    }
   }
   if (tid == 0) {
     int sb;
@@ -184,24 +196,28 @@ void reshape_cache_int4_rdna3(
   const int block_size = key_cache.size(1);
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
-  TORCH_CHECK(head_size == 128, "reshape_cache_int4_rdna3: only head_size=128");
+  TORCH_CHECK(head_size == 128 || head_size == 256,
+              "reshape_cache_int4_rdna3: head_size must be 128 or 256, got ", head_size);
   TORCH_CHECK(key.dtype() == at::kHalf, "only fp16 supported");
 
   dim3 grid(num_tokens, num_kv_heads);
-  dim3 block(128);
-  reshape_cache_int4_rht_kernel<128><<<grid, block, 0, stream>>>(
-      (const half*)key.data_ptr(), (const half*)value.data_ptr(),
-      (uint8_t*)key_cache.data_ptr(), (uint8_t*)value_cache.data_ptr(),
-      (float*)k_scale_cache.data_ptr(), (float*)v_scale_cache.data_ptr(),
-      (const float*)rht_signs.data_ptr(),
-      (const int*)slot_mapping.data_ptr(),
-      block_size,
-      key.stride(0), key.stride(1),
-      value.stride(0), value.stride(1),
-      key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
-      value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),
-      k_scale_cache.stride(0), k_scale_cache.stride(1), k_scale_cache.stride(2),
-      v_scale_cache.stride(0), v_scale_cache.stride(1), v_scale_cache.stride(2));
+  #define LAUNCH_RESHAPE(HS) \
+    reshape_cache_int4_rht_kernel<HS><<<grid, dim3(HS), 0, stream>>>( \
+      (const half*)key.data_ptr(), (const half*)value.data_ptr(), \
+      (uint8_t*)key_cache.data_ptr(), (uint8_t*)value_cache.data_ptr(), \
+      (float*)k_scale_cache.data_ptr(), (float*)v_scale_cache.data_ptr(), \
+      (const float*)rht_signs.data_ptr(), \
+      (const int*)slot_mapping.data_ptr(), \
+      block_size, \
+      key.stride(0), key.stride(1), \
+      value.stride(0), value.stride(1), \
+      key_cache.stride(0), key_cache.stride(1), key_cache.stride(2), \
+      value_cache.stride(0), value_cache.stride(1), value_cache.stride(2), \
+      k_scale_cache.stride(0), k_scale_cache.stride(1), k_scale_cache.stride(2), \
+      v_scale_cache.stride(0), v_scale_cache.stride(1), v_scale_cache.stride(2))
+  if (head_size == 128) { LAUNCH_RESHAPE(128); }
+  else { LAUNCH_RESHAPE(256); }
+  #undef LAUNCH_RESHAPE
 }
 
 // ---------------------------------------------------------------------------
@@ -262,12 +278,19 @@ void rht_rotate_inplace_rdna3(
   const int num_tokens = data.size(0);
   const int num_heads = data.size(1);
   const int head_size = data.size(2);
-  TORCH_CHECK(head_size == 128);
+  TORCH_CHECK(head_size == 128 || head_size == 256,
+              "rht_rotate_inplace_rdna3: head_size must be 128 or 256, got ", head_size);
   auto stream = at::cuda::getCurrentCUDAStream().stream();
   dim3 grid(num_tokens, num_heads);
-  rht_butterfly_inplace_kernel<128><<<grid, dim3(128), 0, stream>>>(
-      (half*)data.data_ptr(), (const float*)rht_signs.data_ptr(),
-      (float)post_scale, inverse, data.stride(0), data.stride(1));
+  if (head_size == 128) {
+    rht_butterfly_inplace_kernel<128><<<grid, dim3(128), 0, stream>>>(
+        (half*)data.data_ptr(), (const float*)rht_signs.data_ptr(),
+        (float)post_scale, inverse, data.stride(0), data.stride(1));
+  } else {
+    rht_butterfly_inplace_kernel<256><<<grid, dim3(256), 0, stream>>>(
+        (half*)data.data_ptr(), (const float*)rht_signs.data_ptr(),
+        (float)post_scale, inverse, data.stride(0), data.stride(1));
+  }
 }
 
 #else

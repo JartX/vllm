@@ -374,8 +374,9 @@ void launch_int4(T* out, const T* q, const uint8_t* kc, const uint8_t* vc,
       ssb, sss, ssh, svvb, svvs, svvh, so0, so1);
 }
 
-template void launch_int4<half,128>(half*,const half*,const uint8_t*,const uint8_t*,const float*,const float*,const float*,const int*,const int*,const int*,int,int,int,int,int,int,float,bool,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,cudaStream_t);
-template void launch_int4<bf16_t,128>(bf16_t*,const bf16_t*,const uint8_t*,const uint8_t*,const float*,const float*,const float*,const int*,const int*,const int*,int,int,int,int,int,int,float,bool,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,cudaStream_t);
+#define INST(T,HS) template void launch_int4<T,HS>(T*,const T*,const uint8_t*,const uint8_t*,const float*,const float*,const float*,const int*,const int*,const int*,int,int,int,int,int,int,float,bool,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,cudaStream_t);
+INST(half,128) INST(bf16_t,128) INST(half,256) INST(bf16_t,256)
+#undef INST
 
 #endif
 
@@ -407,8 +408,14 @@ void paged_prefill_attn_rdna3_int4(
     k_scale_cache.stride(0),k_scale_cache.stride(1),k_scale_cache.stride(2),\
     v_scale_cache.stride(0),v_scale_cache.stride(1),v_scale_cache.stride(2),\
     out.stride(0),out.stride(1),st)
-  if (q.dtype()==at::kHalf) { L(half,128); }
-  else { L(bf16_t,128); }
+  int hs = q.size(2);
+  if (q.dtype()==at::kHalf) {
+    if (hs == 128) { L(half,128); } else if (hs == 256) { L(half,256); }
+    else { TORCH_CHECK(false, "INT4 prefill: unsupported head_size ", hs); }
+  } else {
+    if (hs == 128) { L(bf16_t,128); } else if (hs == 256) { L(bf16_t,256); }
+    else { TORCH_CHECK(false, "INT4 prefill: unsupported head_size ", hs); }
+  }
   #undef L
 }
 #else
