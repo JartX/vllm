@@ -643,9 +643,8 @@ class TritonAttentionImpl(AttentionImpl):
             and current_platform.is_rocm()
             and hasattr(torch.ops, "_C")
         )
-        # HIP decode for HS=128 (RHT inside kernel, HEAD_SIZE threads) and
-        # HS=256 (RHT external, HEAD_SIZE/2 threads = 4 waves).
-        _decode_hs_ok = head_size in (128, 256)
+        # HIP decode HS=128 only. HS=256 v2 crashes with cudagraph.
+        _decode_hs_ok = head_size == 128
         _no_special_features = (
             alibi_slopes is None
             and not use_alibi_sqrt
