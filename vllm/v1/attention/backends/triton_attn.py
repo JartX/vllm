@@ -643,8 +643,8 @@ class TritonAttentionImpl(AttentionImpl):
             and current_platform.is_rocm()
             and hasattr(torch.ops, "_C")
         )
-        # Decode HIP kernel only for HS=128 (HS=256 with 8 waves needs
-        # further validation of cross-wave reduction correctness).
+        # HIP decode only for HS=128. HS=256 has 8 waves → 2× cross-wave
+        # barriers per KV token, slower than Triton split-KV.
         _decode_hs_ok = head_size == 128
         _no_special_features = (
             alibi_slopes is None
