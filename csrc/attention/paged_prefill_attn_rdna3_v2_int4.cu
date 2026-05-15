@@ -198,15 +198,31 @@ __device__ __forceinline__ void attn_step(
   using V16 = typename WmmaNative<T>::v16;
   constexpr int F = HEAD_SIZE/16;
 
+  // Q×K dot product: accumulate WMMA across all head frags.
+  // For F>8 (HS=256), unroll 1 forces register recycling so the compiler
+  // spills qf/oa to scratch instead of keeping 16 frags live simultaneously.
+  // Scratch bandwidth penalty is ~1-2% of total WMMA compute.
   v8fp32 sa = {0,0,0,0,0,0,0,0};
-  #pragma unroll
-  for (int dh = 0; dh < F; ++dh) {
-    V16 bf;
-    int4 lo = *(const int4*)&K[(dh*2+0)*(K_TILE*X)+ll*X];
-    int4 hi = *(const int4*)&K[(dh*2+1)*(K_TILE*X)+ll*X];
-    __builtin_memcpy(&bf, &lo, 16);
-    __builtin_memcpy(((char*)&bf)+16, &hi, 16);
-    sa = wmma_mma(qf[dh], bf, sa);
+  if constexpr (F <= 8) {
+    #pragma unroll
+    for (int dh = 0; dh < F; ++dh) {
+      V16 bf;
+      int4 lo = *(const int4*)&K[(dh*2+0)*(K_TILE*X)+ll*X];
+      int4 hi = *(const int4*)&K[(dh*2+1)*(K_TILE*X)+ll*X];
+      __builtin_memcpy(&bf, &lo, 16);
+      __builtin_memcpy(((char*)&bf)+16, &hi, 16);
+      sa = wmma_mma(qf[dh], bf, sa);
+    }
+  } else {
+    #pragma unroll 1
+    for (int dh = 0; dh < F; ++dh) {
+      V16 bf;
+      int4 lo = *(const int4*)&K[(dh*2+0)*(K_TILE*X)+ll*X];
+      int4 hi = *(const int4*)&K[(dh*2+1)*(K_TILE*X)+ll*X];
+      __builtin_memcpy(&bf, &lo, 16);
+      __builtin_memcpy(((char*)&bf)+16, &hi, 16);
+      sa = wmma_mma(qf[dh], bf, sa);
+    }
   }
 
   float kc = ksc[ll]; int ak = sn+ll; bool ks = ll<vkc;
@@ -225,10 +241,17 @@ __device__ __forceinline__ void attn_step(
     pi[i]=(mn[i]==-INFINITY)?0.f:__expf(sa[i]-mn[i]);
     li[i]=wave16_sum(pi[i]); ls[i]=ls[i]*al[i]+li[i]; ms[i]=mn[i];
   }
-  #pragma unroll
-  for (int dh = 0; dh < F; ++dh)
-  #pragma unroll
-    for (int i = 0; i < 8; ++i) oa[dh][i] *= al[i];
+  if constexpr (F <= 8) {
+    #pragma unroll
+    for (int dh = 0; dh < F; ++dh)
+    #pragma unroll
+      for (int i = 0; i < 8; ++i) oa[dh][i] *= al[i];
+  } else {
+    #pragma unroll 1
+    for (int dh = 0; dh < F; ++dh)
+    #pragma unroll
+      for (int i = 0; i < 8; ++i) oa[dh][i] *= al[i];
+  }
 
   float vc = vsc[ll];
   #pragma unroll
@@ -240,13 +263,24 @@ __device__ __forceinline__ void attn_step(
   int4 pl = *(const int4*)&Pw[ll*K_TILE]; int4 ph = *(const int4*)&Pw[ll*K_TILE+8];
   __builtin_memcpy(&pf, &pl, 16); __builtin_memcpy(((char*)&pf)+16, &ph, 16);
 
-  #pragma unroll
-  for (int dh = 0; dh < F; ++dh) {
-    V16 vf;
-    int4 vl = *(const int4*)&V[(dh*16+ll)*K_TILE];
-    int4 vh = *(const int4*)&V[(dh*16+ll)*K_TILE+8];
-    __builtin_memcpy(&vf, &vl, 16); __builtin_memcpy(((char*)&vf)+16, &vh, 16);
-    oa[dh] = wmma_mma(pf, vf, oa[dh]);
+  if constexpr (F <= 8) {
+    #pragma unroll
+    for (int dh = 0; dh < F; ++dh) {
+      V16 vf;
+      int4 vl = *(const int4*)&V[(dh*16+ll)*K_TILE];
+      int4 vh = *(const int4*)&V[(dh*16+ll)*K_TILE+8];
+      __builtin_memcpy(&vf, &vl, 16); __builtin_memcpy(((char*)&vf)+16, &vh, 16);
+      oa[dh] = wmma_mma(pf, vf, oa[dh]);
+    }
+  } else {
+    #pragma unroll 1
+    for (int dh = 0; dh < F; ++dh) {
+      V16 vf;
+      int4 vl = *(const int4*)&V[(dh*16+ll)*K_TILE];
+      int4 vh = *(const int4*)&V[(dh*16+ll)*K_TILE+8];
+      __builtin_memcpy(&vf, &vl, 16); __builtin_memcpy(((char*)&vf)+16, &vh, 16);
+      oa[dh] = wmma_mma(pf, vf, oa[dh]);
+    }
   }
 }
 
