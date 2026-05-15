@@ -197,6 +197,7 @@ class Int4PerTokenHeadFactory(_PackedFactory):
     # This is ~10 µs per call vs ~41 µs with reshape+matmul+reshape.
     _hd1t_cache: dict[tuple[int, str, torch.dtype], torch.Tensor] = {}
     _hd1_cache: dict[tuple[int, str, torch.dtype], torch.Tensor] = {}
+    _rdna3_reshape_ready: bool | None = None
 
     @classmethod
     def _get_hd1t(cls, d: int, device: torch.device,
@@ -224,6 +225,17 @@ class Int4PerTokenHeadFactory(_PackedFactory):
             cls._get_hd1t(d, device, dtype)  # populates both caches
         return cls._hd1_cache[key]
 
+    @classmethod
+    def _check_rdna3_reshape(cls) -> bool:
+        if cls._rdna3_reshape_ready is None:
+            from vllm.platforms import current_platform
+            cls._rdna3_reshape_ready = (
+                current_platform.is_rocm()
+                and hasattr(torch.ops, "_C")
+                and hasattr(torch.ops._C, "reshape_cache_int4_rdna3")
+            )
+        return cls._rdna3_reshape_ready
+
     def reshape_and_cache(
         self,
         key: torch.Tensor,
@@ -237,14 +249,10 @@ class Int4PerTokenHeadFactory(_PackedFactory):
     ) -> None:
         """Fused RHT + INT4 quantize via HIP kernel on RDNA3."""
         assert k_scale_cache is not None and v_scale_cache is not None
-        from vllm.platforms import current_platform
-
         if (
-            current_platform.is_rocm()
+            self._check_rdna3_reshape()
             and key.dtype == torch.float16
             and key.shape[2] == 128
-            and hasattr(torch.ops, "_C")
-            and hasattr(torch.ops._C, "reshape_cache_int4_rdna3")
         ):
             rht_signs = _get_rht_signs(
                 key.shape[2], 0, key.device, torch.float32

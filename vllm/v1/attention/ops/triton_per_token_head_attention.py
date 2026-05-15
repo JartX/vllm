@@ -1787,6 +1787,17 @@ def _packing_factor_for(kv_quant_mode: KVQuantMode) -> int:
 
 # Cached RHT signs for HIP butterfly kernels.
 _RHT_SIGNS_F32_CACHE: dict[tuple[int, str], torch.Tensor] = {}
+_HAS_RHT_ROTATE: bool | None = None
+
+
+def _has_rht_rotate_inplace() -> bool:
+    global _HAS_RHT_ROTATE
+    if _HAS_RHT_ROTATE is None:
+        _HAS_RHT_ROTATE = (
+            hasattr(torch.ops, "_C")
+            and hasattr(torch.ops._C, "rht_rotate_inplace_rdna3")
+        )
+    return _HAS_RHT_ROTATE
 
 
 def _get_rht_signs_f32(d: int, device: torch.device) -> torch.Tensor:
@@ -1806,9 +1817,8 @@ def _maybe_rotate_q(q: torch.Tensor, kv_quant_mode: KVQuantMode) -> torch.Tensor
     if kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD:
         if (
             q.dtype == torch.float16
-            and q.shape[-1] == 128
-            and hasattr(torch.ops, "_C")
-            and hasattr(torch.ops._C, "rht_rotate_inplace_rdna3")
+            and q.shape[-1] in (128, 256)
+            and _has_rht_rotate_inplace()
         ):
             signs = _get_rht_signs_f32(q.shape[-1], q.device)
             torch.ops._C.rht_rotate_inplace_rdna3(q, signs, False, 1.0)
@@ -1826,9 +1836,8 @@ def _maybe_unrotate_out(
     if kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD:
         if (
             out.dtype == torch.float16
-            and head_size == 128
-            and hasattr(torch.ops, "_C")
-            and hasattr(torch.ops._C, "rht_rotate_inplace_rdna3")
+            and head_size in (128, 256)
+            and _has_rht_rotate_inplace()
         ):
             signs = _get_rht_signs_f32(head_size, out.device)
             torch.ops._C.rht_rotate_inplace_rdna3(

@@ -636,20 +636,41 @@ class TritonAttentionImpl(AttentionImpl):
                 vllm_config.attention_config.tq_max_kv_splits_for_cuda_graph
             )
 
-        # Pre-compute RDNA3 INT4 decode fast-path eligibility once.
-        self._rdna3_int4_decode_ready = (
+        # Pre-compute RDNA3 INT4 fast-path eligibility flags once.
+        _is_rdna3_int4 = (
             self._kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD
-            and head_size == 128
+            and head_size in (128, 256)
             and current_platform.is_rocm()
             and hasattr(torch.ops, "_C")
-            and hasattr(torch.ops._C, "pth_decode_int4_rdna3")
-            and alibi_slopes is None
+        )
+        # Decode HIP kernel only for HS=128 (HS=256 with 8 waves needs
+        # further validation of cross-wave reduction correctness).
+        _decode_hs_ok = head_size == 128
+        _no_special_features = (
+            alibi_slopes is None
             and not use_alibi_sqrt
             and sinks is None
-            and logits_soft_cap is None
+            and not self.logits_soft_cap
             and sliding_window is None
             and kv_sharing_target_layer_name is None
         )
+        self._rdna3_int4_decode_ready = (
+            _is_rdna3_int4
+            and _decode_hs_ok
+            and _no_special_features
+            and hasattr(torch.ops._C, "pth_decode_int4_rdna3")
+        )
+        # Prefill HIP kernel only for HS=128 (HS=256 exceeds RDNA3 VGPR limit
+        # with 16 WMMA frags; decode + reshape HIP kernels are scalar and work
+        # for both sizes).
+        self._rdna3_int4_prefill_ready = (
+            _is_rdna3_int4
+            and head_size == 128
+            and _no_special_features
+            and hasattr(torch.ops._C, "paged_prefill_attn_rdna3_int4")
+        )
+        # Pre-compute INT4 softmax scale (avoids division every forward call).
+        self._int4_scale = self.scale / head_size if _is_rdna3_int4 else 0.0
 
     def forward(
         self,
@@ -728,8 +749,35 @@ class TritonAttentionImpl(AttentionImpl):
                 attn_metadata.q_to_req,
                 attn_metadata.q_to_klen,
                 mid_o_buf,
-                self.scale / self.head_size,
+                self._int4_scale,
                 self.max_num_kv_splits,
+            )
+            return output
+
+        # ---- RDNA3 INT4 fast-path: short-circuit for continuation prefill ----
+        # Pure continuation (all from cache, no first-chunk) bypasses ~20
+        # Python ops of gate evaluation per layer.
+        if (
+            self._rdna3_int4_prefill_ready
+            and attn_metadata.num_decodes == 0
+            and not attn_metadata.all_pure_first_prefill
+        ):
+            self._ensure_scale_caches(kv_cache)
+            key_cache, value_cache = kv_cache.unbind(1)
+            rht_signs = self._get_rht_signs(query.device)
+            torch.ops._C.paged_prefill_attn_rdna3_int4(
+                output[:num_actual_tokens],
+                query[:num_actual_tokens],
+                key_cache,
+                value_cache,
+                self._k_scale_cache, self._v_scale_cache,
+                rht_signs,
+                attn_metadata.block_table,
+                attn_metadata.query_start_loc,
+                attn_metadata.seq_lens,
+                attn_metadata.max_query_len,
+                self._int4_scale,
+                True,
             )
             return output
 
@@ -901,14 +949,7 @@ class TritonAttentionImpl(AttentionImpl):
                 # RDNA3 HIP kernel for INT4 per-token-head prefill.
                 # RDNA3 HIP INT4 kernel: cache-only, fused RHT, bf16 WMMA.
                 # Zero Python-side RHT overhead — identical compute to INT8.
-                if (
-                    self._kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD
-                    and _head_size == 128
-                    and current_platform.is_rocm()
-                    and hasattr(torch.ops, "_C")
-                    and hasattr(torch.ops._C, "paged_prefill_attn_rdna3_int4")
-                ):
-                    int4_scale = self.scale / _head_size
+                if self._rdna3_int4_prefill_ready:
                     torch.ops._C.paged_prefill_attn_rdna3_int4(
                         output[:num_actual_tokens],
                         query[:num_actual_tokens],
@@ -921,7 +962,7 @@ class TritonAttentionImpl(AttentionImpl):
                         attn_metadata.query_start_loc,
                         attn_metadata.seq_lens,
                         attn_metadata.max_query_len,
-                        int4_scale,
+                        self._int4_scale,
                         True,
                     )
                     return output
@@ -998,26 +1039,45 @@ class TritonAttentionImpl(AttentionImpl):
                 )
 
                 pref_qsl = attn_metadata.query_start_loc[num_dec:] - num_dec_tok
-                num_reqs_pref = attn_metadata.query_start_loc.shape[0] - 1 - num_dec
-                use_qk_int8_wmma = (
-                    key_cache.dtype == torch.int8 and current_platform.is_rocm()
-                )
-                triton_per_token_head_prefill(
-                    query=query[num_dec_tok:num_actual_tokens],
-                    output=output[num_dec_tok:num_actual_tokens],
-                    key_cache=key_cache,
-                    value_cache=value_cache,
-                    k_scale_cache=k_scale_cache,
-                    v_scale_cache=v_scale_cache,
-                    block_table=attn_metadata.block_table[num_dec:],
-                    query_start_loc=pref_qsl,
-                    seq_lens=attn_metadata.seq_lens[num_dec:],
-                    softmax_scale=self.scale,
-                    num_reqs=num_reqs_pref,
-                    max_query_len=attn_metadata.max_query_len,
-                    use_qk_int8_wmma=use_qk_int8_wmma,
-                    kv_quant_mode=self._kv_quant_mode,
-                )
+                # INT4 prefill: use HIP kernel directly.
+                if self._rdna3_int4_prefill_ready:
+                    torch.ops._C.paged_prefill_attn_rdna3_int4(
+                        output[num_dec_tok:num_actual_tokens],
+                        query[num_dec_tok:num_actual_tokens],
+                        key_cache, value_cache,
+                        k_scale_cache, v_scale_cache,
+                        self._get_rht_signs(query.device),
+                        attn_metadata.block_table[num_dec:],
+                        pref_qsl,
+                        attn_metadata.seq_lens[num_dec:],
+                        attn_metadata.max_query_len,
+                        self._int4_scale,
+                        True,
+                    )
+                else:
+                    num_reqs_pref = (
+                        attn_metadata.query_start_loc.shape[0] - 1 - num_dec
+                    )
+                    use_qk_int8_wmma = (
+                        key_cache.dtype == torch.int8
+                        and current_platform.is_rocm()
+                    )
+                    triton_per_token_head_prefill(
+                        query=query[num_dec_tok:num_actual_tokens],
+                        output=output[num_dec_tok:num_actual_tokens],
+                        key_cache=key_cache,
+                        value_cache=value_cache,
+                        k_scale_cache=k_scale_cache,
+                        v_scale_cache=v_scale_cache,
+                        block_table=attn_metadata.block_table[num_dec:],
+                        query_start_loc=pref_qsl,
+                        seq_lens=attn_metadata.seq_lens[num_dec:],
+                        softmax_scale=self.scale,
+                        num_reqs=num_reqs_pref,
+                        max_query_len=attn_metadata.max_query_len,
+                        use_qk_int8_wmma=use_qk_int8_wmma,
+                        kv_quant_mode=self._kv_quant_mode,
+                    )
                 return output
 
         # Per-token-head: dedicated split-KV kernel for decode and small
@@ -1055,13 +1115,7 @@ class TritonAttentionImpl(AttentionImpl):
             ):
                 # RDNA3 HIP decode kernel for INT4 — eliminates Triton
                 # dispatch overhead (~40 µs/call) with fused RHT.
-                if (
-                    self._kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD
-                    and self.head_size == 128
-                    and current_platform.is_rocm()
-                    and hasattr(torch.ops, "_C")
-                    and hasattr(torch.ops._C, "pth_decode_int4_rdna3")
-                ):
+                if self._rdna3_int4_decode_ready:
                     mid_o_buf = getattr(layer, "_pth_mid_o_buf", None)
                     if mid_o_buf is None:
                         mid_o_buf = torch.zeros(
@@ -1080,7 +1134,7 @@ class TritonAttentionImpl(AttentionImpl):
                         attn_metadata.q_to_req,
                         attn_metadata.q_to_klen,
                         mid_o_buf,
-                        self.scale / self.head_size,
+                        self._int4_scale,
                         self.max_num_kv_splits,
                     )
                     return output
