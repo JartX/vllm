@@ -643,9 +643,9 @@ class TritonAttentionImpl(AttentionImpl):
             and current_platform.is_rocm()
             and hasattr(torch.ops, "_C")
         )
-        # HIP decode only for HS=128. HS=256 has 8 waves → 2× cross-wave
-        # barriers per KV token, slower than Triton split-KV.
-        _decode_hs_ok = head_size == 128
+        # HIP decode for HS=128 (RHT inside kernel, HEAD_SIZE threads) and
+        # HS=256 (RHT external, HEAD_SIZE/2 threads = 4 waves).
+        _decode_hs_ok = head_size in (128, 256)
         _no_special_features = (
             alibi_slopes is None
             and not use_alibi_sqrt
@@ -737,9 +737,15 @@ class TritonAttentionImpl(AttentionImpl):
                     self.max_num_kv_splits, self.head_size + 2,
                     dtype=torch.float32, device=query.device)
                 layer._pth_mid_o_buf = mid_o_buf
+            q_slice = query[:num_actual_tokens]
+            o_slice = output[:num_actual_tokens]
+            # HS=256 v2 kernel: Q pre-rotated externally, output post-rotated
+            if self.head_size > 128:
+                q_slice = q_slice.clone()
+                torch.ops._C.rht_rotate_inplace_rdna3(
+                    q_slice, self._rht_signs, False, 1.0)
             torch.ops._C.pth_decode_int4_rdna3(
-                output[:num_actual_tokens],
-                query[:num_actual_tokens],
+                o_slice, q_slice,
                 key_cache, value_cache,
                 self._k_scale_cache, self._v_scale_cache,
                 self._rht_signs,
@@ -750,6 +756,10 @@ class TritonAttentionImpl(AttentionImpl):
                 self._int4_scale,
                 self.max_num_kv_splits,
             )
+            if self.head_size > 128:
+                torch.ops._C.rht_rotate_inplace_rdna3(
+                    o_slice, self._rht_signs, True,
+                    1.0 / self.head_size)
             return output
 
         # ---- RDNA3 INT4 fast-path: short-circuit for continuation prefill ----
@@ -1122,9 +1132,14 @@ class TritonAttentionImpl(AttentionImpl):
                             dtype=torch.float32, device=query.device)
                         layer._pth_mid_o_buf = mid_o_buf
                     rht_signs = self._get_rht_signs(query.device)
+                    q_slice = query[:num_actual_tokens]
+                    o_slice = output[:num_actual_tokens]
+                    if self.head_size > 128:
+                        q_slice = q_slice.clone()
+                        torch.ops._C.rht_rotate_inplace_rdna3(
+                            q_slice, rht_signs, False, 1.0)
                     torch.ops._C.pth_decode_int4_rdna3(
-                        output[:num_actual_tokens],
-                        query[:num_actual_tokens],
+                        o_slice, q_slice,
                         key_cache, value_cache,
                         k_scale_cache, v_scale_cache,
                         rht_signs,
@@ -1135,6 +1150,10 @@ class TritonAttentionImpl(AttentionImpl):
                         self._int4_scale,
                         self.max_num_kv_splits,
                     )
+                    if self.head_size > 128:
+                        torch.ops._C.rht_rotate_inplace_rdna3(
+                            o_slice, rht_signs, True,
+                            1.0 / self.head_size)
                     return output
 
                 mid_o_buf = getattr(layer, "_pth_mid_o_buf", None)

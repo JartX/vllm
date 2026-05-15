@@ -168,6 +168,174 @@ __global__ void decode_int4_stage1(
 }
 
 // ---------------------------------------------------------------------------
+// Stage 1 v2: 128 threads for HEAD_SIZE=256 (2 dims per thread, 4 waves).
+// Q must be pre-rotated externally. Avoids 8-wave cross-wave barrier cost.
+// Grid: (num_q, num_q_heads, NUM_SPLITS), Block: HEAD_SIZE/2 threads.
+// ---------------------------------------------------------------------------
+
+template <int HEAD_SIZE>
+__global__ void decode_int4_stage1_v2(
+    const half* __restrict__ Q,          // [num_q, num_q_heads, HEAD_SIZE] PRE-ROTATED
+    const uint8_t* __restrict__ K_cache,
+    const uint8_t* __restrict__ V_cache,
+    const float* __restrict__ K_scale,
+    const float* __restrict__ V_scale,
+    const int* __restrict__ block_table,
+    const int* __restrict__ q_to_req,
+    const int* __restrict__ q_to_klen,
+    float* __restrict__ mid_o,
+    float sm_scale,
+    int num_q_heads, int num_kv_heads, int block_size, int max_blocks,
+    int num_splits,
+    int64_t sq0, int64_t sq1,
+    int64_t skb, int64_t sks, int64_t skh,
+    int64_t svb, int64_t svs, int64_t svh,
+    int64_t ssb, int64_t sss, int64_t ssh,
+    int64_t svsb, int64_t svss, int64_t svsh,
+    int64_t smo, int64_t smh, int64_t sms) {
+
+  constexpr int THREADS = HEAD_SIZE / 2;  // 128 for HS=256
+  constexpr int NW = THREADS / 32;        // 4 waves
+
+  const int qi = blockIdx.x;
+  const int hi = blockIdx.y;
+  const int si = blockIdx.z;
+  const int tid = threadIdx.x;  // 0..THREADS-1
+
+  const int req = q_to_req[qi];
+  const int kv_len = q_to_klen[qi];
+  const int kvh = hi / (num_q_heads / num_kv_heads);
+
+  const int tps = (kv_len + num_splits - 1) / num_splits;
+  const int start = si * tps;
+  const int end = min(start + tps, kv_len);
+  if (start >= kv_len) {
+    mid_o[qi * smo + hi * smh + si * sms + 2 * tid] = 0.0f;
+    mid_o[qi * smo + hi * smh + si * sms + 2 * tid + 1] = 0.0f;
+    if (tid == 0) {
+      mid_o[qi * smo + hi * smh + si * sms + HEAD_SIZE] = -INFINITY;
+      mid_o[qi * smo + hi * smh + si * sms + HEAD_SIZE + 1] = 0.0f;
+    }
+    return;
+  }
+
+  // Load 2 Q values per thread (pre-rotated)
+  const half* qr = Q + qi * sq0 + hi * sq1;
+  float q0 = __half2float(qr[2 * tid]);
+  float q1 = __half2float(qr[2 * tid + 1]);
+
+  __shared__ float dot_lds[NW];
+  const int wave_id = tid / 32;
+  const int lane = tid & 31;
+
+  float m_state = -INFINITY;
+  float l_state = 0.0f;
+  float o0 = 0.0f, o1 = 0.0f;
+
+  for (int kv = start; kv < end; ++kv) {
+    const int lb = kv / block_size;
+    const int slot = kv - lb * block_size;
+    const int pb = block_table[req * max_blocks + lb];
+
+    // Each thread loads 1 packed byte = 2 nibbles (dim 2*tid, 2*tid+1)
+    uint8_t k_byte = K_cache[pb * skb + slot * sks + kvh * skh + tid];
+    int k_lo = k_byte & 0xF;
+    int k_hi = (k_byte >> 4) & 0xF;
+
+    float k_raw = K_scale[pb * ssb + slot * sss + kvh * ssh];
+    int k_bits; __builtin_memcpy(&k_bits, &k_raw, 4);
+    int k_zp = k_bits & 0xF;
+    int k_sb = k_bits & ~0xF;
+    float k_sc; __builtin_memcpy(&k_sc, &k_sb, 4);
+
+    // Dot: 2 terms per thread → wave sums 64 dims → 4 waves = 256 dims
+    float partial = q0 * (float)(k_lo - k_zp) + q1 * (float)(k_hi - k_zp);
+    partial += __shfl_xor(partial, 1);
+    partial += __shfl_xor(partial, 2);
+    partial += __shfl_xor(partial, 4);
+    partial += __shfl_xor(partial, 8);
+    partial += __shfl_xor(partial, 16);
+    if (lane == 0) dot_lds[wave_id] = partial;
+    __syncthreads();
+
+    float score = 0;
+    if (tid < NW) score = dot_lds[tid];
+    #pragma unroll
+    for (int s = 1; s < NW; s *= 2)
+      if (tid < NW) score += __shfl_xor(score, s);
+    if (tid == 0) dot_lds[0] = score * k_sc * sm_scale;
+    __syncthreads();
+    score = dot_lds[0];
+
+    float m_new = fmaxf(m_state, score);
+    float alpha = (m_state == -INFINITY) ? 0.0f : __expf(m_state - m_new);
+    float p = (m_new == -INFINITY) ? 0.0f : __expf(score - m_new);
+    l_state = l_state * alpha + p;
+    o0 = o0 * alpha; o1 = o1 * alpha;
+    m_state = m_new;
+
+    uint8_t v_byte = V_cache[pb * svb + slot * svs + kvh * svh + tid];
+    int v_lo = v_byte & 0xF;
+    int v_hi = (v_byte >> 4) & 0xF;
+    float v_raw = V_scale[pb * svsb + slot * svss + kvh * svsh];
+    int v_bits; __builtin_memcpy(&v_bits, &v_raw, 4);
+    int v_zp = v_bits & 0xF;
+    int v_sb = v_bits & ~0xF;
+    float v_sc; __builtin_memcpy(&v_sc, &v_sb, 4);
+
+    o0 += p * (float)(v_lo - v_zp) * v_sc;
+    o1 += p * (float)(v_hi - v_zp) * v_sc;
+  }
+
+  float* out_ptr = mid_o + qi * smo + hi * smh + si * sms;
+  out_ptr[2 * tid] = o0;
+  out_ptr[2 * tid + 1] = o1;
+  if (tid == 0) {
+    out_ptr[HEAD_SIZE] = m_state;
+    out_ptr[HEAD_SIZE + 1] = l_state;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Stage 2 v2: reduce across splits, no RHT (done externally).
+// 128 threads, 2 dims per thread.
+// ---------------------------------------------------------------------------
+
+template <int HEAD_SIZE>
+__global__ void decode_int4_reduce_v2(
+    const float* __restrict__ mid_o,
+    half* __restrict__ out,
+    int num_splits,
+    int64_t smo, int64_t smh, int64_t sms,
+    int64_t soo, int64_t soh) {
+
+  const int qi = blockIdx.x;
+  const int hi = blockIdx.y;
+  const int tid = threadIdx.x;  // 0..HEAD_SIZE/2-1
+
+  float m_global = -INFINITY;
+  for (int s = 0; s < num_splits; ++s) {
+    float ms = mid_o[qi * smo + hi * smh + s * sms + HEAD_SIZE];
+    m_global = fmaxf(m_global, ms);
+  }
+
+  float o0 = 0.0f, o1 = 0.0f, l_global = 0.0f;
+  for (int s = 0; s < num_splits; ++s) {
+    const float* sp = mid_o + qi * smo + hi * smh + s * sms;
+    float ms = sp[HEAD_SIZE];
+    float ls = sp[HEAD_SIZE + 1];
+    float alpha = (ms == -INFINITY) ? 0.0f : __expf(ms - m_global);
+    o0 += sp[2 * tid] * alpha;
+    o1 += sp[2 * tid + 1] * alpha;
+    l_global += ls * alpha;
+  }
+  float inv_l = 1.0f / (l_global + 1e-10f);
+  // No RHT here — done externally by rht_rotate_inplace_rdna3
+  out[qi * soo + hi * soh + 2 * tid] = __float2half(o0 * inv_l);
+  out[qi * soo + hi * soh + 2 * tid + 1] = __float2half(o1 * inv_l);
+}
+
+// ---------------------------------------------------------------------------
 // Stage 2: reduce across splits → final output + inverse RHT
 // Grid: (num_q, num_q_heads)
 // Block: HEAD_SIZE threads
@@ -294,8 +462,40 @@ void pth_decode_int4_rdna3(
         out.stride(0), out.stride(1)); \
   } while(0)
 
-  if (head_size == 128) { LAUNCH(128); }
-  else { LAUNCH(256); }
+  if (head_size == 128) {
+    LAUNCH(128);
+  } else {
+    // HS=256: use v2 kernels (128 threads, 2 dims/thread, no RHT).
+    // Q must be pre-rotated and output post-rotated by caller.
+    constexpr int HS = 256;
+    constexpr int TH = HS / 2;  // 128 threads
+    dim3 grid1(num_q, num_q_heads, ns);
+    decode_int4_stage1_v2<HS><<<grid1, dim3(TH), 0, stream>>>(
+        (const half*)query.data_ptr(),
+        (const uint8_t*)key_cache.data_ptr(),
+        (const uint8_t*)value_cache.data_ptr(),
+        (const float*)k_scale_cache.data_ptr(),
+        (const float*)v_scale_cache.data_ptr(),
+        (const int*)block_table.data_ptr(),
+        (const int*)q_to_req.data_ptr(),
+        (const int*)q_to_klen.data_ptr(),
+        (float*)mid_o_buf.data_ptr(),
+        (float)sm_scale,
+        num_q_heads, num_kv_heads, block_size, max_blocks, ns,
+        query.stride(0), query.stride(1),
+        key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
+        value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),
+        k_scale_cache.stride(0), k_scale_cache.stride(1), k_scale_cache.stride(2),
+        v_scale_cache.stride(0), v_scale_cache.stride(1), v_scale_cache.stride(2),
+        mid_o_buf.stride(0), mid_o_buf.stride(1), mid_o_buf.stride(2));
+    dim3 grid2(num_q, num_q_heads);
+    decode_int4_reduce_v2<HS><<<grid2, dim3(TH), 0, stream>>>(
+        (const float*)mid_o_buf.data_ptr(),
+        (half*)out.data_ptr(),
+        ns,
+        mid_o_buf.stride(0), mid_o_buf.stride(1), mid_o_buf.stride(2),
+        out.stride(0), out.stride(1));
+  }
   #undef LAUNCH
 }
 
