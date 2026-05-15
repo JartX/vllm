@@ -739,9 +739,17 @@ class TritonAttentionImpl(AttentionImpl):
                 layer._pth_mid_o_buf = mid_o_buf
             q_slice = query[:num_actual_tokens]
             o_slice = output[:num_actual_tokens]
-            # HS=256 v2 kernel: Q pre-rotated externally, output post-rotated
+            # HS=256 v2 kernel: Q pre-rotated externally, output post-rotated.
+            # Use pre-allocated buffer to avoid clone() inside cudagraph.
             if self.head_size > 128:
-                q_slice = q_slice.clone()
+                q_rot = getattr(layer, "_pth_q_rot_buf", None)
+                if q_rot is None or q_rot.shape[0] < num_actual_tokens:
+                    q_rot = torch.empty(
+                        query.size(0), self.num_heads, self.head_size,
+                        dtype=query.dtype, device=query.device)
+                    layer._pth_q_rot_buf = q_rot
+                q_rot[:num_actual_tokens].copy_(q_slice)
+                q_slice = q_rot[:num_actual_tokens]
                 torch.ops._C.rht_rotate_inplace_rdna3(
                     q_slice, self._rht_signs, False, 1.0)
             torch.ops._C.pth_decode_int4_rdna3(
@@ -1135,7 +1143,14 @@ class TritonAttentionImpl(AttentionImpl):
                     q_slice = query[:num_actual_tokens]
                     o_slice = output[:num_actual_tokens]
                     if self.head_size > 128:
-                        q_slice = q_slice.clone()
+                        q_rot = getattr(layer, "_pth_q_rot_buf", None)
+                        if q_rot is None or q_rot.shape[0] < num_actual_tokens:
+                            q_rot = torch.empty(
+                                query.size(0), self.num_heads, self.head_size,
+                                dtype=query.dtype, device=query.device)
+                            layer._pth_q_rot_buf = q_rot
+                        q_rot[:num_actual_tokens].copy_(q_slice)
+                        q_slice = q_rot[:num_actual_tokens]
                         torch.ops._C.rht_rotate_inplace_rdna3(
                             q_slice, rht_signs, False, 1.0)
                     torch.ops._C.pth_decode_int4_rdna3(
