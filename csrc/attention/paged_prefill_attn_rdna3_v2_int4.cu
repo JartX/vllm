@@ -109,27 +109,48 @@ __device__ __forceinline__ void rht_inverse_output(
     for (int i = 0; i < 8; ++i) acc[dh][i] *= ss; }
 }
 
+// ---- Scale pre-loader: first K_TILE threads pre-load scales+zp ----------
+// Eliminates redundant global reads (DC threads per K position all read the
+// same scale). Also removes if(dh==0) divergence in the K/V loaders.
+
+template <int HEAD_SIZE>
+__device__ __forceinline__ void preload_scales(
+    const float* __restrict__ sc_cache, const int* __restrict__ bt,
+    int si, int kh, int sn, int bound, int bs, int mbps,
+    int64_t ssb, int64_t sss, int64_t ssh,
+    float* __restrict__ sc_lds, int* __restrict__ zp_lds, int tid) {
+  if (tid < K_TILE) {
+    int ak = sn + tid; bool v = ak < bound;
+    if (v) {
+      int lb = ak / bs, sl = ak - lb * bs;
+      int pb = bt[si * mbps + lb];
+      float raw = sc_cache[pb * ssb + sl * sss + kh * ssh];
+      sc_lds[tid] = extract_scale(raw);
+      zp_lds[tid] = extract_zp(raw);
+    } else {
+      sc_lds[tid] = 0.0f;
+      zp_lds[tid] = 0;
+    }
+  }
+}
+
 // ---- K loader: nibble→center→fp16 (reads HALF bytes vs INT8) --------------
+// Scales+zp already in LDS from preload_scales.
 
 template <typename T, int HEAD_SIZE>
 __device__ __forceinline__ void load_k_int4(
     T* __restrict__ K, const uint8_t* __restrict__ kc,
-    const float* __restrict__ ksc, const int* __restrict__ bt,
+    const int* __restrict__ bt,
+    const int* __restrict__ zp_lds,
     int si, int kh, int sn, int bound, int bs, int mbps,
     int64_t skb, int64_t sks, int64_t skh,
-    int64_t ssb, int64_t sss, int64_t ssh,
-    float* __restrict__ sc_lds, int tid) {
+    int tid) {
   constexpr int DC = HEAD_SIZE/16, X = 16/sizeof(T);
   int ki = tid/DC, dh = tid%DC;
   int ak = sn+ki; bool v = ak<bound;
   int lb = ak/bs, sl = ak-lb*bs;
   int pb = v ? bt[si*mbps+lb] : 0;
-  int zp = 0;
-  if (v) {
-    float raw = ksc[pb*ssb + sl*sss + kh*ssh];
-    zp = extract_zp(raw);
-    if (dh==0) sc_lds[ki] = extract_scale(raw);
-  } else if (dh==0) sc_lds[ki] = 0.0f;
+  int zp = v ? zp_lds[ki] : 0;
 
   const uint8_t* src = kc + (int64_t)pb*skb + (int64_t)sl*sks +
                         (int64_t)kh*skh + (int64_t)(dh*8);
@@ -148,27 +169,24 @@ __device__ __forceinline__ void load_k_int4(
 }
 
 // ---- V loader: nibble→center→fp16 (transposed) ---------------------------
+// Scales+zp already in LDS from preload_scales.
 
 template <typename T, int HEAD_SIZE>
 __device__ __forceinline__ void load_v_int4(
     T* __restrict__ V, const uint8_t* __restrict__ vc,
-    const float* __restrict__ vsc, const int* __restrict__ bt,
+    const int* __restrict__ bt,
+    const int* __restrict__ zp_lds,
     int si, int kh, int sn, int bound, int bs, int mbps,
     int64_t svb, int64_t svs, int64_t svh,
-    int64_t ssb, int64_t sss, int64_t ssh,
-    float* __restrict__ sc_lds, int tid) {
+    int tid) {
   constexpr int DC = HEAD_SIZE/16;
   int vk = max(0, min(K_TILE, bound-sn));
   int ms = tid/DC, md = tid%DC;
-  int ak = sn+ms; bool v = ms<vk;
+  bool v = ms<vk;
+  int ak = sn+ms;
   int lb = ak/bs, sl = ak-lb*bs;
   int pb = v ? bt[si*mbps+lb] : 0;
-  int zp = 0;
-  if (v) {
-    float raw = vsc[pb*ssb + sl*sss + kh*ssh];
-    zp = extract_zp(raw);
-    if (md==0) sc_lds[ms] = extract_scale(raw);
-  } else if (md==0) sc_lds[ms] = 0.0f;
+  int zp = v ? zp_lds[ms] : 0;
 
   uint8_t pk[8];
   if (v) {
@@ -323,6 +341,7 @@ __global__ void paged_prefill_attn_kernel_v2_int4(
   __shared__ T K_lds[F*2*K_TILE*X]; __shared__ T V_lds[HEAD_SIZE*K_TILE];
   __shared__ T P_lds[NW][M_PER_WAVE*K_TILE];
   __shared__ float ksl[K_TILE], vsl[K_TILE]; __shared__ float d1[HEAD_SIZE];
+  __shared__ int kzp[K_TILE], vzp[K_TILE];  // pre-loaded zero-points
   T* Pw = &P_lds[wid][0];
 
   if (tid < HEAD_SIZE) d1[tid] = rht_signs[tid];
@@ -348,10 +367,14 @@ __global__ void paged_prefill_attn_kernel_v2_int4(
   for (int dh = 0; dh < F; ++dh) oa[dh]=(v8fp32){0,0,0,0,0,0,0,0};
 
   for (int sn = 0; sn < cl; sn += K_TILE) {
-    load_k_int4<T,HEAD_SIZE>(K_lds,k_cache,k_scale_cache,block_table,
-        si,kvh,sn,cl,block_size,max_blocks_per_seq,skb,sks,skh,ssb,sss,ssh,ksl,tid);
-    load_v_int4<T,HEAD_SIZE>(V_lds,v_cache,v_scale_cache,block_table,
-        si,kvh,sn,cl,block_size,max_blocks_per_seq,svb,svs,svh,svvb,svvs,svvh,vsl,tid);
+    preload_scales<HEAD_SIZE>(k_scale_cache,block_table,si,kvh,sn,cl,
+        block_size,max_blocks_per_seq,ssb,sss,ssh,ksl,kzp,tid);
+    preload_scales<HEAD_SIZE>(v_scale_cache,block_table,si,kvh,sn,cl,
+        block_size,max_blocks_per_seq,svvb,svvs,svvh,vsl,vzp,tid);
+    load_k_int4<T,HEAD_SIZE>(K_lds,k_cache,block_table,kzp,
+        si,kvh,sn,cl,block_size,max_blocks_per_seq,skb,sks,skh,tid);
+    load_v_int4<T,HEAD_SIZE>(V_lds,v_cache,block_table,vzp,
+        si,kvh,sn,cl,block_size,max_blocks_per_seq,svb,svs,svh,tid);
     __syncthreads();
     attn_step<T,HEAD_SIZE,X,false>(K_lds,V_lds,Pw,ksl,vsl,qf,oa,ms,ls,
         wqa,sn,vqw,min(K_TILE,cl-sn),sm_scale,lane,ll,lh);
@@ -360,10 +383,14 @@ __global__ void paged_prefill_attn_kernel_v2_int4(
 
   int l2e = causal ? min(sl, cl+qts+max(0,min(BM,ql-qts))) : sl;
   for (int sn = cl; sn < l2e; sn += K_TILE) {
-    load_k_int4<T,HEAD_SIZE>(K_lds,k_cache,k_scale_cache,block_table,
-        si,kvh,sn,sl,block_size,max_blocks_per_seq,skb,sks,skh,ssb,sss,ssh,ksl,tid);
-    load_v_int4<T,HEAD_SIZE>(V_lds,v_cache,v_scale_cache,block_table,
-        si,kvh,sn,sl,block_size,max_blocks_per_seq,svb,svs,svh,svvb,svvs,svvh,vsl,tid);
+    preload_scales<HEAD_SIZE>(k_scale_cache,block_table,si,kvh,sn,sl,
+        block_size,max_blocks_per_seq,ssb,sss,ssh,ksl,kzp,tid);
+    preload_scales<HEAD_SIZE>(v_scale_cache,block_table,si,kvh,sn,sl,
+        block_size,max_blocks_per_seq,svvb,svvs,svvh,vsl,vzp,tid);
+    load_k_int4<T,HEAD_SIZE>(K_lds,k_cache,block_table,kzp,
+        si,kvh,sn,sl,block_size,max_blocks_per_seq,skb,sks,skh,tid);
+    load_v_int4<T,HEAD_SIZE>(V_lds,v_cache,block_table,vzp,
+        si,kvh,sn,sl,block_size,max_blocks_per_seq,svb,svs,svh,tid);
     __syncthreads();
     attn_step<T,HEAD_SIZE,X,true>(K_lds,V_lds,Pw,ksl,vsl,qf,oa,ms,ls,
         wqa,sn,vqw,min(K_TILE,l2e-sn),sm_scale,lane,ll,lh);
