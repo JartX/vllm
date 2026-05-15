@@ -660,12 +660,10 @@ class TritonAttentionImpl(AttentionImpl):
             and _no_special_features
             and hasattr(torch.ops._C, "pth_decode_int4_rdna3")
         )
-        # Prefill HIP kernel only for HS=128 (HS=256 exceeds RDNA3 VGPR limit
-        # with 16 WMMA frags; decode + reshape HIP kernels are scalar and work
-        # for both sizes).
+        # Prefill HIP kernel for HS=128 and HS=256.  HS=256 uses
+        # pragma-unroll-1 to force register recycling (16 WMMA frags).
         self._rdna3_int4_prefill_ready = (
             _is_rdna3_int4
-            and head_size == 128
             and _no_special_features
             and hasattr(torch.ops._C, "paged_prefill_attn_rdna3_int4")
         )
