@@ -1187,6 +1187,7 @@ class TritonAttentionImpl(AttentionImpl):
                     q_to_klen=attn_metadata.q_to_klen,
                     scale=self.scale,
                     max_num_kv_splits=self.max_num_kv_splits,
+                    block_kv=32 if self._kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD else 16,
                     output=output[:num_actual_tokens],
                     mid_o_buf=mid_o_buf,
                     output_buf=output_buf,
