@@ -33,6 +33,7 @@ from vllm.v1.attention.ops.triton_quant_kv._pack_unpack import (
     unpack_int4_nibbles,
 )
 from vllm.v1.attention.ops.triton_quant_kv._packed_reshape import _lloyd_max_dequant_4
+from vllm.platforms import current_platform
 from vllm.v1.kv_cache_interface import KVQuantMode
 
 
@@ -1121,6 +1122,8 @@ def triton_per_token_head_attention(
         # Pad to >=16 so the kernel's tl.dot also compiles for the
         # tightest head_size + packing combos (e.g. head_size=32 + INT2).
         packed_head_padded = max(16, triton.next_power_of_2(D // packing_factor))
+        # ROCm: match triton_decode_attention tuning for RDNA3/MI300.
+        _rocm = current_platform.is_rocm()
         _pth_attn_stage1_packed_gqa[(total_q, Hk, NUM_KV_SPLITS)](
             query,
             key_cache,
@@ -1160,7 +1163,12 @@ def triton_per_token_head_attention(
             PACKED_HEAD_PADDED=packed_head_padded,
             PACKING_FACTOR=packing_factor,
             num_warps=4,
-            num_stages=2,
+            num_stages=1 if _rocm else 2,
+            **({
+                "waves_per_eu": 1,
+                "matrix_instr_nonkdim": 16,
+                "kpack": 2,
+            } if _rocm else {}),
         )
     elif packing_factor > 1:
         # Pad to >=16 so the prefill kernel's tl.dot also compiles for the
@@ -1203,7 +1211,12 @@ def triton_per_token_head_attention(
             PACKED_HEAD_PADDED=packed_head_padded,
             PACKING_FACTOR=packing_factor,
             num_warps=4,
-            num_stages=2,
+            num_stages=1 if current_platform.is_rocm() else 2,
+            **({
+                "waves_per_eu": 1,
+                "matrix_instr_nonkdim": 16,
+                "kpack": 2,
+            } if current_platform.is_rocm() else {}),
         )
     else:
         _pth_attn_stage1[(total_q, Hq, NUM_KV_SPLITS)](
