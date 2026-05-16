@@ -892,8 +892,10 @@ def _pth_attn_stage1_packed_gqa(
         P_v = p * v_scales[None, :]
         if PACKING_FACTOR == 2:
             Pv_zp_sum = tl.sum(P_v * v_zp[None, :], axis=1)
-            acc_s0 += tl.dot(P_v, V_s0) - Pv_zp_sum[:, None]
-            acc_s1 += tl.dot(P_v, V_s1) - Pv_zp_sum[:, None]
+            # fp16 cast for WMMA (V nibbles 0-15 exact, P_v is softmax×scale)
+            P_v_h = P_v.to(tl.float16)
+            acc_s0 += tl.dot(P_v_h, V_s0.to(tl.float16)) - Pv_zp_sum[:, None]
+            acc_s1 += tl.dot(P_v_h, V_s1.to(tl.float16)) - Pv_zp_sum[:, None]
         else:
             acc_s0 += tl.dot(P_v, V_s0)
             acc_s1 += tl.dot(P_v, V_s1)
