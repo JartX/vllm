@@ -796,8 +796,11 @@ def _pth_attn_stage1_packed_gqa(
         )
         if PACKING_FACTOR == 2:
             K_s0_u, K_s1_u = unpack_int4_nibbles(K_packed)
-            K_s0 = K_s0_u.to(tl.float32)
-            K_s1 = K_s1_u.to(tl.float32)
+            # Direct uint8→fp16 (nibbles 0..15 exact). Halves K register
+            # footprint vs the prior fp32 intermediate, easing the spill
+            # pressure that dominates long-context decode.
+            K_s0 = K_s0_u.to(tl.float16)
+            K_s1 = K_s1_u.to(tl.float16)
         else:
             kc0_u, kc1_u, kc2_u, kc3_u = unpack_int2_quartet(K_packed)
             K_s0 = _lloyd_max_dequant_4(kc0_u).to(tl.float32)
@@ -819,10 +822,12 @@ def _pth_attn_stage1_packed_gqa(
             k_scales = ks_raw
 
         if PACKING_FACTOR == 2:
-            # Cast to fp16 before dot to ensure WMMA (v_wmma_f32_16x16x16_f16)
-            # instead of scalar FMA. +7% decode, +53% prefill at 32K context.
-            qk = (tl.dot(Q_s0.to(tl.float16), K_s0.to(tl.float16))
-                  + tl.dot(Q_s1.to(tl.float16), K_s1.to(tl.float16)))
+            # K_s0/K_s1 are already fp16; cast Q to fp16 for WMMA
+            # (v_wmma_f32_16x16x16_f16). Use WMMA accumulator on the second
+            # dot to halve intermediate register footprint and let the
+            # compiler issue fused mac+acc instructions.
+            qk = tl.dot(Q_s0.to(tl.float16), K_s0)
+            qk = tl.dot(Q_s1.to(tl.float16), K_s1, qk)
             qk = (qk - Q_sum[:, None] * k_zp[None, :]) * (
                 ATTN_SCALE * k_scales[None, :]
             )
@@ -865,8 +870,9 @@ def _pth_attn_stage1_packed_gqa(
         )
         if PACKING_FACTOR == 2:
             V_s0_u, V_s1_u = unpack_int4_nibbles(V_packed)
-            V_s0 = V_s0_u.to(tl.float32)
-            V_s1 = V_s1_u.to(tl.float32)
+            # Direct uint8→fp16, same rationale as the K path above.
+            V_s0 = V_s0_u.to(tl.float16)
+            V_s1 = V_s1_u.to(tl.float16)
         else:
             vc0_u, vc1_u, vc2_u, vc3_u = unpack_int2_quartet(V_packed)
             V_s0 = _lloyd_max_dequant_4(vc0_u).to(tl.float32)
@@ -892,10 +898,10 @@ def _pth_attn_stage1_packed_gqa(
         P_v = p * v_scales[None, :]
         if PACKING_FACTOR == 2:
             Pv_zp_sum = tl.sum(P_v * v_zp[None, :], axis=1)
-            # fp16 cast for WMMA (V nibbles 0-15 exact, P_v is softmax×scale)
+            # V_s0/V_s1 are already fp16; only P_v needs casting.
             P_v_h = P_v.to(tl.float16)
-            acc_s0 += tl.dot(P_v_h, V_s0.to(tl.float16)) - Pv_zp_sum[:, None]
-            acc_s1 += tl.dot(P_v_h, V_s1.to(tl.float16)) - Pv_zp_sum[:, None]
+            acc_s0 += tl.dot(P_v_h, V_s0) - Pv_zp_sum[:, None]
+            acc_s1 += tl.dot(P_v_h, V_s1) - Pv_zp_sum[:, None]
         else:
             acc_s0 += tl.dot(P_v, V_s0)
             acc_s1 += tl.dot(P_v, V_s1)
