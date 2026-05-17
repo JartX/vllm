@@ -756,9 +756,10 @@ def _pth_attn_stage1_packed_gqa(
             other=0.0,
         ).to(tl.float32)
 
-    # Σ Q per row (BLOCK_M,) for the INT4 zero-point correction.
+    # Σ Q per row (BLOCK_M,) for the symmetric INT4 offset correction.
+    # With fixed zp=8, the per-iter correction becomes Q_sum * 8 (constant).
     if PACKING_FACTOR == 2:
-        Q_sum = tl.sum(Q_s0, axis=1) + tl.sum(Q_s1, axis=1)
+        Q_sum_x_8 = (tl.sum(Q_s0, axis=1) + tl.sum(Q_s1, axis=1)) * 8.0
 
     m_i = tl.full([BLOCK_M], -float("inf"), dtype=tl.float32)
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
@@ -815,20 +816,18 @@ def _pth_attn_stage1_packed_gqa(
         )
         ks_raw = tl.load(K_scale_ptr + k_sc_addrs, mask=kv_mask, other=0.0)
         if PACKING_FACTOR == 2:
-            ks_bits = ks_raw.to(tl.int32, bitcast=True)
-            k_zp = (ks_bits & 0xF).to(tl.float32)
-            k_scales = (ks_bits & -16).to(tl.float32, bitcast=True)
+            # Symmetric format: scale is plain float32 (no steganography).
+            k_scales = ks_raw
         else:
             k_scales = ks_raw
 
         if PACKING_FACTOR == 2:
-            # K_s0/K_s1 are already fp16; cast Q to fp16 for WMMA
-            # (v_wmma_f32_16x16x16_f16). Use WMMA accumulator on the second
-            # dot to halve intermediate register footprint and let the
-            # compiler issue fused mac+acc instructions.
+            # K_s0/K_s1 are already fp16; cast Q to fp16 for WMMA.
+            # Symmetric quant with offset 8: correction is Q_sum * 8 (constant,
+            # precomputed outside loop as Q_sum_x_8).
             qk = tl.dot(Q_s0.to(tl.float16), K_s0)
             qk = tl.dot(Q_s1.to(tl.float16), K_s1, qk)
-            qk = (qk - Q_sum[:, None] * k_zp[None, :]) * (
+            qk = (qk - Q_sum_x_8[:, None]) * (
                 ATTN_SCALE * k_scales[None, :]
             )
         else:
@@ -887,9 +886,8 @@ def _pth_attn_stage1_packed_gqa(
         )
         vs_raw = tl.load(V_scale_ptr + v_sc_addrs, mask=kv_mask, other=0.0)
         if PACKING_FACTOR == 2:
-            vs_bits = vs_raw.to(tl.int32, bitcast=True)
-            v_zp = (vs_bits & 0xF).to(tl.float32)
-            v_scales = (vs_bits & -16).to(tl.float32, bitcast=True)
+            # Symmetric format: scale is plain float32.
+            v_scales = vs_raw
         else:
             v_scales = vs_raw
 
@@ -897,8 +895,8 @@ def _pth_attn_stage1_packed_gqa(
         # → tl.dot(P_v, V_si) (BLOCK_M, packed_dim).
         P_v = p * v_scales[None, :]
         if PACKING_FACTOR == 2:
-            Pv_zp_sum = tl.sum(P_v * v_zp[None, :], axis=1)
-            # V_s0/V_s1 are already fp16; only P_v needs casting.
+            # Symmetric offset 8: Pv_zp_sum = 8 * sum(P_v) per row.
+            Pv_zp_sum = 8.0 * tl.sum(P_v, axis=1)
             P_v_h = P_v.to(tl.float16)
             acc_s0 += tl.dot(P_v_h, V_s0) - Pv_zp_sum[:, None]
             acc_s1 += tl.dot(P_v_h, V_s1) - Pv_zp_sum[:, None]

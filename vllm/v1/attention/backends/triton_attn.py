@@ -646,9 +646,9 @@ class TritonAttentionImpl(AttentionImpl):
             and current_platform.is_rocm()
             and hasattr(torch.ops, "_C")
         )
-        # HIP decode for HS=128 only. HS=256 v2 (scalar shuffle) is +5%
-        # short ctx but -17% long ctx vs Triton WMMA. Not worth it.
-        _decode_hs_ok = head_size == 128
+        # HIP decode for HS=128 and HS=256 (symmetric format: scalar shuffle
+        # without per-token zp correction is now competitive at long ctx).
+        _decode_hs_ok = head_size in (128, 256)
         _no_special_features = (
             alibi_slopes is None
             and not use_alibi_sqrt
