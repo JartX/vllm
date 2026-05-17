@@ -635,6 +635,9 @@ class TritonAttentionImpl(AttentionImpl):
             self.max_num_kv_splits = (
                 vllm_config.attention_config.tq_max_kv_splits_for_cuda_graph
             )
+            self._max_cudagraph_capture_size = (
+                vllm_config.compilation_config.max_cudagraph_capture_size or 4
+            )
 
         # Pre-compute RDNA3 INT4 fast-path eligibility flags once.
         _is_rdna3_int4 = (
@@ -643,7 +646,8 @@ class TritonAttentionImpl(AttentionImpl):
             and current_platform.is_rocm()
             and hasattr(torch.ops, "_C")
         )
-        # HIP decode HS=128 only. HS=256 v2 crashes with cudagraph.
+        # HIP decode for HS=128 only. HS=256 v2 (scalar shuffle) is +5%
+        # short ctx but -17% long ctx vs Triton WMMA. Not worth it.
         _decode_hs_ok = head_size == 128
         _no_special_features = (
             alibi_slopes is None
@@ -730,21 +734,27 @@ class TritonAttentionImpl(AttentionImpl):
             self._ensure_scale_caches(kv_cache)
             key_cache, value_cache = kv_cache.unbind(1)
             mid_o_buf = getattr(layer, "_pth_mid_o_buf", None)
-            if mid_o_buf is None:
+            if mid_o_buf is None or mid_o_buf.shape[0] < query.size(0):
+                buf_size = max(query.size(0),
+                               self._max_cudagraph_capture_size)
                 mid_o_buf = torch.zeros(
-                    query.size(0), self.num_heads,
+                    buf_size, self.num_heads,
                     self.max_num_kv_splits, self.head_size + 2,
                     dtype=torch.float32, device=query.device)
                 layer._pth_mid_o_buf = mid_o_buf
             q_slice = query[:num_actual_tokens]
             o_slice = output[:num_actual_tokens]
             # HS=256 v2 kernel: Q pre-rotated externally, output post-rotated.
-            # Use pre-allocated buffer to avoid clone() inside cudagraph.
+            # Pre-allocate to max cudagraph capture size so the buffer address
+            # is stable across ALL captures — avoids pointer invalidation when
+            # captures [1, 2, 4] run sequentially.
             if self.head_size > 128:
                 q_rot = getattr(layer, "_pth_q_rot_buf", None)
-                if q_rot is None or q_rot.shape[0] < num_actual_tokens:
+                if q_rot is None or q_rot.shape[0] < query.size(0):
+                    buf_size = max(query.size(0),
+                                   self._max_cudagraph_capture_size)
                     q_rot = torch.empty(
-                        query.size(0), self.num_heads, self.head_size,
+                        buf_size, self.num_heads, self.head_size,
                         dtype=query.dtype, device=query.device)
                     layer._pth_q_rot_buf = q_rot
                 q_rot[:num_actual_tokens].copy_(q_slice)
