@@ -491,6 +491,17 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("pth_decode_int4_rdna3", torch::kCUDA,
            &pth_decode_int4_rdna3);
 
+  // INT8 per-token-head decode for RDNA3 — single-wave scalar v3.
+  ops.def(
+      "pth_decode_int8_rdna3(Tensor! out, Tensor query, "
+      "Tensor key_cache, Tensor value_cache, "
+      "Tensor k_scale_cache, Tensor v_scale_cache, "
+      "Tensor block_table, "
+      "Tensor q_to_req, Tensor q_to_klen, "
+      "Tensor! mid_o_buf, float sm_scale, int num_kv_splits) -> ()");
+  ops.impl("pth_decode_int8_rdna3", torch::kCUDA,
+           &pth_decode_int8_rdna3);
+
   // W4A16 GPTQ kernels for AMD RDNA3 (gfx1100).
   // See csrc/quantization/gptq/README_RDNA3.md.
   ops.def(

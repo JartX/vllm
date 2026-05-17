@@ -666,6 +666,18 @@ class TritonAttentionImpl(AttentionImpl):
             and _no_special_features
             and hasattr(torch.ops._C, "paged_prefill_attn_rdna3_int4")
         )
+        # HIP scalar v3 decode for INT8 per-token-head (HS=256 only).
+        _is_rdna3_int8 = (
+            self._kv_quant_mode == KVQuantMode.INT8_PER_TOKEN_HEAD
+            and head_size == 256
+            and current_platform.is_rocm()
+            and hasattr(torch.ops, "_C")
+        )
+        self._rdna3_int8_decode_ready = (
+            _is_rdna3_int8
+            and _no_special_features
+            and hasattr(torch.ops._C, "pth_decode_int8_rdna3")
+        )
         # Pre-compute INT4 softmax scale (avoids division every forward call).
         self._int4_scale = self.scale / head_size if _is_rdna3_int4 else 0.0
 
@@ -715,6 +727,39 @@ class TritonAttentionImpl(AttentionImpl):
         # performance to make sure it does not introduce any overhead.
 
         num_actual_tokens = attn_metadata.num_actual_tokens
+
+        # ---- RDNA3 INT8 fast-path: short-circuit for decode ----
+        # Single-wave scalar v3 kernel, zero __syncthreads.
+        if (
+            self._rdna3_int8_decode_ready
+            and self._k_scale_cache is not None
+            and attn_metadata.max_query_len <= _CONTINUATION_DECODE_THRESHOLD
+            and attn_metadata.q_to_req is not None
+        ):
+            self._ensure_scale_caches(kv_cache)
+            key_cache, value_cache = kv_cache.unbind(1)
+            mid_o_buf = getattr(layer, "_pth_mid_o_buf", None)
+            if mid_o_buf is None or mid_o_buf.shape[0] < query.size(0):
+                buf_size = max(query.size(0),
+                               self._max_cudagraph_capture_size)
+                mid_o_buf = torch.zeros(
+                    buf_size, self.num_heads,
+                    self.max_num_kv_splits, self.head_size + 2,
+                    dtype=torch.float32, device=query.device)
+                layer._pth_mid_o_buf = mid_o_buf
+            torch.ops._C.pth_decode_int8_rdna3(
+                output[:num_actual_tokens],
+                query[:num_actual_tokens],
+                key_cache, value_cache,
+                self._k_scale_cache, self._v_scale_cache,
+                attn_metadata.block_table,
+                attn_metadata.q_to_req,
+                attn_metadata.q_to_klen,
+                mid_o_buf,
+                self.scale,
+                self.max_num_kv_splits,
+            )
+            return output
 
         # ---- RDNA3 INT4 fast-path: short-circuit for decode ----
         # Bypasses ~20 Python ops of gate evaluation per layer.

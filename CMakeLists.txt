@@ -666,9 +666,10 @@ if (VLLM_GPU_LANG STREQUAL "HIP")
   list(APPEND VLLM_EXT_SRC
     "csrc/attention/reshape_cache_int4_rdna3.cu"
   )
-  # RDNA3 INT4 HIP decode attention (split-KV + fused RHT, gfx1100)
+  # RDNA3 INT4/INT8 HIP decode attention (split-KV, gfx1100)
   list(APPEND VLLM_EXT_SRC
     "csrc/attention/pth_decode_int4_rdna3.cu"
+    "csrc/attention/pth_decode_int8_rdna3.cu"
   )
 # if ROCM endif
 endif()
