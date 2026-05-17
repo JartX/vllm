@@ -379,15 +379,15 @@ __global__ void decode_int4_stage1_v3(
     const int slot = kv - lb * block_size;
     const int pb = block_table[req * max_blocks + lb];
 
-    // Load 4 packed bytes = 8 nibbles for K
-    const uint8_t* k_ptr = K_cache + pb * skb + slot * sks + kvh * skh
-                           + tid * BYTES_PER_THREAD;
+    // Vectorized load: 1 dword = 4 packed bytes = 8 nibbles for K
+    uint32_t k_dw = *reinterpret_cast<const uint32_t*>(
+        K_cache + pb * skb + slot * sks + kvh * skh + tid * BYTES_PER_THREAD);
     float partial = 0.0f;
     #pragma unroll
     for (int b = 0; b < BYTES_PER_THREAD; ++b) {
-      uint8_t kb = k_ptr[b];
-      float k0 = (float)((int)(kb & 0xF) - 8);
-      float k1 = (float)((int)((kb >> 4) & 0xF) - 8);
+      int kb = (k_dw >> (b * 8)) & 0xFF;
+      float k0 = (float)((kb & 0xF) - 8);
+      float k1 = (float)(((kb >> 4) & 0xF) - 8);
       partial += q_vals[b * 2] * k0 + q_vals[b * 2 + 1] * k1;
     }
 
@@ -409,17 +409,16 @@ __global__ void decode_int4_stage1_v3(
       o_vals[d] *= alpha;
     m_state = m_new;
 
-    // V accumulation (same thread owns same output dims)
-    const uint8_t* v_ptr = V_cache + pb * svb + slot * svs + kvh * svh
-                           + tid * BYTES_PER_THREAD;
+    // V accumulation — vectorized dword load, same thread owns output dims
+    uint32_t v_dw = *reinterpret_cast<const uint32_t*>(
+        V_cache + pb * svb + slot * svs + kvh * svh + tid * BYTES_PER_THREAD);
     float v_sc = V_scale[pb * svsb + slot * svss + kvh * svsh];
+    float p_vs = p * v_sc;
     #pragma unroll
     for (int b = 0; b < BYTES_PER_THREAD; ++b) {
-      uint8_t vb = v_ptr[b];
-      float v0 = (float)((int)(vb & 0xF) - 8);
-      float v1 = (float)((int)((vb >> 4) & 0xF) - 8);
-      o_vals[b * 2] += p * v0 * v_sc;
-      o_vals[b * 2 + 1] += p * v1 * v_sc;
+      int vb = (v_dw >> (b * 8)) & 0xFF;
+      o_vals[b * 2] += p_vs * (float)((vb & 0xF) - 8);
+      o_vals[b * 2 + 1] += p_vs * (float)(((vb >> 4) & 0xF) - 8);
     }
   }
 
