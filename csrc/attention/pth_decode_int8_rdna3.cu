@@ -12,6 +12,22 @@
 
 #if defined(USE_ROCM)
 #include <hip/hip_runtime.h>
+#include <hip/hip_bf16.h>
+
+// Templated load/store helpers for fp16 and bf16 query/output dtypes.
+// Both __half and __hip_bfloat16 are implicitly convertible to/from float.
+template <typename T> __device__ __forceinline__ float to_float(T x) {
+  return (float)x;
+}
+template <> __device__ __forceinline__ float to_float<half>(half x) {
+  return __half2float(x);
+}
+template <typename T> __device__ __forceinline__ T from_float(float x) {
+  return (T)x;
+}
+template <> __device__ __forceinline__ half from_float<half>(float x) {
+  return __float2half(x);
+}
 
 // ---------------------------------------------------------------------------
 // Stage 1 v3: 32 threads (1 wave), 8 dims/thread. ZERO __syncthreads.
@@ -19,9 +35,9 @@
 // Grid: (num_q, num_q_heads, NUM_SPLITS), Block: 32 threads.
 // ---------------------------------------------------------------------------
 
-template <int HEAD_SIZE>
+template <int HEAD_SIZE, typename QT>
 __global__ void decode_int8_stage1_v3(
-    const half* __restrict__ Q,
+    const QT* __restrict__ Q,
     const int8_t* __restrict__ K_cache,
     const int8_t* __restrict__ V_cache,
     const float* __restrict__ K_scale,
@@ -67,11 +83,11 @@ __global__ void decode_int8_stage1_v3(
   }
 
   // Load Q values for this thread's dims
-  const half* qr = Q + qi * sq0 + hi * sq1;
+  const QT* qr = Q + qi * sq0 + hi * sq1;
   float q_vals[DIMS_PER_THREAD];
   #pragma unroll
   for (int d = 0; d < DIMS_PER_THREAD; ++d)
-    q_vals[d] = __half2float(qr[tid * DIMS_PER_THREAD + d]);
+    q_vals[d] = to_float<QT>(qr[tid * DIMS_PER_THREAD + d]);
 
   // Pre-scale to log2 space for exp2f
   const float sm_scale_log2 = sm_scale * 1.4426950408889634f;
@@ -140,10 +156,10 @@ __global__ void decode_int8_stage1_v3(
 // 128 threads, 2 dims per thread (reuses v2 reduce pattern).
 // ---------------------------------------------------------------------------
 
-template <int HEAD_SIZE>
+template <int HEAD_SIZE, typename OT>
 __global__ void decode_int8_reduce(
     const float* __restrict__ mid_o,
-    half* __restrict__ out,
+    OT* __restrict__ out,
     int num_splits,
     int64_t smo, int64_t smh, int64_t sms,
     int64_t soo, int64_t soh) {
@@ -169,8 +185,8 @@ __global__ void decode_int8_reduce(
     l_global += ls * a;
   }
   float inv_l = 1.0f / (l_global + 1e-10f);
-  out[qi * soo + hi * soh + 2 * tid] = __float2half(o0 * inv_l);
-  out[qi * soo + hi * soh + 2 * tid + 1] = __float2half(o1 * inv_l);
+  out[qi * soo + hi * soh + 2 * tid] = from_float<OT>(o0 * inv_l);
+  out[qi * soo + hi * soh + 2 * tid + 1] = from_float<OT>(o1 * inv_l);
 }
 
 // ---------------------------------------------------------------------------
@@ -201,7 +217,10 @@ void pth_decode_int8_rdna3(
 
   TORCH_CHECK(head_size == 256,
               "pth_decode_int8_rdna3: only head_size=256 supported, got ", head_size);
-  TORCH_CHECK(query.dtype() == at::kHalf);
+  TORCH_CHECK(query.dtype() == at::kHalf || query.dtype() == at::kBFloat16,
+              "pth_decode_int8_rdna3: query must be fp16 or bf16");
+  TORCH_CHECK(out.dtype() == query.dtype(),
+              "pth_decode_int8_rdna3: out must match query dtype");
   TORCH_CHECK(key_cache.dtype() == at::kChar);  // int8
 
   int ns = (int)num_kv_splits;
@@ -209,32 +228,40 @@ void pth_decode_int8_rdna3(
   constexpr int TH = HS / 2;
 
   dim3 grid1(num_q, num_q_heads, ns);
-  decode_int8_stage1_v3<HS><<<grid1, dim3(32), 0, stream>>>(
-      (const half*)query.data_ptr(),
-      (const int8_t*)key_cache.data_ptr(),
-      (const int8_t*)value_cache.data_ptr(),
-      (const float*)k_scale_cache.data_ptr(),
-      (const float*)v_scale_cache.data_ptr(),
-      (const int*)block_table.data_ptr(),
-      (const int*)q_to_req.data_ptr(),
-      (const int*)q_to_klen.data_ptr(),
-      (float*)mid_o_buf.data_ptr(),
-      (float)sm_scale,
-      num_q_heads, num_kv_heads, block_size, max_blocks, ns,
-      query.stride(0), query.stride(1),
-      key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
-      value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),
-      k_scale_cache.stride(0), k_scale_cache.stride(1), k_scale_cache.stride(2),
-      v_scale_cache.stride(0), v_scale_cache.stride(1), v_scale_cache.stride(2),
-      mid_o_buf.stride(0), mid_o_buf.stride(1), mid_o_buf.stride(2));
-
   dim3 grid2(num_q, num_q_heads);
-  decode_int8_reduce<HS><<<grid2, dim3(TH), 0, stream>>>(
-      (const float*)mid_o_buf.data_ptr(),
-      (half*)out.data_ptr(),
-      ns,
-      mid_o_buf.stride(0), mid_o_buf.stride(1), mid_o_buf.stride(2),
+
+#define LAUNCH_INT8_V3(QT, OT)                                                 \
+  decode_int8_stage1_v3<HS, QT><<<grid1, dim3(32), 0, stream>>>(               \
+      (const QT*)query.data_ptr(),                                             \
+      (const int8_t*)key_cache.data_ptr(),                                     \
+      (const int8_t*)value_cache.data_ptr(),                                   \
+      (const float*)k_scale_cache.data_ptr(),                                  \
+      (const float*)v_scale_cache.data_ptr(),                                  \
+      (const int*)block_table.data_ptr(),                                      \
+      (const int*)q_to_req.data_ptr(),                                         \
+      (const int*)q_to_klen.data_ptr(),                                        \
+      (float*)mid_o_buf.data_ptr(),                                            \
+      (float)sm_scale,                                                         \
+      num_q_heads, num_kv_heads, block_size, max_blocks, ns,                   \
+      query.stride(0), query.stride(1),                                        \
+      key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),           \
+      value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),     \
+      k_scale_cache.stride(0), k_scale_cache.stride(1), k_scale_cache.stride(2),\
+      v_scale_cache.stride(0), v_scale_cache.stride(1), v_scale_cache.stride(2),\
+      mid_o_buf.stride(0), mid_o_buf.stride(1), mid_o_buf.stride(2));          \
+  decode_int8_reduce<HS, OT><<<grid2, dim3(TH), 0, stream>>>(                  \
+      (const float*)mid_o_buf.data_ptr(),                                      \
+      (OT*)out.data_ptr(),                                                     \
+      ns,                                                                      \
+      mid_o_buf.stride(0), mid_o_buf.stride(1), mid_o_buf.stride(2),           \
       out.stride(0), out.stride(1));
+
+  if (query.dtype() == at::kHalf) {
+    LAUNCH_INT8_V3(half, half);
+  } else {
+    LAUNCH_INT8_V3(__hip_bfloat16, __hip_bfloat16);
+  }
+#undef LAUNCH_INT8_V3
 }
 
 #else
