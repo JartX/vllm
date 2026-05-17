@@ -354,6 +354,10 @@ __global__ void decode_int4_stage1_v3(
   for (int d = 0; d < DIMS_PER_THREAD; ++d)
     q_vals[d] = __half2float(qr[tid * DIMS_PER_THREAD + d]);
 
+  // Pre-scale to log2 space: exp(x) = exp2(x * log2e). By folding log2e
+  // into sm_scale we use exp2f directly (saves 1 hidden mul per exp call).
+  const float sm_scale_log2 = sm_scale * 1.4426950408889634f;
+
   float m_state = -INFINITY;
   float l_state = 0.0f;
   float o_vals[DIMS_PER_THREAD] = {};
@@ -368,12 +372,20 @@ __global__ void decode_int4_stage1_v3(
     // Vectorized load: 1 dword = 4 packed bytes = 8 nibbles for K
     uint32_t k_dw = *reinterpret_cast<const uint32_t*>(
         K_cache + pb * skb + slot * sks + kvh * skh + tid * BYTES_PER_THREAD);
+
+    // Extract scale + zp from steganographed float
+    float k_raw = K_scale[pb * ssb + slot * sss + kvh * ssh];
+    int k_bits; __builtin_memcpy(&k_bits, &k_raw, 4);
+    int k_zp = k_bits & 0xF;
+    int k_sb = k_bits & ~0xF;
+    float k_sc; __builtin_memcpy(&k_sc, &k_sb, 4);
+
     float partial = 0.0f;
     #pragma unroll
     for (int b = 0; b < BYTES_PER_THREAD; ++b) {
       int kb = (k_dw >> (b * 8)) & 0xFF;
-      float k0 = (float)((kb & 0xF) - 8);
-      float k1 = (float)(((kb >> 4) & 0xF) - 8);
+      float k0 = (float)((kb & 0xF) - k_zp);
+      float k1 = (float)(((kb >> 4) & 0xF) - k_zp);
       partial += q_vals[b * 2] * k0 + q_vals[b * 2 + 1] * k1;
     }
 
@@ -382,14 +394,13 @@ __global__ void decode_int4_stage1_v3(
     for (int s = 16; s > 0; s >>= 1)
       partial += __shfl_xor(partial, s);
 
-    float k_sc = K_scale[pb * ssb + slot * sss + kvh * ssh];
-    float score = partial * k_sc * sm_scale;
+    float score = partial * k_sc * sm_scale_log2;
 
-    // Online softmax — branchless. IEEE guarantees exp(-inf)=0, so
-    // first iter (m_state=-inf): alpha=exp(-inf-score)=0, p=exp(0)=1. Correct.
+    // Online softmax in log2 space — exp2f avoids the hidden x*log2e
+    // multiply inside __expf. IEEE: exp2(-inf)=0, so first iter correct.
     float m_new = fmaxf(m_state, score);
-    float alpha = __expf(m_state - m_new);  // 0 on first iter, ≤1 after
-    float p = __expf(score - m_new);        // ≤1
+    float alpha = exp2f(m_state - m_new);
+    float p = exp2f(score - m_new);
     l_state = l_state * alpha + p;
     #pragma unroll
     for (int d = 0; d < DIMS_PER_THREAD; ++d)
@@ -399,13 +410,17 @@ __global__ void decode_int4_stage1_v3(
     // V accumulation — vectorized dword load, same thread owns output dims
     uint32_t v_dw = *reinterpret_cast<const uint32_t*>(
         V_cache + pb * svb + slot * svs + kvh * svh + tid * BYTES_PER_THREAD);
-    float v_sc = V_scale[pb * svsb + slot * svss + kvh * svsh];
+    float v_raw = V_scale[pb * svsb + slot * svss + kvh * svsh];
+    int v_bits; __builtin_memcpy(&v_bits, &v_raw, 4);
+    int v_zp = v_bits & 0xF;
+    int v_sb = v_bits & ~0xF;
+    float v_sc; __builtin_memcpy(&v_sc, &v_sb, 4);
     float p_vs = p * v_sc;
     #pragma unroll
     for (int b = 0; b < BYTES_PER_THREAD; ++b) {
       int vb = (v_dw >> (b * 8)) & 0xFF;
-      o_vals[b * 2] += p_vs * (float)((vb & 0xF) - 8);
-      o_vals[b * 2 + 1] += p_vs * (float)(((vb >> 4) & 0xF) - 8);
+      o_vals[b * 2] += p_vs * (float)((vb & 0xF) - v_zp);
+      o_vals[b * 2 + 1] += p_vs * (float)(((vb >> 4) & 0xF) - v_zp);
     }
   }
 
