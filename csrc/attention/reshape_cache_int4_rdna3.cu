@@ -100,24 +100,23 @@ __global__ void reshape_cache_int4_rht_kernel(
   }
   float k_max = s[0];
 
-  // Symmetric quantization with offset binary (zp=8 fixed).
-  // After RHT, values are roughly symmetric around zero. We use:
-  //   scale = max(|min|, |max|) / 7.0
-  //   stored = clamp(round(val/scale) + 8, 0, 15)
-  // At read time: K_dequant = (nibble - 8) * scale (constant offset, no per-token zp)
-  float k_absmax = fmaxf(fabsf(k_min), fabsf(k_max));
-  float k_scale = fmaxf(k_absmax / 7.0f, 1e-6f);
+  // Asymmetric quantization with steganographic zp (original format, 16 levels).
+  // Full [0, 15] range with per-token-head zero-point for maximum quality.
+  float k_scale = fmaxf((k_max - k_min) / 15.0f, 1e-6f);
   float k_inv = 1.0f / k_scale;
+  float k_zp_f = fminf(fmaxf(
+      (int)(-k_min * k_inv + 0.5f) >= 0
+          ? (float)(int)(-k_min * k_inv + 0.5f)
+          : (float)(int)(-k_min * k_inv - 0.5f),
+      0.0f), 15.0f);
+  int k_zp = (int)k_zp_f;
 
-  // Quantize: round to [-7, 7] then offset by 8 → [1, 15] (clamp to [0, 15])
-  int k_q = (int)fminf(fmaxf(k_rotated * k_inv + 8.5f, 0.0f), 15.0f);
+  // Quantize to [0, 15]
+  int k_q = (int)fminf(fmaxf(k_rotated * k_inv + k_zp_f + 0.5f, 0.0f), 15.0f);
 
   // Pack nibbles via shared memory (safe across wave boundaries).
-  // Reuse s[] as int scratch: thread i writes its quantized nibble,
-  // then even thread 2i reads both nibble[2i] and nibble[2i+1].
   {
     __syncthreads();
-    // Reinterpret s[] as int array for nibble exchange
     int* si = reinterpret_cast<int*>(s);
     si[tid] = k_q;
     __syncthreads();
@@ -127,9 +126,14 @@ __global__ void reshape_cache_int4_rht_kernel(
     }
   }
 
-  // Store plain scale (no zp steganography — symmetric quant uses fixed zp=8)
+  // Store steganographed scale: zp in low 4 bits of float bit-pattern.
   if (tid == 0) {
-    k_scale_cache[blk * ssb + slot_in_blk * sss + head * ssh] = k_scale;
+    int sb;
+    __builtin_memcpy(&sb, &k_scale, 4);
+    int packed = (sb & ~0xF) | (k_zp & 0xF);
+    float sp;
+    __builtin_memcpy(&sp, &packed, 4);
+    k_scale_cache[blk * ssb + slot_in_blk * sss + head * ssh] = sp;
   }
 
   // ---- Process V (same logic) ----
@@ -166,11 +170,16 @@ __global__ void reshape_cache_int4_rht_kernel(
   }
   float v_max = s[0];
 
-  // Symmetric quantization for V (same as K above)
-  float v_absmax = fmaxf(fabsf(v_min), fabsf(v_max));
-  float v_scale = fmaxf(v_absmax / 7.0f, 1e-6f);
+  // Asymmetric quantization for V (same as K)
+  float v_scale = fmaxf((v_max - v_min) / 15.0f, 1e-6f);
   float v_inv = 1.0f / v_scale;
-  int v_q = (int)fminf(fmaxf(v_rotated * v_inv + 8.5f, 0.0f), 15.0f);
+  float v_zp_f = fminf(fmaxf(
+      (int)(-v_min * v_inv + 0.5f) >= 0
+          ? (float)(int)(-v_min * v_inv + 0.5f)
+          : (float)(int)(-v_min * v_inv - 0.5f),
+      0.0f), 15.0f);
+  int v_zp = (int)v_zp_f;
+  int v_q = (int)fminf(fmaxf(v_rotated * v_inv + v_zp_f + 0.5f, 0.0f), 15.0f);
 
   {
     __syncthreads();
@@ -183,7 +192,12 @@ __global__ void reshape_cache_int4_rht_kernel(
     }
   }
   if (tid == 0) {
-    v_scale_cache[blk * svvb + slot_in_blk * svvs + head * svvh] = v_scale;
+    int sb;
+    __builtin_memcpy(&sb, &v_scale, 4);
+    int packed = (sb & ~0xF) | (v_zp & 0xF);
+    float sp;
+    __builtin_memcpy(&sp, &packed, 4);
+    v_scale_cache[blk * svvb + slot_in_blk * svvs + head * svvh] = sp;
   }
 }
 

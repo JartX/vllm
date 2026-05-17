@@ -812,6 +812,7 @@ def _pth_attn_stage1_packed_gqa(
         )
         ks_raw = tl.load(K_scale_ptr + k_sc_addrs, mask=kv_mask, other=0.0)
         if PACKING_FACTOR == 2:
+            # Asymmetric format: extract zp from low 4 bits of steganographed float.
             ks_bits = ks_raw.to(tl.int32, bitcast=True)
             k_zp = (ks_bits & 0xF).to(tl.float32)
             k_scales = (ks_bits & -16).to(tl.float32, bitcast=True)
@@ -820,7 +821,8 @@ def _pth_attn_stage1_packed_gqa(
 
         if PACKING_FACTOR == 2:
             # Cast to fp16 before dot to ensure WMMA (v_wmma_f32_16x16x16_f16)
-            # instead of scalar FMA. +7% decode, +53% prefill at 32K context.
+            # instead of scalar FMA. K_s0/K_s1 are fp32 on this branch, so
+            # cast both Q and K explicitly. +7% decode, +53% prefill at 32K.
             qk = (tl.dot(Q_s0.to(tl.float16), K_s0.to(tl.float16))
                   + tl.dot(Q_s1.to(tl.float16), K_s1.to(tl.float16)))
             qk = (qk - Q_sum[:, None] * k_zp[None, :]) * (
@@ -887,8 +889,7 @@ def _pth_attn_stage1_packed_gqa(
         else:
             v_scales = vs_raw
 
-        # PV split-dot.  P (BLOCK_M, BLOCK_KV) → P_v (BLOCK_M, BLOCK_KV)
-        # → tl.dot(P_v, V_si) (BLOCK_M, packed_dim).
+        # PV split-dot.
         P_v = p * v_scales[None, :]
         if PACKING_FACTOR == 2:
             Pv_zp_sum = tl.sum(P_v * v_zp[None, :], axis=1)
