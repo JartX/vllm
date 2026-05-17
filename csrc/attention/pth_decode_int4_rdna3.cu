@@ -239,17 +239,15 @@ __global__ void decode_int4_stage1_v2(
 
     // Each thread loads 1 packed byte = 2 nibbles (dim 2*tid, 2*tid+1)
     uint8_t k_byte = K_cache[pb * skb + slot * sks + kvh * skh + tid];
-    int k_lo = k_byte & 0xF;
-    int k_hi = (k_byte >> 4) & 0xF;
+    // Symmetric format: nibbles stored as offset-8 binary. Subtract 8 (constant).
+    float k0 = (float)((int)(k_byte & 0xF) - 8);
+    float k1 = (float)((int)((k_byte >> 4) & 0xF) - 8);
 
-    float k_raw = K_scale[pb * ssb + slot * sss + kvh * ssh];
-    int k_bits; __builtin_memcpy(&k_bits, &k_raw, 4);
-    int k_zp = k_bits & 0xF;
-    int k_sb = k_bits & ~0xF;
-    float k_sc; __builtin_memcpy(&k_sc, &k_sb, 4);
+    // Scale is plain float32 (no steganography).
+    float k_sc = K_scale[pb * ssb + slot * sss + kvh * ssh];
 
     // Dot: 2 terms per thread → wave sums 64 dims → 4 waves = 256 dims
-    float partial = q0 * (float)(k_lo - k_zp) + q1 * (float)(k_hi - k_zp);
+    float partial = q0 * k0 + q1 * k1;
     partial += __shfl_xor(partial, 1);
     partial += __shfl_xor(partial, 2);
     partial += __shfl_xor(partial, 4);
@@ -275,16 +273,12 @@ __global__ void decode_int4_stage1_v2(
     m_state = m_new;
 
     uint8_t v_byte = V_cache[pb * svb + slot * svs + kvh * svh + tid];
-    int v_lo = v_byte & 0xF;
-    int v_hi = (v_byte >> 4) & 0xF;
-    float v_raw = V_scale[pb * svsb + slot * svss + kvh * svsh];
-    int v_bits; __builtin_memcpy(&v_bits, &v_raw, 4);
-    int v_zp = v_bits & 0xF;
-    int v_sb = v_bits & ~0xF;
-    float v_sc; __builtin_memcpy(&v_sc, &v_sb, 4);
+    float v0 = (float)((int)(v_byte & 0xF) - 8);
+    float v1 = (float)((int)((v_byte >> 4) & 0xF) - 8);
+    float v_sc = V_scale[pb * svsb + slot * svss + kvh * svsh];
 
-    o0 += p * (float)(v_lo - v_zp) * v_sc;
-    o1 += p * (float)(v_hi - v_zp) * v_sc;
+    o0 += p * v0 * v_sc;
+    o1 += p * v1 * v_sc;
   }
 
   float* out_ptr = mid_o + qi * smo + hi * smh + si * sms;
@@ -299,6 +293,131 @@ __global__ void decode_int4_stage1_v2(
 // ---------------------------------------------------------------------------
 // Stage 2 v2: reduce across splits, no RHT (done externally).
 // 128 threads, 2 dims per thread.
+// ---------------------------------------------------------------------------
+// Stage 1 v3: 32 threads (1 wave) for HEAD_SIZE=256. ZERO __syncthreads.
+// Each thread handles 8 dims (4 packed bytes). Reduction via __shfl_xor only.
+// Symmetric format: nibble - 8, plain float scale (no steganography).
+// Grid: (num_q, num_q_heads, NUM_SPLITS), Block: 32 threads.
+// ---------------------------------------------------------------------------
+
+template <int HEAD_SIZE>
+__global__ void decode_int4_stage1_v3(
+    const half* __restrict__ Q,          // [num_q, num_q_heads, HEAD_SIZE] PRE-ROTATED
+    const uint8_t* __restrict__ K_cache,
+    const uint8_t* __restrict__ V_cache,
+    const float* __restrict__ K_scale,   // plain float (symmetric)
+    const float* __restrict__ V_scale,
+    const int* __restrict__ block_table,
+    const int* __restrict__ q_to_req,
+    const int* __restrict__ q_to_klen,
+    float* __restrict__ mid_o,
+    float sm_scale,
+    int num_q_heads, int num_kv_heads, int block_size, int max_blocks,
+    int num_splits,
+    int64_t sq0, int64_t sq1,
+    int64_t skb, int64_t sks, int64_t skh,
+    int64_t svb, int64_t svs, int64_t svh,
+    int64_t ssb, int64_t sss, int64_t ssh,
+    int64_t svsb, int64_t svss, int64_t svsh,
+    int64_t smo, int64_t smh, int64_t sms) {
+
+  constexpr int DIMS_PER_THREAD = HEAD_SIZE / 32;  // 8 for HS=256
+  constexpr int BYTES_PER_THREAD = DIMS_PER_THREAD / 2;  // 4 packed bytes
+
+  const int qi = blockIdx.x;
+  const int hi = blockIdx.y;
+  const int si = blockIdx.z;
+  const int tid = threadIdx.x;  // 0..31
+
+  const int req = q_to_req[qi];
+  const int kv_len = q_to_klen[qi];
+  const int kvh = hi / (num_q_heads / num_kv_heads);
+
+  const int tps = (kv_len + num_splits - 1) / num_splits;
+  const int start = si * tps;
+  const int end = min(start + tps, kv_len);
+  if (start >= kv_len) {
+    float* out_ptr = mid_o + qi * smo + hi * smh + si * sms;
+    for (int d = 0; d < DIMS_PER_THREAD; ++d)
+      out_ptr[tid * DIMS_PER_THREAD + d] = 0.0f;
+    if (tid == 0) {
+      out_ptr[HEAD_SIZE] = -INFINITY;
+      out_ptr[HEAD_SIZE + 1] = 0.0f;
+    }
+    return;
+  }
+
+  // Load Q values for this thread's dims (8 dims, pre-rotated)
+  const half* qr = Q + qi * sq0 + hi * sq1;
+  float q_vals[DIMS_PER_THREAD];
+  #pragma unroll
+  for (int d = 0; d < DIMS_PER_THREAD; ++d)
+    q_vals[d] = __half2float(qr[tid * DIMS_PER_THREAD + d]);
+
+  float m_state = -INFINITY;
+  float l_state = 0.0f;
+  float o_vals[DIMS_PER_THREAD] = {};
+
+  for (int kv = start; kv < end; ++kv) {
+    const int lb = kv / block_size;
+    const int slot = kv - lb * block_size;
+    const int pb = block_table[req * max_blocks + lb];
+
+    // Load 4 packed bytes = 8 nibbles for K
+    const uint8_t* k_ptr = K_cache + pb * skb + slot * sks + kvh * skh
+                           + tid * BYTES_PER_THREAD;
+    float partial = 0.0f;
+    #pragma unroll
+    for (int b = 0; b < BYTES_PER_THREAD; ++b) {
+      uint8_t kb = k_ptr[b];
+      float k0 = (float)((int)(kb & 0xF) - 8);
+      float k1 = (float)((int)((kb >> 4) & 0xF) - 8);
+      partial += q_vals[b * 2] * k0 + q_vals[b * 2 + 1] * k1;
+    }
+
+    // Wave-wide reduction (no sync needed — single wave)
+    #pragma unroll
+    for (int s = 16; s > 0; s >>= 1)
+      partial += __shfl_xor(partial, s);
+
+    float k_sc = K_scale[pb * ssb + slot * sss + kvh * ssh];
+    float score = partial * k_sc * sm_scale;
+
+    // Online softmax
+    float m_new = fmaxf(m_state, score);
+    float alpha = (m_state == -INFINITY) ? 0.0f : __expf(m_state - m_new);
+    float p = (m_new == -INFINITY) ? 0.0f : __expf(score - m_new);
+    l_state = l_state * alpha + p;
+    #pragma unroll
+    for (int d = 0; d < DIMS_PER_THREAD; ++d)
+      o_vals[d] *= alpha;
+    m_state = m_new;
+
+    // V accumulation (same thread owns same output dims)
+    const uint8_t* v_ptr = V_cache + pb * svb + slot * svs + kvh * svh
+                           + tid * BYTES_PER_THREAD;
+    float v_sc = V_scale[pb * svsb + slot * svss + kvh * svsh];
+    #pragma unroll
+    for (int b = 0; b < BYTES_PER_THREAD; ++b) {
+      uint8_t vb = v_ptr[b];
+      float v0 = (float)((int)(vb & 0xF) - 8);
+      float v1 = (float)((int)((vb >> 4) & 0xF) - 8);
+      o_vals[b * 2] += p * v0 * v_sc;
+      o_vals[b * 2 + 1] += p * v1 * v_sc;
+    }
+  }
+
+  // Write output
+  float* out_ptr = mid_o + qi * smo + hi * smh + si * sms;
+  #pragma unroll
+  for (int d = 0; d < DIMS_PER_THREAD; ++d)
+    out_ptr[tid * DIMS_PER_THREAD + d] = o_vals[d];
+  if (tid == 0) {
+    out_ptr[HEAD_SIZE] = m_state;
+    out_ptr[HEAD_SIZE + 1] = l_state;
+  }
+}
+
 // ---------------------------------------------------------------------------
 
 template <int HEAD_SIZE>
@@ -465,12 +584,12 @@ void pth_decode_int4_rdna3(
   if (head_size == 128) {
     LAUNCH(128);
   } else {
-    // HS=256: use v2 kernels (128 threads, 2 dims/thread, no RHT).
+    // HS=256: v3 kernel — 32 threads (1 wave), 8 dims/thread, ZERO syncs.
     // Q must be pre-rotated and output post-rotated by caller.
+    // Symmetric format: nibble-8, plain float scale.
     constexpr int HS = 256;
-    constexpr int TH = HS / 2;  // 128 threads
     dim3 grid1(num_q, num_q_heads, ns);
-    decode_int4_stage1_v2<HS><<<grid1, dim3(TH), 0, stream>>>(
+    decode_int4_stage1_v3<HS><<<grid1, dim3(32), 0, stream>>>(
         (const half*)query.data_ptr(),
         (const uint8_t*)key_cache.data_ptr(),
         (const uint8_t*)value_cache.data_ptr(),
@@ -489,6 +608,7 @@ void pth_decode_int4_rdna3(
         v_scale_cache.stride(0), v_scale_cache.stride(1), v_scale_cache.stride(2),
         mid_o_buf.stride(0), mid_o_buf.stride(1), mid_o_buf.stride(2));
     dim3 grid2(num_q, num_q_heads);
+    constexpr int TH = HS / 2;  // 128 threads for reduce
     decode_int4_reduce_v2<HS><<<grid2, dim3(TH), 0, stream>>>(
         (const float*)mid_o_buf.data_ptr(),
         (half*)out.data_ptr(),
