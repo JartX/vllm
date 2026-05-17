@@ -11,10 +11,27 @@
 #include <ATen/cuda/CUDAContext.h>
 
 #if defined(USE_ROCM)
+#include <hip/hip_runtime.h>
+#include <hip/hip_bf16.h>
 
-template <int HEAD_SIZE>
+// Templated load/store helpers for fp16 and bf16 K/V dtypes.
+// Both __half and __hip_bfloat16 are implicitly convertible to/from float.
+template <typename T> __device__ __forceinline__ float to_float(T x) {
+  return (float)x;
+}
+template <> __device__ __forceinline__ float to_float<half>(half x) {
+  return __half2float(x);
+}
+template <typename T> __device__ __forceinline__ T from_float(float x) {
+  return (T)x;
+}
+template <> __device__ __forceinline__ half from_float<half>(float x) {
+  return __float2half(x);
+}
+
+template <int HEAD_SIZE, typename T>
 __global__ void reshape_cache_int4_rht_kernel(
-    const half* __restrict__ key, const half* __restrict__ value,
+    const T* __restrict__ key, const T* __restrict__ value,
     uint8_t* __restrict__ key_cache, uint8_t* __restrict__ value_cache,
     float* __restrict__ k_scale_cache, float* __restrict__ v_scale_cache,
     const float* __restrict__ rht_signs,
@@ -41,7 +58,7 @@ __global__ void reshape_cache_int4_rht_kernel(
 
   // ---- Process K ----
   // Load + D₁ sign flip
-  float kval = __half2float(key[tok * sk0 + head * sk1 + tid]);
+  float kval = to_float<T>(key[tok * sk0 + head * sk1 + tid]);
   s[tid] = kval * rht_signs[tid];
   __syncthreads();
 
@@ -121,7 +138,7 @@ __global__ void reshape_cache_int4_rht_kernel(
 
   // ---- Process V (same logic) ----
   __syncthreads();
-  float vval = __half2float(value[tok * sv0 + head * sv1 + tid]);
+  float vval = to_float<T>(value[tok * sv0 + head * sv1 + tid]);
   s[tid] = vval * rht_signs[tid];
   __syncthreads();
 
@@ -197,12 +214,15 @@ void reshape_cache_int4_rdna3(
 
   TORCH_CHECK(head_size == 128 || head_size == 256,
               "reshape_cache_int4_rdna3: head_size must be 128 or 256, got ", head_size);
-  TORCH_CHECK(key.dtype() == at::kHalf, "only fp16 supported");
+  TORCH_CHECK(key.dtype() == at::kHalf || key.dtype() == at::kBFloat16,
+              "reshape_cache_int4_rdna3: key/value must be fp16 or bf16");
+  TORCH_CHECK(value.dtype() == key.dtype(),
+              "reshape_cache_int4_rdna3: key and value must share dtype");
 
   dim3 grid(num_tokens, num_kv_heads);
-  #define LAUNCH_RESHAPE(HS) \
-    reshape_cache_int4_rht_kernel<HS><<<grid, dim3(HS), 0, stream>>>( \
-      (const half*)key.data_ptr(), (const half*)value.data_ptr(), \
+  #define LAUNCH_RESHAPE(HS, T) \
+    reshape_cache_int4_rht_kernel<HS, T><<<grid, dim3(HS), 0, stream>>>( \
+      (const T*)key.data_ptr(), (const T*)value.data_ptr(), \
       (uint8_t*)key_cache.data_ptr(), (uint8_t*)value_cache.data_ptr(), \
       (float*)k_scale_cache.data_ptr(), (float*)v_scale_cache.data_ptr(), \
       (const float*)rht_signs.data_ptr(), \
@@ -214,8 +234,14 @@ void reshape_cache_int4_rdna3(
       value_cache.stride(0), value_cache.stride(1), value_cache.stride(2), \
       k_scale_cache.stride(0), k_scale_cache.stride(1), k_scale_cache.stride(2), \
       v_scale_cache.stride(0), v_scale_cache.stride(1), v_scale_cache.stride(2))
-  if (head_size == 128) { LAUNCH_RESHAPE(128); }
-  else { LAUNCH_RESHAPE(256); }
+  const bool is_bf16 = (key.dtype() == at::kBFloat16);
+  if (head_size == 128) {
+    if (is_bf16) { LAUNCH_RESHAPE(128, __hip_bfloat16); }
+    else         { LAUNCH_RESHAPE(128, half); }
+  } else {
+    if (is_bf16) { LAUNCH_RESHAPE(256, __hip_bfloat16); }
+    else         { LAUNCH_RESHAPE(256, half); }
+  }
   #undef LAUNCH_RESHAPE
 }
 
@@ -226,9 +252,9 @@ void reshape_cache_int4_rdna3(
 // Inverse: data = D₁ × H × data × scale (butterfly, then sign flip + scale)
 // ---------------------------------------------------------------------------
 
-template <int HEAD_SIZE>
+template <int HEAD_SIZE, typename T>
 __global__ void rht_butterfly_inplace_kernel(
-    half* __restrict__ data,
+    T* __restrict__ data,
     const float* __restrict__ signs,
     float post_scale,  // 1.0 for forward, 1/HEAD_SIZE for inverse
     bool inverse,
@@ -239,7 +265,7 @@ __global__ void rht_butterfly_inplace_kernel(
 
   __shared__ float s[HEAD_SIZE];
 
-  float val = __half2float(data[row * stride_row + head * stride_head + tid]);
+  float val = to_float<T>(data[row * stride_row + head * stride_head + tid]);
 
   if (!inverse) {
     // Forward RHT: sign flip first, then butterfly
@@ -262,17 +288,18 @@ __global__ void rht_butterfly_inplace_kernel(
   if (inverse) {
     // Inverse RHT: sign flip after butterfly, fuse scale
     data[row * stride_row + head * stride_head + tid] =
-        __float2half(s[tid] * signs[tid] * post_scale);
+        from_float<T>(s[tid] * signs[tid] * post_scale);
   } else {
     data[row * stride_row + head * stride_head + tid] =
-        __float2half(s[tid] * post_scale);
+        from_float<T>(s[tid] * post_scale);
   }
 }
 
 void rht_rotate_inplace_rdna3(
     torch::Tensor data, torch::Tensor rht_signs, bool inverse,
     double post_scale) {
-  TORCH_CHECK(data.dtype() == at::kHalf);
+  TORCH_CHECK(data.dtype() == at::kHalf || data.dtype() == at::kBFloat16,
+              "rht_rotate_inplace_rdna3: data must be fp16 or bf16");
   TORCH_CHECK(data.dim() == 3, "expected [tokens, heads, head_size]");
   const int num_tokens = data.size(0);
   const int num_heads = data.size(1);
@@ -281,15 +308,19 @@ void rht_rotate_inplace_rdna3(
               "rht_rotate_inplace_rdna3: head_size must be 128 or 256, got ", head_size);
   auto stream = at::cuda::getCurrentCUDAStream().stream();
   dim3 grid(num_tokens, num_heads);
+  #define LAUNCH_RHT(HS, T) \
+    rht_butterfly_inplace_kernel<HS, T><<<grid, dim3(HS), 0, stream>>>( \
+        (T*)data.data_ptr(), (const float*)rht_signs.data_ptr(), \
+        (float)post_scale, inverse, data.stride(0), data.stride(1))
+  const bool is_bf16 = (data.dtype() == at::kBFloat16);
   if (head_size == 128) {
-    rht_butterfly_inplace_kernel<128><<<grid, dim3(128), 0, stream>>>(
-        (half*)data.data_ptr(), (const float*)rht_signs.data_ptr(),
-        (float)post_scale, inverse, data.stride(0), data.stride(1));
+    if (is_bf16) { LAUNCH_RHT(128, __hip_bfloat16); }
+    else         { LAUNCH_RHT(128, half); }
   } else {
-    rht_butterfly_inplace_kernel<256><<<grid, dim3(256), 0, stream>>>(
-        (half*)data.data_ptr(), (const float*)rht_signs.data_ptr(),
-        (float)post_scale, inverse, data.stride(0), data.stride(1));
+    if (is_bf16) { LAUNCH_RHT(256, __hip_bfloat16); }
+    else         { LAUNCH_RHT(256, half); }
   }
+  #undef LAUNCH_RHT
 }
 
 #else

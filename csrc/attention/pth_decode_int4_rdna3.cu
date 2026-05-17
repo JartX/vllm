@@ -16,6 +16,22 @@
 
 #if defined(USE_ROCM)
 #include <hip/hip_runtime.h>
+#include <hip/hip_bf16.h>
+
+// Templated load/store helpers for fp16 and bf16 query/output dtypes.
+// Both __half and __hip_bfloat16 are implicitly convertible to/from float.
+template <typename T> __device__ __forceinline__ float to_float(T x) {
+  return (float)x;
+}
+template <> __device__ __forceinline__ float to_float<half>(half x) {
+  return __half2float(x);
+}
+template <typename T> __device__ __forceinline__ T from_float(float x) {
+  return (T)x;
+}
+template <> __device__ __forceinline__ half from_float<half>(float x) {
+  return __float2half(x);
+}
 
 // ---------------------------------------------------------------------------
 // Stage 1: per-split attention
@@ -23,9 +39,9 @@
 // Block: HEAD_SIZE threads. Each thread owns one head dimension.
 // ---------------------------------------------------------------------------
 
-template <int HEAD_SIZE, int BLOCK_KV>
+template <int HEAD_SIZE, int BLOCK_KV, typename QT>
 __global__ void decode_int4_stage1(
-    const half* __restrict__ Q,          // [num_q, num_q_heads, HEAD_SIZE]
+    const QT* __restrict__ Q,            // [num_q, num_q_heads, HEAD_SIZE]
     const uint8_t* __restrict__ K_cache, // [blocks, block_size, kv_heads, HEAD_SIZE/2]
     const uint8_t* __restrict__ V_cache,
     const float* __restrict__ K_scale,   // [blocks, block_size, kv_heads] stego
@@ -70,7 +86,7 @@ __global__ void decode_int4_stage1(
 
   // ---- Load Q + RHT butterfly ----
   __shared__ float qs[HEAD_SIZE];
-  float qv = __half2float(Q[qi * sq0 + hi * sq1 + tid]);
+  float qv = to_float<QT>(Q[qi * sq0 + hi * sq1 + tid]);
   // D₁ sign flip
   qs[tid] = qv * rht_signs[tid];
   __syncthreads();
@@ -173,9 +189,9 @@ __global__ void decode_int4_stage1(
 // Grid: (num_q, num_q_heads, NUM_SPLITS), Block: HEAD_SIZE/2 threads.
 // ---------------------------------------------------------------------------
 
-template <int HEAD_SIZE>
+template <int HEAD_SIZE, typename QT>
 __global__ void decode_int4_stage1_v2(
-    const half* __restrict__ Q,          // [num_q, num_q_heads, HEAD_SIZE] PRE-ROTATED
+    const QT* __restrict__ Q,            // [num_q, num_q_heads, HEAD_SIZE] PRE-ROTATED
     const uint8_t* __restrict__ K_cache,
     const uint8_t* __restrict__ V_cache,
     const float* __restrict__ K_scale,
@@ -220,9 +236,9 @@ __global__ void decode_int4_stage1_v2(
   }
 
   // Load 2 Q values per thread (pre-rotated)
-  const half* qr = Q + qi * sq0 + hi * sq1;
-  float q0 = __half2float(qr[2 * tid]);
-  float q1 = __half2float(qr[2 * tid + 1]);
+  const QT* qr = Q + qi * sq0 + hi * sq1;
+  float q0 = to_float<QT>(qr[2 * tid]);
+  float q1 = to_float<QT>(qr[2 * tid + 1]);
 
   __shared__ float dot_lds[NW];
   const int wave_id = tid / 32;
@@ -300,9 +316,9 @@ __global__ void decode_int4_stage1_v2(
 // Grid: (num_q, num_q_heads, NUM_SPLITS), Block: 32 threads.
 // ---------------------------------------------------------------------------
 
-template <int HEAD_SIZE>
+template <int HEAD_SIZE, typename QT>
 __global__ void decode_int4_stage1_v3(
-    const half* __restrict__ Q,          // [num_q, num_q_heads, HEAD_SIZE] PRE-ROTATED
+    const QT* __restrict__ Q,            // [num_q, num_q_heads, HEAD_SIZE] PRE-ROTATED
     const uint8_t* __restrict__ K_cache,
     const uint8_t* __restrict__ V_cache,
     const float* __restrict__ K_scale,   // plain float (symmetric)
@@ -348,11 +364,11 @@ __global__ void decode_int4_stage1_v3(
   }
 
   // Load Q values for this thread's dims (8 dims, pre-rotated)
-  const half* qr = Q + qi * sq0 + hi * sq1;
+  const QT* qr = Q + qi * sq0 + hi * sq1;
   float q_vals[DIMS_PER_THREAD];
   #pragma unroll
   for (int d = 0; d < DIMS_PER_THREAD; ++d)
-    q_vals[d] = __half2float(qr[tid * DIMS_PER_THREAD + d]);
+    q_vals[d] = to_float<QT>(qr[tid * DIMS_PER_THREAD + d]);
 
   // Pre-scale to log2 space: exp(x) = exp2(x * log2e). By folding log2e
   // into sm_scale we use exp2f directly (saves 1 hidden mul per exp call).
@@ -437,10 +453,10 @@ __global__ void decode_int4_stage1_v3(
 
 // ---------------------------------------------------------------------------
 
-template <int HEAD_SIZE>
+template <int HEAD_SIZE, typename OT>
 __global__ void decode_int4_reduce_v2(
     const float* __restrict__ mid_o,
-    half* __restrict__ out,
+    OT* __restrict__ out,
     int num_splits,
     int64_t smo, int64_t smh, int64_t sms,
     int64_t soo, int64_t soh) {
@@ -467,8 +483,8 @@ __global__ void decode_int4_reduce_v2(
   }
   float inv_l = 1.0f / (l_global + 1e-10f);
   // No RHT here — done externally by rht_rotate_inplace_rdna3
-  out[qi * soo + hi * soh + 2 * tid] = __float2half(o0 * inv_l);
-  out[qi * soo + hi * soh + 2 * tid + 1] = __float2half(o1 * inv_l);
+  out[qi * soo + hi * soh + 2 * tid] = from_float<OT>(o0 * inv_l);
+  out[qi * soo + hi * soh + 2 * tid + 1] = from_float<OT>(o1 * inv_l);
 }
 
 // ---------------------------------------------------------------------------
@@ -477,10 +493,10 @@ __global__ void decode_int4_reduce_v2(
 // Block: HEAD_SIZE threads
 // ---------------------------------------------------------------------------
 
-template <int HEAD_SIZE>
+template <int HEAD_SIZE, typename OT>
 __global__ void decode_int4_reduce(
     const float* __restrict__ mid_o,     // [num_q, num_q_heads, NUM_SPLITS, HEAD_SIZE+2]
-    half* __restrict__ out,              // [num_q, num_q_heads, HEAD_SIZE]
+    OT* __restrict__ out,                // [num_q, num_q_heads, HEAD_SIZE]
     const float* __restrict__ rht_signs,
     int num_splits, float inv_head_size,
     int64_t smo, int64_t smh, int64_t sms,
@@ -527,7 +543,7 @@ __global__ void decode_int4_reduce(
 
   // D₁ sign flip + /head_size
   out[qi * soo + hi * soh + tid] =
-      __float2half(rs[tid] * rht_signs[tid] * inv_head_size);
+      from_float<OT>(rs[tid] * rht_signs[tid] * inv_head_size);
 }
 
 // ---------------------------------------------------------------------------
@@ -559,17 +575,21 @@ void pth_decode_int4_rdna3(
 
   TORCH_CHECK(head_size == 128 || head_size == 256,
               "pth_decode_int4_rdna3: head_size must be 128 or 256, got ", head_size);
-  TORCH_CHECK(query.dtype() == at::kHalf);
+  TORCH_CHECK(query.dtype() == at::kHalf || query.dtype() == at::kBFloat16,
+              "pth_decode_int4_rdna3: query must be fp16 or bf16");
+  TORCH_CHECK(out.dtype() == query.dtype(),
+              "pth_decode_int4_rdna3: out must match query dtype");
 
   constexpr int BKV = 1;
   int ns = (int)num_kv_splits;
   TORCH_CHECK(mid_o_buf.size(2) >= ns);
   TORCH_CHECK(mid_o_buf.size(3) >= head_size + 2);
 
-  #define LAUNCH(HS) do { \
+  #define LAUNCH_HS128(QT, OT) do { \
+    constexpr int HS = 128; \
     dim3 grid1(num_q, num_q_heads, ns); \
-    decode_int4_stage1<HS, BKV><<<grid1, dim3(HS), 0, stream>>>( \
-        (const half*)query.data_ptr(), \
+    decode_int4_stage1<HS, BKV, QT><<<grid1, dim3(HS), 0, stream>>>( \
+        (const QT*)query.data_ptr(), \
         (const uint8_t*)key_cache.data_ptr(), \
         (const uint8_t*)value_cache.data_ptr(), \
         (const float*)k_scale_cache.data_ptr(), \
@@ -589,51 +609,62 @@ void pth_decode_int4_rdna3(
         mid_o_buf.stride(0), mid_o_buf.stride(1), mid_o_buf.stride(2)); \
     dim3 grid2(num_q, num_q_heads); \
     constexpr float inv_hs = 1.0f / (float)HS; \
-    decode_int4_reduce<HS><<<grid2, dim3(HS), 0, stream>>>( \
+    decode_int4_reduce<HS, OT><<<grid2, dim3(HS), 0, stream>>>( \
         (const float*)mid_o_buf.data_ptr(), \
-        (half*)out.data_ptr(), \
+        (OT*)out.data_ptr(), \
         (const float*)rht_signs.data_ptr(), \
         ns, inv_hs, \
         mid_o_buf.stride(0), mid_o_buf.stride(1), mid_o_buf.stride(2), \
         out.stride(0), out.stride(1)); \
   } while(0)
 
+  #define LAUNCH_HS256_V3(QT, OT) do { \
+    constexpr int HS = 256; \
+    constexpr int TH = HS / 2; \
+    dim3 grid1(num_q, num_q_heads, ns); \
+    decode_int4_stage1_v3<HS, QT><<<grid1, dim3(32), 0, stream>>>( \
+        (const QT*)query.data_ptr(), \
+        (const uint8_t*)key_cache.data_ptr(), \
+        (const uint8_t*)value_cache.data_ptr(), \
+        (const float*)k_scale_cache.data_ptr(), \
+        (const float*)v_scale_cache.data_ptr(), \
+        (const int*)block_table.data_ptr(), \
+        (const int*)q_to_req.data_ptr(), \
+        (const int*)q_to_klen.data_ptr(), \
+        (float*)mid_o_buf.data_ptr(), \
+        (float)sm_scale, \
+        num_q_heads, num_kv_heads, block_size, max_blocks, ns, \
+        query.stride(0), query.stride(1), \
+        key_cache.stride(0), key_cache.stride(1), key_cache.stride(2), \
+        value_cache.stride(0), value_cache.stride(1), value_cache.stride(2), \
+        k_scale_cache.stride(0), k_scale_cache.stride(1), k_scale_cache.stride(2), \
+        v_scale_cache.stride(0), v_scale_cache.stride(1), v_scale_cache.stride(2), \
+        mid_o_buf.stride(0), mid_o_buf.stride(1), mid_o_buf.stride(2)); \
+    dim3 grid2(num_q, num_q_heads); \
+    decode_int4_reduce_v2<HS, OT><<<grid2, dim3(TH), 0, stream>>>( \
+        (const float*)mid_o_buf.data_ptr(), \
+        (OT*)out.data_ptr(), \
+        ns, \
+        mid_o_buf.stride(0), mid_o_buf.stride(1), mid_o_buf.stride(2), \
+        out.stride(0), out.stride(1)); \
+  } while(0)
+
+  const bool is_bf16 = (query.dtype() == at::kBFloat16);
   if (head_size == 128) {
-    LAUNCH(128);
+    if (is_bf16) {
+      LAUNCH_HS128(__hip_bfloat16, __hip_bfloat16);
+    } else {
+      LAUNCH_HS128(half, half);
+    }
   } else {
-    // HS=256: v3 kernel — 32 threads (1 wave), 8 dims/thread, ZERO syncs.
-    // Q must be pre-rotated and output post-rotated by caller.
-    // Symmetric format: nibble-8, plain float scale.
-    constexpr int HS = 256;
-    dim3 grid1(num_q, num_q_heads, ns);
-    decode_int4_stage1_v3<HS><<<grid1, dim3(32), 0, stream>>>(
-        (const half*)query.data_ptr(),
-        (const uint8_t*)key_cache.data_ptr(),
-        (const uint8_t*)value_cache.data_ptr(),
-        (const float*)k_scale_cache.data_ptr(),
-        (const float*)v_scale_cache.data_ptr(),
-        (const int*)block_table.data_ptr(),
-        (const int*)q_to_req.data_ptr(),
-        (const int*)q_to_klen.data_ptr(),
-        (float*)mid_o_buf.data_ptr(),
-        (float)sm_scale,
-        num_q_heads, num_kv_heads, block_size, max_blocks, ns,
-        query.stride(0), query.stride(1),
-        key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
-        value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),
-        k_scale_cache.stride(0), k_scale_cache.stride(1), k_scale_cache.stride(2),
-        v_scale_cache.stride(0), v_scale_cache.stride(1), v_scale_cache.stride(2),
-        mid_o_buf.stride(0), mid_o_buf.stride(1), mid_o_buf.stride(2));
-    dim3 grid2(num_q, num_q_heads);
-    constexpr int TH = HS / 2;  // 128 threads for reduce
-    decode_int4_reduce_v2<HS><<<grid2, dim3(TH), 0, stream>>>(
-        (const float*)mid_o_buf.data_ptr(),
-        (half*)out.data_ptr(),
-        ns,
-        mid_o_buf.stride(0), mid_o_buf.stride(1), mid_o_buf.stride(2),
-        out.stride(0), out.stride(1));
+    if (is_bf16) {
+      LAUNCH_HS256_V3(__hip_bfloat16, __hip_bfloat16);
+    } else {
+      LAUNCH_HS256_V3(half, half);
+    }
   }
-  #undef LAUNCH
+  #undef LAUNCH_HS128
+  #undef LAUNCH_HS256_V3
 }
 
 #else
