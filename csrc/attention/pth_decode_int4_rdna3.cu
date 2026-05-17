@@ -358,10 +358,12 @@ __global__ void decode_int4_stage1_v3(
   float l_state = 0.0f;
   float o_vals[DIMS_PER_THREAD] = {};
 
+  int prev_lb = -1;
+  int pb = 0;
   for (int kv = start; kv < end; ++kv) {
     const int lb = kv / block_size;
     const int slot = kv - lb * block_size;
-    const int pb = block_table[req * max_blocks + lb];
+    if (lb != prev_lb) { pb = block_table[req * max_blocks + lb]; prev_lb = lb; }
 
     // Vectorized load: 1 dword = 4 packed bytes = 8 nibbles for K
     uint32_t k_dw = *reinterpret_cast<const uint32_t*>(
@@ -383,10 +385,11 @@ __global__ void decode_int4_stage1_v3(
     float k_sc = K_scale[pb * ssb + slot * sss + kvh * ssh];
     float score = partial * k_sc * sm_scale;
 
-    // Online softmax
+    // Online softmax — branchless. IEEE guarantees exp(-inf)=0, so
+    // first iter (m_state=-inf): alpha=exp(-inf-score)=0, p=exp(0)=1. Correct.
     float m_new = fmaxf(m_state, score);
-    float alpha = (m_state == -INFINITY) ? 0.0f : __expf(m_state - m_new);
-    float p = (m_new == -INFINITY) ? 0.0f : __expf(score - m_new);
+    float alpha = __expf(m_state - m_new);  // 0 on first iter, ≤1 after
+    float p = __expf(score - m_new);        // ≤1
     l_state = l_state * alpha + p;
     #pragma unroll
     for (int d = 0; d < DIMS_PER_THREAD; ++d)
