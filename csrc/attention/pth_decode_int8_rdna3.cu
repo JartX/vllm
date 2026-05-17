@@ -179,7 +179,12 @@ __global__ void decode_int8_reduce(
     const float* sp = mid_o + qi * smo + hi * smh + s * sms;
     float ms = sp[HEAD_SIZE];
     float ls = sp[HEAD_SIZE + 1];
-    float a = (ms == -INFINITY) ? 0.0f : exp2f((ms - m_global) * 1.4426950408889634f);
+    // ms / m_global are stored in log2 space (stage1 pre-scaled by log2(e)),
+    // so exp2(ms - m_global) is the correct rescaling factor. Multiplying the
+    // delta by log2(e) again would compute e^delta instead of 2^delta and
+    // systematically underweight non-max splits, drifting attention toward the
+    // max-only split and inducing repetition loops over long generations.
+    float a = (ms == -INFINITY) ? 0.0f : exp2f(ms - m_global);
     o0 += sp[2 * tid] * a;
     o1 += sp[2 * tid + 1] * a;
     l_global += ls * a;

@@ -476,7 +476,13 @@ __global__ void decode_int4_reduce_v2(
     const float* sp = mid_o + qi * smo + hi * smh + s * sms;
     float ms = sp[HEAD_SIZE];
     float ls = sp[HEAD_SIZE + 1];
-    float alpha = (ms == -INFINITY) ? 0.0f : __expf(ms - m_global);
+    // ms / m_global come from v3 stage1, which pre-scales scores by log2(e)
+    // and stores m_state in log2 space. The correct rescale is exp2(delta),
+    // NOT __expf(delta): __expf would compute e^(log2_delta) and shrink
+    // non-max splits by a factor of e^(delta*(1 - 1/log2(e))) ≈ e^(-0.307*|delta|),
+    // biasing attention toward the max split and inducing repetition loops on
+    // long generations.
+    float alpha = (ms == -INFINITY) ? 0.0f : exp2f(ms - m_global);
     o0 += sp[2 * tid] * alpha;
     o1 += sp[2 * tid + 1] * alpha;
     l_global += ls * alpha;
