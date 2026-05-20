@@ -42,7 +42,7 @@ table due to suboptimal dequant scheduling and wave occupancy.
 **Result**: Saturates the gfx1100 WMMA unit. Scalar path + WMMA v2 (2-wave
 cooperative with double-buffered LDS) hits the compute ceiling.
 
-**Files**: [`csrc/quantization/gptq/README_RDNA3.md`](../../csrc/quantization/gptq/README_RDNA3.md)
+**Files**: [`csrc/libtorch_stable/quantization/gptq/README_RDNA3.md`](../../csrc/libtorch_stable/quantization/gptq/README_RDNA3.md)
 
 ---
 
@@ -237,8 +237,8 @@ All optimizations are grounded in verified gfx1100 ISA analysis:
 
 *half-rate on gfx1100 (measured 2.01× vs full-rate expectation).
 
-Full ISA reference: [`csrc/quantization/gptq/README_RDNA3_FULL_ISA.md`](../../csrc/quantization/gptq/README_RDNA3_FULL_ISA.md)
-Conversion cost analysis: [`csrc/quantization/gptq/README_RDNA3_CVT_ISA.md`](../../csrc/quantization/gptq/README_RDNA3_CVT_ISA.md)
+Full ISA reference: [`csrc/libtorch_stable/quantization/gptq/README_RDNA3_FULL_ISA.md`](../../csrc/libtorch_stable/quantization/gptq/README_RDNA3_FULL_ISA.md)
+Conversion cost analysis: [`csrc/libtorch_stable/quantization/gptq/README_RDNA3_CVT_ISA.md`](../../csrc/libtorch_stable/quantization/gptq/README_RDNA3_CVT_ISA.md)
 
 ---
 
