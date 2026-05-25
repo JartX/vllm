@@ -1,0 +1,91 @@
+--- a/lmcache/v1/gpu_connector/gpu_connectors.py	2026-05-25 13:58:25.000000000 +0200
++++ b/lmcache/v1/gpu_connector/gpu_connectors.py	2026-05-25 15:52:37.265494379 +0200
+@@ -238,6 +238,9 @@
+         )
+ 
+     def _initialize_pointers(self, kv_caches: List[torch.Tensor]) -> torch.Tensor:
++        def _flat(x):
++            return [x] if isinstance(x, torch.Tensor) else [e for s in x for e in _flat(s)]
++        kv_caches = _flat(kv_caches)
+         self.device = kv_caches[0].device
+         assert self.device.type == "cuda", "The device should be CUDA."
+         idx = self.device.index
+@@ -248,6 +251,8 @@
+             kv_caches, EngineType.VLLM, layout_hints=self.layout_hints
+         )
+ 
++        n=len(kv_caches)
++        if n!=len(self.kv_cache_pointers): self.num_layers=n; self.kv_cache_pointers=torch.zeros(n,dtype=torch.int64,device="cpu")
+         self.kv_cache_pointers.numpy()[:] = [t.data_ptr() for t in kv_caches]
+         self.kv_cache_pointers_on_gpu[idx] = torch.empty(
+             self.num_layers, dtype=torch.int64, device=self.device
+@@ -364,7 +369,7 @@
+                     memory_obj.tensor,
+                     kv_cache_pointers,
+                     slot_mapping[start:end],
+-                    self.kvcaches[0].device,
++                    self.kvcaches[0][0].device,
+                     self.page_buffer_size,
+                     lmc_ops.TransferDirection.D2H,
+                     self.gpu_kv_format,
+@@ -373,13 +378,13 @@
+                 )
+             else:
+                 # kvcaches -> gpu_buffer -> memobj
+-                assert self.gpu_buffer.device == self.kvcaches[0].device
++                assert self.gpu_buffer.device == self.kvcaches[0][0].device
+                 tmp_gpu_buffer = self.gpu_buffer[:, :, : end - start, :]
+                 lmc_ops.multi_layer_kv_transfer(
+                     tmp_gpu_buffer,
+                     kv_cache_pointers,
+                     slot_mapping[start:end],
+-                    self.kvcaches[0].device,
++                    self.kvcaches[0][0].device,
+                     self.page_buffer_size,
+                     lmc_ops.TransferDirection.D2H,
+                     self.gpu_kv_format,
+@@ -536,7 +541,7 @@
+         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
+         self.initialize_kvcaches_ptr(**kwargs)
+         assert self.kvcaches is not None
+-        assert self.kvcaches[0].device == self.device
++        assert self.kvcaches[0][0].device == self.device
+         self._initialize_kv_cache_pointers()
+         assert self.group_kv_cache_pointers_on_gpu is not None
+ 
+@@ -570,7 +575,7 @@
+         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
+         self.initialize_kvcaches_ptr(**kwargs)
+         assert self.kvcaches is not None
+-        assert self.kvcaches[0].device == self.device
++        assert self.kvcaches[0][0].device == self.device
+         self._initialize_kv_cache_pointers()
+         assert self.group_kv_cache_pointers_on_gpu is not None
+         with torch.cuda.stream(self.store_stream):
+@@ -823,7 +828,7 @@
+         buf_offset = starts[0]
+         if self.cache_positions:
+             new_positions_full = torch.arange(
+-                starts[0], ends[-1], dtype=torch.int64, device=self.kvcaches[0].device
++                starts[0], ends[-1], dtype=torch.int64, device=self.kvcaches[0][0].device
+             )
+ 
+         buffer_shape = self.get_shape(num_all_tokens)
+@@ -847,7 +852,7 @@
+ 
+         if self.cache_positions:
+             old_positions_full = torch.zeros(
+-                (num_all_tokens,), dtype=torch.int64, device=self.kvcaches[0].device
++                (num_all_tokens,), dtype=torch.int64, device=self.kvcaches[0][0].device
+             )
+         for layer_id in range(self.num_layers + 2):
+             if layer_id > 1:
+@@ -987,7 +992,7 @@
+             if self.cache_positions:
+                 old_positions_chunks.append(
+                     torch.arange(
+-                        start, end, device=self.kvcaches[0].device, dtype=torch.int64
++                        start, end, device=self.kvcaches[0][0].device, dtype=torch.int64
+                     )
+                 )
+ 

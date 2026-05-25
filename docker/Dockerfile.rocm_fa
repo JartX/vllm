@@ -345,6 +345,9 @@ ENV PYTORCH_ROCM_ARCH=gfx1100 \
     TORCH_DONT_CHECK_COMPILER_ABI=1 \
     CXX=hipcc \
     BUILD_WITH_HIP=1
+# RDNA3/hybrid KV-cache patches for LMCache (70-tensor pool: flatten + dyn layer
+# count + accept storage_offset). See docker/patches/lmcache/.
+COPY docker/patches/lmcache/ /opt/lmcache_patches/
 RUN --mount=type=cache,target=/root/.cache/uv \
     if [ "$INSTALL_LMCACHE" = "1" ]; then \
         set -eux; \
@@ -353,6 +356,9 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         python3 -m pip install -r requirements/build.txt; \
         python3 -m pip install . --no-build-isolation; \
         python3 -m pip install "${LMCACHE_TRANSFORMERS_PIN}"; \
+        LMCDIR="$(python3 -c 'import lmcache,os;print(os.path.dirname(lmcache.__file__))')"; \
+        patch -p2 -d "$LMCDIR" < /opt/lmcache_patches/utils.patch; \
+        patch -p2 -d "$LMCDIR" < /opt/lmcache_patches/gpu_connectors.patch; \
         python3 -c "import lmcache; print('lmcache OK', getattr(lmcache,'__version__','?'))"; \
         python3 -c "from lmcache.integration.vllm.vllm_v1_adapter import LMCacheConnectorV1Impl; print('lmcache adapter OK')"; \
         python3 -c "from vllm.distributed.kv_transfer.kv_connector.v1 import SupportsHMA; \

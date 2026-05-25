@@ -1,0 +1,11 @@
+--- a/lmcache/v1/gpu_connector/utils.py	2026-05-25 13:54:40.000000000 +0200
++++ b/lmcache/v1/gpu_connector/utils.py	2026-05-25 15:52:37.190493164 +0200
+@@ -207,7 +207,7 @@
+         _fail("stride[-1] != 1 (inner dim not contiguous)")
+     if stride[-2] != shape[-1]:
+         _fail("stride[-2] != shape[-1] (last-two dims not tightly packed)")
+-    if storage_offset != 0:
++    if storage_offset != 0 and False:
+         _fail("storage_offset != 0 (slice/narrow view, base address shifted)")
+     # Interior dims (1 .. ndim-2 exclusive) must be tightly packed with
+     # respect to the dims to their right. Only dim-0's stride is allowed
