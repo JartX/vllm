@@ -356,9 +356,13 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         python3 -m pip install -r requirements/build.txt; \
         python3 -m pip install . --no-build-isolation; \
         python3 -m pip install "${LMCACHE_TRANSFORMERS_PIN}"; \
+        cd /; \
         LMCDIR="$(python3 -c 'import lmcache,os;print(os.path.dirname(lmcache.__file__))')"; \
+        case "$LMCDIR" in /opt/LMCache/*) echo "FATAL: lmcache resolves to source tree $LMCDIR, not the installed package" >&2; exit 1;; esac; \
         patch -p2 -d "$LMCDIR" < /opt/lmcache_patches/utils.patch; \
         patch -p2 -d "$LMCDIR" < /opt/lmcache_patches/gpu_connectors.patch; \
+        grep -q "storage_offset != 0 and False" "$LMCDIR/v1/gpu_connector/utils.py" || { echo "FATAL: utils.patch did not apply to $LMCDIR" >&2; exit 1; }; \
+        grep -q "def _flat" "$LMCDIR/v1/gpu_connector/gpu_connectors.py" || { echo "FATAL: gpu_connectors.patch did not apply to $LMCDIR" >&2; exit 1; }; \
         python3 -c "import lmcache; print('lmcache OK', getattr(lmcache,'__version__','?'))"; \
         python3 -c "from lmcache.integration.vllm.vllm_v1_adapter import LMCacheConnectorV1Impl; print('lmcache adapter OK')"; \
         python3 -c "from vllm.distributed.kv_transfer.kv_connector.v1 import SupportsHMA; \
