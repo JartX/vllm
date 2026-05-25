@@ -332,6 +332,38 @@ RUN --mount=type=bind,from=export_vllm,src=/,target=/install \
     && uv pip install --system *.whl \
     && python3 -m pip install "vllm[audio]"
 
+# --- LMCache (KV connector / shared-storage offload) ---
+# The vLLM wheel installed above already carries the LMCacheConnectorV1 HMA
+# support (request_finished_all_groups / SupportsHMA), since it is built from
+# this repo's source. Here we only add the LMCache runtime itself.
+ARG INSTALL_LMCACHE=1
+ARG LMCACHE_REPO="https://github.com/LMCache/LMCache.git"
+ARG LMCACHE_BRANCH="dev"
+ARG LMCACHE_TRANSFORMERS_PIN="transformers==5.3.0"
+# Build flags for LMCache's HIP/C extensions on RDNA3 (reuse installed torch).
+ENV PYTORCH_ROCM_ARCH=gfx1100 \
+    TORCH_DONT_CHECK_COMPILER_ABI=1 \
+    CXX=hipcc \
+    BUILD_WITH_HIP=1
+RUN --mount=type=cache,target=/root/.cache/uv \
+    if [ "$INSTALL_LMCACHE" = "1" ]; then \
+        set -eux; \
+        git clone --depth 1 --branch "${LMCACHE_BRANCH}" "${LMCACHE_REPO}" /opt/LMCache; \
+        cd /opt/LMCache; \
+        python3 -m pip install -r requirements/build.txt; \
+        python3 -m pip install . --no-build-isolation; \
+        python3 -m pip install "${LMCACHE_TRANSFORMERS_PIN}"; \
+        python3 -c "import lmcache; print('lmcache OK', getattr(lmcache,'__version__','?'))"; \
+        python3 -c "from lmcache.integration.vllm.vllm_v1_adapter import LMCacheConnectorV1Impl; print('lmcache adapter OK')"; \
+        python3 -c "from vllm.distributed.kv_transfer.kv_connector.v1 import SupportsHMA; \
+from vllm.distributed.kv_transfer.kv_connector.v1.lmcache_connector import LMCacheConnectorV1; \
+assert issubclass(LMCacheConnectorV1, SupportsHMA), 'LMCacheConnectorV1 is not SupportsHMA'; \
+print('vllm LMCache connector + HMA patch OK')"; \
+        python3 -c "import transformers,torch,vllm; print('transformers',transformers.__version__,'| torch',torch.__version__,'| vllm',vllm.__version__)"; \
+    else \
+        echo "INSTALL_LMCACHE=0 -> skipping LMCache install"; \
+    fi
+
 ARG COMMON_WORKDIR
 ARG BASE_IMAGE
 
