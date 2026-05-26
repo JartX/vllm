@@ -291,7 +291,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
            &pth_decode_int8_rdna3);
 
   // W4A16 GPTQ kernels for AMD RDNA3 (gfx1100).
-  // See csrc/quantization/gptq/README_RDNA3.md.
   ops.def(
       "gptq_gemm_rdna3(Tensor a, Tensor b_q_weight, Tensor b_qzeros, "
       "Tensor b_scales, Tensor b_g_idx, bool use_v2_format) -> Tensor");

@@ -197,8 +197,7 @@ void pth_decode_int8_rdna3(
     torch::Tensor q_to_req, torch::Tensor q_to_klen,
     torch::Tensor mid_o_buf, double sm_scale, int64_t num_kv_splits);
 
-// W4A16 GPTQ kernels for AMD RDNA3 (gfx1100). See csrc/quantization/gptq/
-// README_RDNA3.md for kernel architecture.
+// W4A16 GPTQ kernels for AMD RDNA3 (gfx1100).
 torch::Tensor gptq_gemm_rdna3(torch::Tensor a, torch::Tensor b_q_weight,
                               torch::Tensor b_qzeros, torch::Tensor b_scales,
                               torch::Tensor b_g_idx, bool use_v2_format);
