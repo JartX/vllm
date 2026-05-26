@@ -105,9 +105,17 @@ ONBUILD RUN git clone ${VLLM_REPO} \
 FROM fetch_vllm_${REMOTE_VLLM} AS fetch_vllm
 
 FROM fetch_vllm AS build_vllm
+# MAX_JOBS caps parallel compile jobs: with only ~38GB free while the server
+# runs, -j=32 on the heavy HIP TUs (paged_attention, selective_scan) OOM-kills
+# the compiler and ninja fails silently. 8 keeps peak RAM in budget.
 RUN cd vllm \
+    && git config --global --add safe.directory '*' \
+    && export MAX_JOBS=8 \
     && python3 -m pip install -r requirements/rocm.txt \
-    && python3 setup.py clean --all  \
+    && python3 -m pip install setuptools_scm \
+    && export SETUPTOOLS_SCM_PRETEND_VERSION=$(python3 -c "import setuptools_scm; print(setuptools_scm.get_version())") \
+    && echo "Building wheel with version: ${SETUPTOOLS_SCM_PRETEND_VERSION}" \
+    && python3 setup.py clean --all \
     && python3 setup.py bdist_wheel --dist-dir=dist
 FROM scratch AS export_vllm
 ARG COMMON_WORKDIR
