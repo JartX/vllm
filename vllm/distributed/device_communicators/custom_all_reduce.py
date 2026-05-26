@@ -70,6 +70,7 @@ class CustomAllreduce:
         """
         self._IS_CAPTURING = False
         self.disabled = True
+        self._hostar = None
 
         if not custom_ar:
             # disable because of missing custom allreduce library
@@ -100,6 +101,14 @@ class CustomAllreduce:
         if world_size == 1:
             # No need to initialize custom allreduce for single GPU case.
             return
+
+        # Host-staged AllReduce (RCCL-free, no P2P). Independent of the IPC
+        # path below; usable when P2P is dead. Off unless VLLM_HOSTAR=1.
+        from vllm.distributed.device_communicators.host_staged_all_reduce import (
+            HostStagedAllReduce,
+        )
+
+        self._hostar = HostStagedAllReduce(rank, world_size)
 
         if world_size not in CustomAllreduce._SUPPORTED_WORLD_SIZES:
             logger.warning(
@@ -265,6 +274,10 @@ class CustomAllreduce:
 
     def custom_all_reduce(self, input: torch.Tensor) -> torch.Tensor | None:
         """The main allreduce API that provides support for cuda graph."""
+        # Host-staged path (small fp16 payloads, no P2P needed); in-place.
+        if self._hostar is not None and self._hostar.should_use(input):
+            self._hostar.all_reduce(input)
+            return input
         # When custom allreduce is disabled, this will be None.
         if self.disabled or not self.should_custom_ar(input):
             return None
