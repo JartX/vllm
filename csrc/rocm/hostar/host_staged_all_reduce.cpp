@@ -8,7 +8,8 @@
 // rank0 uses A/flagA, rank1 uses B/flagB. AR: D2H mine -> sig -> spin peer ->
 // H2D peer -> reduce. Mechanism validated at ~43us/10KB cross-process.
 //
-// build: hipcc -O3 --offload-arch=gfx1100 -fPIC -shared 30_hostar_lib.cpp -o libhostar.so
+// Compiled into the _C extension (ROCm only); symbols loaded via ctypes.
+#if defined(USE_ROCM)
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <sys/mman.h>
@@ -55,3 +56,4 @@ extern "C" void hostar_allreduce(__half* g, int n, void* stream) {
   hipMemcpyAsync(C.gp, C.ph, n*2, hipMemcpyHostToDevice, s);
   k_add<<<(n+255)/256,256,0,s>>>(g, C.gp, n);
 }
+#endif  // USE_ROCM

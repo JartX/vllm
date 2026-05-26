@@ -8,8 +8,8 @@ busy-polls a cross-process flag; graph-capturable. Beats RCCL ~9-13× on the
 compute. Off by default — flip on with VLLM_HOSTAR=1 for a workload where
 AllReduce is on the critical path. Only ranks 0/1, fp16, world_size 2.
 
-Backing lib: csrc/rocm/hostar/host_staged_all_reduce.cpp →
-  hipcc -O3 --offload-arch=gfx1100 -fPIC -shared <src> -o libhostar.so
+Backing symbols (hostar_init/hostar_allreduce) are compiled into the _C
+extension: csrc/rocm/hostar/host_staged_all_reduce.cpp.
 """
 
 import ctypes
@@ -29,11 +29,15 @@ class HostStagedAllReduce:
         self.disabled = True
         if not (envs.VLLM_HOSTAR and world_size == 2):
             return
-        lib_path = envs.VLLM_HOSTAR_LIB or "libhostar.so"
+        # Symbols live in the _C extension; dlopen it by its installed path.
+        # VLLM_HOSTAR_LIB overrides for a standalone libhostar.so build.
+        import vllm._C  # noqa: F401
+
+        lib_path = envs.VLLM_HOSTAR_LIB or vllm._C.__file__
         try:
             self._lib = ctypes.CDLL(lib_path)
         except OSError as e:
-            logger.warning("hostar lib not loadable (%s); using RCCL", e)
+            logger.warning("hostar symbols not loadable (%s); using RCCL", e)
             return
         self._lib.hostar_allreduce.argtypes = [
             ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p
