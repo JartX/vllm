@@ -88,46 +88,42 @@ __global__ void k_put(const uint16_t* src, uint16_t* slotbase, int maxn,
 // all_reduce op is functional, so the rank's input must stay intact): the FIRST
 // peer is added with src = the input (seeds the output without a separate copy
 // kernel), and any further peers accumulate with src = out. The peer slot is
-// read with SYSTEM-scope acquire loads (32-bit, two 16-bit elems per load) so
-// each read goes to memory rather than this GPU's stale read cache — defeating
-// the cross-chipset "consumer reads stale slot data after the flag" race.
+// read with plain coalesced 128-bit loads (8 bf16 / thread): the Fw handshake
+// (k_pub release-store + fence, k_spin acquire-load + __threadfence_system)
+// already establishes that the peer's k_put writes are visible before this
+// kernel runs, so per-element acquire loads are unnecessary and would only
+// serialize the bulk read. A scalar 16-bit tail handles the non-vectorized end.
 __global__ void k_add(__half* out, const __half* src, const __half* pbase,
                       int maxn, int rank, int n) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
-  int pairs = n >> 1;
   const __half* p = pbase + (size_t)(g_cur[rank] & 1) * maxn;
-  if (i < pairs) {
-    const unsigned* p32 = reinterpret_cast<const unsigned*>(p);
-    unsigned w = __hip_atomic_load(&p32[i], __ATOMIC_ACQUIRE,
-                                   __HIP_MEMORY_SCOPE_SYSTEM);
-    unsigned short lo = w & 0xFFFFu, hi = w >> 16;
-    out[2 * i] = __hadd(src[2 * i], *reinterpret_cast<__half*>(&lo));
-    out[2 * i + 1] = __hadd(src[2 * i + 1], *reinterpret_cast<__half*>(&hi));
-  } else if ((n & 1) && i == pairs) {  // odd tail
-    unsigned short v = __hip_atomic_load(
-        reinterpret_cast<const unsigned short*>(p) + (n - 1), __ATOMIC_ACQUIRE,
-        __HIP_MEMORY_SCOPE_SYSTEM);
-    out[n - 1] = __hadd(src[n - 1], *reinterpret_cast<__half*>(&v));
+  int vec = n >> 3;  // number of 8-elem (uint4) groups
+  if (i < vec) {
+    uint4 w = reinterpret_cast<const uint4*>(p)[i];
+    const __half* wh = reinterpret_cast<const __half*>(&w);
+    __half* o = out + 8 * i;
+    const __half* sh = src + 8 * i;
+#pragma unroll
+    for (int k = 0; k < 8; k++) o[k] = __hadd(sh[k], wh[k]);
+  } else if (i == vec) {  // scalar tail (<8 elems)
+    for (int j = 8 * vec; j < n; j++) out[j] = __hadd(src[j], p[j]);
   }
 }
 __global__ void k_add_bf16(__hip_bfloat16* out, const __hip_bfloat16* src,
                            const __hip_bfloat16* pbase, int maxn, int rank,
                            int n) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
-  int pairs = n >> 1;
   const __hip_bfloat16* p = pbase + (size_t)(g_cur[rank] & 1) * maxn;
-  if (i < pairs) {
-    const unsigned* p32 = reinterpret_cast<const unsigned*>(p);
-    unsigned w = __hip_atomic_load(&p32[i], __ATOMIC_ACQUIRE,
-                                   __HIP_MEMORY_SCOPE_SYSTEM);
-    unsigned short lo = w & 0xFFFFu, hi = w >> 16;
-    out[2 * i] = src[2 * i] + *reinterpret_cast<__hip_bfloat16*>(&lo);
-    out[2 * i + 1] = src[2 * i + 1] + *reinterpret_cast<__hip_bfloat16*>(&hi);
-  } else if ((n & 1) && i == pairs) {
-    unsigned short v = __hip_atomic_load(
-        reinterpret_cast<const unsigned short*>(p) + (n - 1), __ATOMIC_ACQUIRE,
-        __HIP_MEMORY_SCOPE_SYSTEM);
-    out[n - 1] = src[n - 1] + *reinterpret_cast<__hip_bfloat16*>(&v);
+  int vec = n >> 3;
+  if (i < vec) {
+    uint4 w = reinterpret_cast<const uint4*>(p)[i];
+    const __hip_bfloat16* wh = reinterpret_cast<const __hip_bfloat16*>(&w);
+    __hip_bfloat16* o = out + 8 * i;
+    const __hip_bfloat16* sh = src + 8 * i;
+#pragma unroll
+    for (int k = 0; k < 8; k++) o[k] = sh[k] + wh[k];
+  } else if (i == vec) {
+    for (int j = 8 * vec; j < n; j++) out[j] = src[j] + p[j];
   }
 }
 
