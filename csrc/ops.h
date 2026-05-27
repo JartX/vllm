@@ -159,7 +159,6 @@ void paged_prefill_attn_rdna3_int8(
     bool causal);
 
 // RDNA3 INT4 per-token-head paged prefill attention (gfx1100).
-// Cache-only (no k_chunk/v_chunk). RHT fused via rht_signs.
 void paged_prefill_attn_rdna3_int4(
     torch::Tensor& out, torch::Tensor q,
     torch::Tensor k_cache, torch::Tensor v_cache,
@@ -196,16 +195,6 @@ void pth_decode_int8_rdna3(
     torch::Tensor block_table,
     torch::Tensor q_to_req, torch::Tensor q_to_klen,
     torch::Tensor mid_o_buf, double sm_scale, int64_t num_kv_splits);
-
-// W4A16 GPTQ kernels for AMD RDNA3 (gfx1100).
-torch::Tensor gptq_gemm_rdna3(torch::Tensor a, torch::Tensor b_q_weight,
-                              torch::Tensor b_qzeros, torch::Tensor b_scales,
-                              torch::Tensor b_g_idx, bool use_v2_format);
-
-torch::Tensor gptq_gemm_rdna3_wmma(torch::Tensor a, torch::Tensor b_q_weight,
-                                   torch::Tensor b_qzeros,
-                                   torch::Tensor b_scales,
-                                   torch::Tensor b_g_idx, bool use_v2_format);
 
 void selective_scan_fwd(
     const torch::Tensor& u, const torch::Tensor& delta, const torch::Tensor& A,

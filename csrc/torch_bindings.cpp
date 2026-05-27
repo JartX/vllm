@@ -241,7 +241,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
            &paged_prefill_attn_rdna3_int8);
 
   // RDNA3 INT4 per-token-head paged prefill attention (gfx1100).
-  // Cache-only + fused RHT.
   ops.def(
       "paged_prefill_attn_rdna3_int4(Tensor! out, Tensor q, "
       "Tensor k_cache, Tensor v_cache, "
@@ -279,7 +278,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("pth_decode_int4_rdna3", torch::kCUDA,
            &pth_decode_int4_rdna3);
 
-  // INT8 per-token-head decode for RDNA3 — single-wave scalar v3.
+  // INT8 per-token-head decode for RDNA3.
   ops.def(
       "pth_decode_int8_rdna3(Tensor! out, Tensor query, "
       "Tensor key_cache, Tensor value_cache, "
@@ -289,17 +288,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor! mid_o_buf, float sm_scale, int num_kv_splits) -> ()");
   ops.impl("pth_decode_int8_rdna3", torch::kCUDA,
            &pth_decode_int8_rdna3);
-
-  // W4A16 GPTQ kernels for AMD RDNA3 (gfx1100).
-  ops.def(
-      "gptq_gemm_rdna3(Tensor a, Tensor b_q_weight, Tensor b_qzeros, "
-      "Tensor b_scales, Tensor b_g_idx, bool use_v2_format) -> Tensor");
-  ops.impl("gptq_gemm_rdna3", torch::kCUDA, &gptq_gemm_rdna3);
-
-  ops.def(
-      "gptq_gemm_rdna3_wmma(Tensor a, Tensor b_q_weight, Tensor b_qzeros, "
-      "Tensor b_scales, Tensor b_g_idx, bool use_v2_format) -> Tensor");
-  ops.impl("gptq_gemm_rdna3_wmma", torch::kCUDA, &gptq_gemm_rdna3_wmma);
 
   // Mamba selective scan kernel
   ops.def(
