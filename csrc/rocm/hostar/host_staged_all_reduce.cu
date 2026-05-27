@@ -77,20 +77,14 @@ __global__ void k_put(const uint16_t* src, uint16_t* slot, int n) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n) slot[i] = src[i];
 }
-// Seed the output with this rank's own partial (16-bit, dtype-agnostic). The
-// reduction is OUT-OF-PLACE: vLLM's all_reduce custom op is functional (returns
-// a fresh tensor, leaves the input intact for other graph consumers), so we must
-// not touch the input — we accumulate peers into this separate output buffer.
-__global__ void k_copy(uint16_t* dst, const uint16_t* src, int n) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) dst[i] = src[i];
-}
-// Accumulate a peer's host-pinned slot into the output. The peer slot is read
-// with SYSTEM-scope acquire loads (32-bit, two 16-bit elems per load) so each
-// read goes to memory rather than this GPU's stale read cache — defeating the
-// cross-chipset "consumer reads stale slot data after the flag" race without a
-// blind post-flag delay.
-__global__ void k_add(__half* d, const __half* p, int n) {
+// out = src + peer, in a single pass. The reduction is OUT-OF-PLACE (vLLM's
+// all_reduce op is functional, so the rank's input must stay intact): the FIRST
+// peer is added with src = the input (seeds the output without a separate copy
+// kernel), and any further peers accumulate with src = out. The peer slot is
+// read with SYSTEM-scope acquire loads (32-bit, two 16-bit elems per load) so
+// each read goes to memory rather than this GPU's stale read cache — defeating
+// the cross-chipset "consumer reads stale slot data after the flag" race.
+__global__ void k_add(__half* out, const __half* src, const __half* p, int n) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   int pairs = n >> 1;
   if (i < pairs) {
@@ -98,16 +92,17 @@ __global__ void k_add(__half* d, const __half* p, int n) {
     unsigned w = __hip_atomic_load(&p32[i], __ATOMIC_ACQUIRE,
                                    __HIP_MEMORY_SCOPE_SYSTEM);
     unsigned short lo = w & 0xFFFFu, hi = w >> 16;
-    d[2 * i] = __hadd(d[2 * i], *reinterpret_cast<__half*>(&lo));
-    d[2 * i + 1] = __hadd(d[2 * i + 1], *reinterpret_cast<__half*>(&hi));
+    out[2 * i] = __hadd(src[2 * i], *reinterpret_cast<__half*>(&lo));
+    out[2 * i + 1] = __hadd(src[2 * i + 1], *reinterpret_cast<__half*>(&hi));
   } else if ((n & 1) && i == pairs) {  // odd tail
     unsigned short v = __hip_atomic_load(
         reinterpret_cast<const unsigned short*>(p) + (n - 1), __ATOMIC_ACQUIRE,
         __HIP_MEMORY_SCOPE_SYSTEM);
-    d[n - 1] = __hadd(d[n - 1], *reinterpret_cast<__half*>(&v));
+    out[n - 1] = __hadd(src[n - 1], *reinterpret_cast<__half*>(&v));
   }
 }
-__global__ void k_add_bf16(__hip_bfloat16* d, const __hip_bfloat16* p, int n) {
+__global__ void k_add_bf16(__hip_bfloat16* out, const __hip_bfloat16* src,
+                           const __hip_bfloat16* p, int n) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   int pairs = n >> 1;
   if (i < pairs) {
@@ -115,13 +110,13 @@ __global__ void k_add_bf16(__hip_bfloat16* d, const __hip_bfloat16* p, int n) {
     unsigned w = __hip_atomic_load(&p32[i], __ATOMIC_ACQUIRE,
                                    __HIP_MEMORY_SCOPE_SYSTEM);
     unsigned short lo = w & 0xFFFFu, hi = w >> 16;
-    d[2 * i] = d[2 * i] + *reinterpret_cast<__hip_bfloat16*>(&lo);
-    d[2 * i + 1] = d[2 * i + 1] + *reinterpret_cast<__hip_bfloat16*>(&hi);
+    out[2 * i] = src[2 * i] + *reinterpret_cast<__hip_bfloat16*>(&lo);
+    out[2 * i + 1] = src[2 * i + 1] + *reinterpret_cast<__hip_bfloat16*>(&hi);
   } else if ((n & 1) && i == pairs) {
     unsigned short v = __hip_atomic_load(
         reinterpret_cast<const unsigned short*>(p) + (n - 1), __ATOMIC_ACQUIRE,
         __HIP_MEMORY_SCOPE_SYSTEM);
-    d[n - 1] = d[n - 1] + *reinterpret_cast<__hip_bfloat16*>(&v);
+    out[n - 1] = src[n - 1] + *reinterpret_cast<__hip_bfloat16*>(&v);
   }
 }
 
@@ -212,22 +207,27 @@ extern "C" void hostar_allreduce(void* in, void* out, int n, int dtype,
   int* Fr = C.F + C.n_ranks;
   int blocks = (n + 255) / 256;
 
-  // Phase 1 — stage my data, seed the output, publish "ready", wait for peers.
+  // Phase 1 — stage my data, publish "ready", wait for peers.
   k_round<<<1, 1, 0, s>>>(C.rank);
   k_put<<<blocks, 256, 0, s>>>((const uint16_t*)in, (uint16_t*)C.slots[C.rank],
                                n);
-  k_copy<<<blocks, 256, 0, s>>>((uint16_t*)out, (const uint16_t*)in, n);
   k_pub<<<1, 1, 0, s>>>(Fw, C.rank);
   k_spin<<<1, 1, 0, s>>>(Fw, C.n_ranks, C.rank);
 
   // Read + accumulate every peer's slot into `out` directly from host memory.
+  // The first peer reads src = `in` (seeds out without a separate copy, leaving
+  // `in` intact); further peers accumulate with src = `out`.
+  const void* src = in;
   for (int p = 0; p < C.n_ranks; p++) {
     if (p == C.rank) continue;
     if (dtype == 1)
       k_add_bf16<<<blocks, 256, 0, s>>>((__hip_bfloat16*)out,
+                                        (const __hip_bfloat16*)src,
                                         (const __hip_bfloat16*)C.slots[p], n);
     else
-      k_add<<<blocks, 256, 0, s>>>((__half*)out, (const __half*)C.slots[p], n);
+      k_add<<<blocks, 256, 0, s>>>((__half*)out, (const __half*)src,
+                                   (const __half*)C.slots[p], n);
+    src = out;
   }
 
   // Phase 2 — read-acknowledge: publish "I've consumed peers' slots", then wait
