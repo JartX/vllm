@@ -1,15 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Host-staged AllReduce for 2× RX 7900 XTX without P2P (RCCL-free).
+"""Host-staged AllReduce for 2x/4x RX 7900 XTX without P2P (RCCL-free).
 
-Small-payload TP AllReduce path that stages through pinned host memory and
-busy-polls a cross-process flag; graph-capturable. Beats RCCL ~9-13× on the
-10-512KB regime, but end-to-end ties RCCL because the 587us call overlaps
-compute. Off by default — flip on with VLLM_HOSTAR=1 for a workload where
-AllReduce is on the critical path. fp16, world_size 2 or 4.
+Small-payload TP AllReduce that stages through cross-process pinned host memory
+and busy-polls a flag; graph-capturable. The reduction kernel is correct and
+fast in isolation, but it is OFF BY DEFAULT and not currently usable in vLLM:
+the hipHostRegister() of the shared buffer in the backing lib corrupts vLLM's
+CUDA-graph memory pool on this ROCm stack (see csrc/rocm/hostar for the full
+investigation). Flip on with VLLM_HOSTAR=1 only for experiments. fp16/bf16,
+world_size 2 or 4.
 
-Backing symbols (hostar_init/hostar_allreduce) are compiled into the _C
-extension: csrc/rocm/hostar/host_staged_all_reduce.cpp.
+Backing symbols (hostar_init/hostar_allreduce) are built into the _C extension
+from csrc/rocm/hostar/host_staged_all_reduce.cu; VLLM_HOSTAR_LIB can point at a
+standalone libhostar.so instead.
 """
 
 import ctypes
@@ -43,7 +46,7 @@ class HostStagedAllReduce:
             ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_int
         ]
         self._lib.hostar_allreduce.argtypes = [
-            ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_void_p
         ]
         if self._lib.hostar_init(b"/vllm_hostar", rank, max_elems,
                                  world_size) != 0:
@@ -53,10 +56,21 @@ class HostStagedAllReduce:
         self.disabled = False
 
     def should_use(self, inp: torch.Tensor) -> bool:
-        return (not self.disabled and inp.dtype == torch.float16
+        # Engage ONLY while a CUDA graph is being captured. The cross-process
+        # k_spin handshake needs both TP ranks to issue the exact same sequence
+        # of calls (the shared round counter must stay in lockstep). That holds
+        # for captured graphs — both ranks replay the same graph each step — but
+        # NOT during eager profiling/warmup, where per-rank call counts drift
+        # and k_spin then waits forever. So eager all-reduces fall back to RCCL;
+        # capture records the hostar kernels and they execute, in lockstep, only
+        # on replay. Large batches / prefill aren't captured → RCCL too.
+        return (not self.disabled
+                and inp.dtype in (torch.float16, torch.bfloat16)
                 and inp.numel() <= self.max_elems
-                and inp.numel() * 2 <= _MAX_BYTES)
+                and inp.numel() * 2 <= _MAX_BYTES
+                and torch.cuda.is_current_stream_capturing())
 
     def all_reduce(self, inp: torch.Tensor) -> None:
         stream = torch.cuda.current_stream().cuda_stream
-        self._lib.hostar_allreduce(inp.data_ptr(), inp.numel(), stream)
+        dtype = 1 if inp.dtype == torch.bfloat16 else 0
+        self._lib.hostar_allreduce(inp.data_ptr(), inp.numel(), dtype, stream)
