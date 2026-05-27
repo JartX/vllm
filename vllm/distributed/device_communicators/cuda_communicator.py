@@ -281,10 +281,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
         # Host-staged AllReduce (RCCL-free, no P2P). Lives on the communicator
         # itself, not on ca_comm — ca_comm is None whenever custom allreduce is
         # disabled (always true on no-P2P boxes), so gating on it would never
-        # fire. Checked here independently, in-place reduce, returns input_.
+        # fire. Checked here independently; out-of-place (returns a fresh tensor)
+        # to satisfy the functional all_reduce op contract.
         if self._hostar is not None and self._hostar.should_use(input_):
-            self._hostar.all_reduce(input_)
-            return input_
+            return self._hostar.all_reduce(input_)
         ca_comm = self.ca_comm
         if (
             ca_comm is not None

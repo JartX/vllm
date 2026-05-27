@@ -3,12 +3,12 @@
 """Host-staged AllReduce for 2x/4x RX 7900 XTX without P2P (RCCL-free).
 
 Small-payload TP AllReduce that stages through cross-process pinned host memory
-and busy-polls a flag; graph-capturable. The reduction kernel is correct and
-fast in isolation, but it is OFF BY DEFAULT and not currently usable in vLLM:
-the hipHostRegister() of the shared buffer in the backing lib corrupts vLLM's
-CUDA-graph memory pool on this ROCm stack (see csrc/rocm/hostar for the full
-investigation). Flip on with VLLM_HOSTAR=1 only for experiments. fp16/bf16,
-world_size 2 or 4.
+(anonymous memfd) and busy-polls a flag; graph-capturable. Correct and coherent
+in vLLM, but OFF BY DEFAULT (VLLM_HOSTAR=1 to enable) because it does not beat
+RCCL here — AllReduce is not on the decode critical path on this box, so it
+measures roughly equal at low concurrency and a few % slower at higher
+concurrency. Out-of-place (returns a fresh tensor) to match vLLM's functional
+all_reduce op. fp16/bf16, world_size 2 or 4.
 
 Backing symbols (hostar_init/hostar_allreduce) are built into the _C extension
 from csrc/rocm/hostar/host_staged_all_reduce.cu; VLLM_HOSTAR_LIB can point at a
@@ -46,7 +46,8 @@ class HostStagedAllReduce:
             ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_int
         ]
         self._lib.hostar_allreduce.argtypes = [
-            ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_void_p
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+            ctypes.c_void_p
         ]
         if self._lib.hostar_init(b"/vllm_hostar", rank, max_elems,
                                  world_size) != 0:
@@ -70,7 +71,13 @@ class HostStagedAllReduce:
                 and inp.numel() * 2 <= _MAX_BYTES
                 and torch.cuda.is_current_stream_capturing())
 
-    def all_reduce(self, inp: torch.Tensor) -> None:
+    def all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
+        # Out-of-place to match vLLM's functional all_reduce custom op: reduce
+        # into a fresh tensor (like pynccl's empty_like) and leave inp intact, so
+        # graph nodes that still read the pre-reduce input aren't corrupted.
+        out = torch.empty_like(inp)
         stream = torch.cuda.current_stream().cuda_stream
         dtype = 1 if inp.dtype == torch.bfloat16 else 0
-        self._lib.hostar_allreduce(inp.data_ptr(), inp.numel(), dtype, stream)
+        self._lib.hostar_allreduce(inp.data_ptr(), out.data_ptr(), inp.numel(),
+                                   dtype, stream)
+        return out
