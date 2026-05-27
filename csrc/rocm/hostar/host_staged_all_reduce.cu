@@ -35,30 +35,27 @@
 
 #define HOSTAR_MAX_RANKS 4
 
-// Per-rank round counters in DEVICE memory. Each host flag F[rank] has a single
-// writer (this rank), so we never need an atomic RMW on host memory — which
-// matters because on this box GPU1 sits behind the PCH chipset and a
-// system-scope atomic_add to host memory from GPU1 is NOT visible to the
-// host/peer (measured), while a release store IS. The counter is a device-scope
-// atomic so it accumulates across graph replays (a plain ++ does not persist
-// across captured-graph launches).
-__device__ int g_round[HOSTAR_MAX_RANKS];
-__device__ int g_cur[HOSTAR_MAX_RANKS];
+// Per-rank COMMITTED round counter in DEVICE memory, advanced once per
+// all-reduce (in k_pubspin). It is bumped with a device-scope atomicAdd so the
+// new value persists across captured-graph replays (a plain store does not).
+// During an all-reduce the live round is g_R+1 before k_pubspin commits and g_R
+// after; k_put (pre-commit) and k_add (post-commit) therefore both derive the
+// same round parity. Each host flag F[rank] has a single writer (this rank) so
+// no host-memory RMW is needed — which matters because on this box GPU1 sits
+// behind the PCH chipset and a system-scope atomic_add to host memory from GPU1
+// is NOT visible to the host/peer (measured), while a release store IS.
+__device__ int g_R[HOSTAR_MAX_RANKS];
 
-// Advance this rank's round counter; does not touch host flags yet.
-__global__ void k_round(int rank) {
-  if (!threadIdx.x) g_cur[rank] = atomicAdd(&g_round[rank], 1) + 1;
-}
-// Publish "my data is ready" then wait until every peer is ready, in one
-// single-thread kernel (merging the old k_pub + k_spin saves a launch per
-// all-reduce). The leading __threadfence_system makes this GPU's slot writes
-// (k_put) visible system-wide before the flag store; the trailing one orders
-// the peers' slot data (made visible by the acquire-loads) before the k_add
-// that follows on the same stream. Both fences are required to cross the PCH
-// chipset; they are the same two fences as before, just in one kernel.
+// Publish "my data is ready", wait until every peer is ready, and commit this
+// round — all in one single-thread kernel (folding the old k_round + k_pub +
+// k_spin saves two launches per all-reduce). The leading __threadfence_system
+// makes this GPU's slot writes (k_put) visible system-wide before the flag
+// store; the trailing one orders the peers' slot data (made visible by the
+// acquire-loads) before the k_add that follows on the same stream. Both fences
+// are required to cross the PCH chipset.
 __global__ void k_pubspin(int* F, int n, int rank) {
   if (!threadIdx.x) {
-    int me = g_cur[rank];
+    int me = g_R[rank] + 1;  // live round for this all-reduce
     __threadfence_system();
     __hip_atomic_store(&F[rank], me, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
     for (int p = 0; p < n; p++) {
@@ -66,7 +63,8 @@ __global__ void k_pubspin(int* F, int n, int rank) {
       while (__hip_atomic_load(&F[p], __ATOMIC_ACQUIRE,
                                __HIP_MEMORY_SCOPE_SYSTEM) < me) { /* spin */ }
     }
-    __threadfence_system();  // order peers' slot data before subsequent k_add
+    __threadfence_system();      // order peers' slot data before subsequent k_add
+    atomicAdd(&g_R[rank], 1);    // commit: g_R now == this round (persists across replays)
   }
 }
 // Copy this rank's data into its host-pinned slot (16-bit elems, dtype-agnostic).
@@ -78,7 +76,8 @@ __global__ void k_pubspin(int* F, int n, int rank) {
 __global__ void k_put(const uint16_t* src, uint16_t* slotbase, int maxn,
                       int rank, int n) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
-  uint16_t* slot = slotbase + (size_t)(g_cur[rank] & 1) * maxn;
+  // Pre-commit: live round is g_R+1, so its parity is (g_R+1)&1.
+  uint16_t* slot = slotbase + (size_t)((g_R[rank] + 1) & 1) * maxn;
   if (i < n) slot[i] = src[i];
 }
 // out = src + peer, in a single pass. The reduction is OUT-OF-PLACE (vLLM's
@@ -93,7 +92,8 @@ __global__ void k_put(const uint16_t* src, uint16_t* slotbase, int maxn,
 __global__ void k_add(__half* out, const __half* src, const __half* pbase,
                       int maxn, int rank, int n) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
-  const __half* p = pbase + (size_t)(g_cur[rank] & 1) * maxn;
+  // Post-commit: g_R == this round, parity g_R&1 (same parity k_put used).
+  const __half* p = pbase + (size_t)(g_R[rank] & 1) * maxn;
   int vec = n >> 3;  // number of 8-elem (uint4) groups
   if (i < vec) {
     uint4 w = reinterpret_cast<const uint4*>(p)[i];
@@ -110,7 +110,7 @@ __global__ void k_add_bf16(__hip_bfloat16* out, const __hip_bfloat16* src,
                            const __hip_bfloat16* pbase, int maxn, int rank,
                            int n) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
-  const __hip_bfloat16* p = pbase + (size_t)(g_cur[rank] & 1) * maxn;
+  const __hip_bfloat16* p = pbase + (size_t)(g_R[rank] & 1) * maxn;
   int vec = n >> 3;
   if (i < vec) {
     uint4 w = reinterpret_cast<const uint4*>(p)[i];
@@ -216,7 +216,6 @@ extern "C" void hostar_allreduce(void* in, void* out, int n, int dtype,
   // Stage my data into this round's buffer half, publish "ready", wait for every
   // peer. No read-ack phase: double buffering guarantees the half I'm about to
   // write was already consumed by every peer (see k_put).
-  k_round<<<1, 1, 0, s>>>(C.rank);
   k_put<<<blocks, 256, 0, s>>>((const uint16_t*)in, (uint16_t*)C.slots[C.rank],
                                mn, C.rank, n);
   k_pubspin<<<1, 1, 0, s>>>(Fw, C.n_ranks, C.rank);
