@@ -78,7 +78,12 @@ __global__ void k_put(const uint16_t* src, uint16_t* slotbase, int maxn,
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   // Pre-commit: live round is g_R+1, so its parity is (g_R+1)&1.
   uint16_t* slot = slotbase + (size_t)((g_R[rank] + 1) & 1) * maxn;
-  if (i < n) slot[i] = src[i];
+  int vec = n >> 3;  // 128-bit (8x16b) coalesced stores for the bulk PCIe write
+  if (i < vec) {
+    reinterpret_cast<uint4*>(slot)[i] = reinterpret_cast<const uint4*>(src)[i];
+  } else if (i == vec) {  // scalar tail (<8 elems)
+    for (int j = 8 * vec; j < n; j++) slot[j] = src[j];
+  }
 }
 // out = src + peer, in a single pass. The reduction is OUT-OF-PLACE (vLLM's
 // all_reduce op is functional, so the rank's input must stay intact): the FIRST
