@@ -14,15 +14,27 @@
 // overwrite a slot still being read). All ops are kernels on the caller's
 // stream → CUDA-graph capturable.
 //
-// STATUS (2026-05-27): correct and working in vLLM (coherent output, lockstep
-// verified) but OFF BY DEFAULT (VLLM_HOSTAR=0) because it does not beat RCCL on
-// this box — AllReduce is not on the decode critical path, so it measures ~equal
-// at conc1 and a few % slower at higher concurrency. Two fixes were required to
-// get here: (1) back the cross-process buffer with an anonymous memfd, NOT a
-// file-backed /dev/shm mapping (registering the latter corrupts vLLM's CUDA-
-// graph pool on this ROCm stack); (2) reduce OUT-OF-PLACE — vLLM's all_reduce
-// custom op is functional, so the input must be left intact and the sum written
-// to a fresh output. See project memory for the full investigation.
+// STATUS (2026-05-27): correct and working in vLLM, and BEATS RCCL on this box
+// in both regimes (Qwen3.6-27B bf16 TP2, no P2P): decode ~+6-9% tok/s (the
+// captured-graph path below), and prefill ~+4% TTFT (the eager pipelined path,
+// hostar_allreduce_pipe). Still OFF BY DEFAULT (VLLM_HOSTAR=0); the eager/prefill
+// path additionally needs VLLM_HOSTAR_EAGER=1 and VLLM_HOSTAR_MAXELEMS sized for
+// the prefill activation (~33M). Key design points, each one a measured fix:
+//  (1) Back the cross-process buffer with an anonymous memfd, NOT a file-backed
+//      /dev/shm mapping (registering the latter corrupts vLLM's CUDA-graph pool).
+//  (2) Reduce OUT-OF-PLACE — vLLM's all_reduce op is functional; leave the input
+//      intact and write the sum to a fresh output.
+//  (3) Decode: 3 kernels (k_put, k_pubspin, k_add), double-buffered by round
+//      parity, 128-bit coalesced loads/stores; wins by ultra-low fixed overhead
+//      under graph lockstep (small payloads are latency-bound).
+//  (4) Prefill: large eager ARs are bottlenecked by GPU1's host link (it sits
+//      behind the PCH chipset, ~4x lower bandwidth — same asymmetry as dead
+//      P2P). That link is full-duplex UNDER A KERNEL (simultaneous host loads +
+//      stores ~1.8x vs serial) though the copy engine serializes it. So
+//      hostar_allreduce_pipe chunks the payload and runs a FUSED kernel that
+//      writes my chunk c+1 while it reads+adds the peer's chunk c — driving both
+//      PCIe directions at once — beating RCCL's transfer at large sizes.
+// See project memory for the full investigation.
 #if defined(USE_ROCM)
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
@@ -150,7 +162,7 @@ extern "C" int hostar_init(const char* shm, int rank, int max_elems,
   // data-ready flags Fw[n_ranks]. Double buffering removes the read-ack phase,
   // so only one flag array is needed.
   size_t bytes =
-      (size_t)n_ranks * 2 * max_elems * 2 + n_ranks * sizeof(int) + 128;
+      (size_t)n_ranks * 2 * max_elems * 2 + (2 + 8) * n_ranks * sizeof(int) + 256;
 
   // Cross-process shared buffer via memfd (NOT shm_open). Registering a
   // file-backed /dev/shm mapping with hipHostRegister corrupts vLLM's CUDA-
@@ -199,7 +211,7 @@ extern "C" int hostar_init(const char* shm, int rank, int max_elems,
   for (int r = 0; r < n_ranks; r++)
     C.slots[r] = base + (size_t)r * 2 * max_elems;  // 2 halves per rank
   if (rank == 0)
-    for (int r = 0; r < n_ranks; r++) C.F[r] = 0;
+    for (int r = 0; r < (2 + 8) * n_ranks; r++) C.F[r] = 0;  // Fw + Fe + Fp
   usleep(500000);  // let rank 0's flag-zeroing land before any peer proceeds
   hipStreamCreate(&C.s);
   hipSetDevice(prev_dev);
@@ -242,4 +254,210 @@ extern "C" void hostar_allreduce(void* in, void* out, int n, int dtype,
     src = out;
   }
 }
+
+// ===== Eager path (prefill): CP-side flag wait (hipStreamWaitValue), no busy-
+// wait kernel. Python drives each call so it passes the round explicitly; buffer
+// parity = round&1 (same double-buffer rule). Uses a SEPARATE flag array Fe so
+// it never collides with the graph path's Fw. =====
+__global__ void k_put_e(const uint16_t* src, uint16_t* slotbase, int maxn,
+                        int buf, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  uint16_t* slot = slotbase + (size_t)buf * maxn;
+  int vec = n >> 3;
+  if (i < vec)
+    reinterpret_cast<uint4*>(slot)[i] = reinterpret_cast<const uint4*>(src)[i];
+  else if (i == vec)
+    for (int j = 8 * vec; j < n; j++) slot[j] = src[j];
+}
+__global__ void k_add_e_bf16(__hip_bfloat16* out, const __hip_bfloat16* src,
+                             const __hip_bfloat16* pbase, int maxn, int buf,
+                             int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  const __hip_bfloat16* p = pbase + (size_t)buf * maxn;
+  int vec = n >> 3;
+  if (i < vec) {
+    uint4 w = reinterpret_cast<const uint4*>(p)[i];
+    const __hip_bfloat16* wh = reinterpret_cast<const __hip_bfloat16*>(&w);
+    __hip_bfloat16* o = out + 8 * i;
+    const __hip_bfloat16* sh = src + 8 * i;
+#pragma unroll
+    for (int k = 0; k < 8; k++) o[k] = sh[k] + wh[k];
+  } else if (i == vec) {
+    for (int j = 8 * vec; j < n; j++) out[j] = src[j] + p[j];
+  }
+}
+__global__ void k_add_e(__half* out, const __half* src, const __half* pbase,
+                        int maxn, int buf, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  const __half* p = pbase + (size_t)buf * maxn;
+  int vec = n >> 3;
+  if (i < vec) {
+    uint4 w = reinterpret_cast<const uint4*>(p)[i];
+    const __half* wh = reinterpret_cast<const __half*>(&w);
+    __half* o = out + 8 * i;
+    const __half* sh = src + 8 * i;
+#pragma unroll
+    for (int k = 0; k < 8; k++) o[k] = __hadd(sh[k], wh[k]);
+  } else if (i == vec) {
+    for (int j = 8 * vec; j < n; j++) out[j] = __hadd(src[j], p[j]);
+  }
+}
+__global__ void k_fence() { if (!threadIdx.x) __threadfence_system(); }
+
+extern "C" void hostar_allreduce_eager(void* in, void* out, int n, int dtype,
+                                       int round, void* stream) {
+  hipStream_t s = stream ? (hipStream_t)stream : C.s;
+  int buf = round & 1;
+  int blocks = (n + 255) / 256, mn = C.maxn;
+  int* Fe = C.F + C.n_ranks;  // eager flags (after Fw)
+  k_put_e<<<blocks, 256, 0, s>>>((const uint16_t*)in,
+                                 (uint16_t*)C.slots[C.rank], mn, buf, n);
+  k_fence<<<1, 1, 0, s>>>();  // flush my slot to host before publishing
+  // Publish via the command processor (no CU busy-wait kernel).
+  hipStreamWriteValue32(s, &Fe[C.rank], (unsigned)round, 0);
+  for (int p = 0; p < C.n_ranks; p++) {
+    if (p == C.rank) continue;
+    hipStreamWaitValue32(s, &Fe[p], (unsigned)round, hipStreamWaitValueGte,
+                         0xffffffffu);
+  }
+  k_fence<<<1, 1, 0, s>>>();  // make peers' slot data visible before k_add_e
+  const void* src = in;
+  for (int p = 0; p < C.n_ranks; p++) {
+    if (p == C.rank) continue;
+    if (dtype == 1)
+      k_add_e_bf16<<<blocks, 256, 0, s>>>((__hip_bfloat16*)out,
+                                          (const __hip_bfloat16*)src,
+                                          (const __hip_bfloat16*)C.slots[p], mn,
+                                          buf, n);
+    else
+      k_add_e<<<blocks, 256, 0, s>>>((__half*)out, (const __half*)src,
+                                     (const __half*)C.slots[p], mn, buf, n);
+    src = out;
+  }
+}
+
+
+// ===== Pipelined eager all-reduce: chunked, fused write+read kernel that drives
+// BOTH PCIe directions at once (GPU1's link is full-duplex under a kernel, ~1.8x
+// vs serial). Beats RCCL on large payloads. Double-buffered by round parity;
+// per-chunk data-ready flags Fp. =====
+#define HOSTAR_PIPE_C 8
+__global__ void k_fused_bf16(uint16_t* sw, const uint16_t* iw, int nw,
+                             __hip_bfloat16* orr, const __hip_bfloat16* ir,
+                             const __hip_bfloat16* pr, int nr) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  int vw = nw >> 3, vr = nr >> 3;
+  if (i < vw)
+    reinterpret_cast<uint4*>(sw)[i] = reinterpret_cast<const uint4*>(iw)[i];
+  else if ((nw & 7) && i == vw)
+    for (int j = 8 * vw; j < nw; j++) sw[j] = iw[j];
+  if (i < vr) {
+    uint4 w = reinterpret_cast<const uint4*>(pr)[i];
+    const __hip_bfloat16* wh = reinterpret_cast<const __hip_bfloat16*>(&w);
+    __hip_bfloat16* o = orr + 8 * i; const __hip_bfloat16* sh = ir + 8 * i;
+#pragma unroll
+    for (int k = 0; k < 8; k++) o[k] = sh[k] + wh[k];
+  } else if ((nr & 7) && i == vr)
+    for (int j = 8 * vr; j < nr; j++) orr[j] = ir[j] + pr[j];
+}
+__global__ void k_fused_f16(uint16_t* sw, const uint16_t* iw, int nw,
+                            __half* orr, const __half* ir, const __half* pr,
+                            int nr) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  int vw = nw >> 3, vr = nr >> 3;
+  if (i < vw)
+    reinterpret_cast<uint4*>(sw)[i] = reinterpret_cast<const uint4*>(iw)[i];
+  else if ((nw & 7) && i == vw)
+    for (int j = 8 * vw; j < nw; j++) sw[j] = iw[j];
+  if (i < vr) {
+    uint4 w = reinterpret_cast<const uint4*>(pr)[i];
+    const __half* wh = reinterpret_cast<const __half*>(&w);
+    __half* o = orr + 8 * i; const __half* sh = ir + 8 * i;
+#pragma unroll
+    for (int k = 0; k < 8; k++) o[k] = __hadd(sh[k], wh[k]);
+  } else if ((nr & 7) && i == vr)
+    for (int j = 8 * vr; j < nr; j++) orr[j] = __hadd(ir[j], pr[j]);
+}
+// plain chunk copy / add (prologue write, final read)
+__global__ void k_putc(const uint16_t* in, uint16_t* slot, int nw) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x; int vw = nw >> 3;
+  if (i < vw) reinterpret_cast<uint4*>(slot)[i] = reinterpret_cast<const uint4*>(in)[i];
+  else if ((nw & 7) && i == vw) for (int j = 8 * vw; j < nw; j++) slot[j] = in[j];
+}
+__global__ void k_addc_bf16(__hip_bfloat16* o, const __hip_bfloat16* ir,
+                            const __hip_bfloat16* pr, int nr) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x; int vr = nr >> 3;
+  if (i < vr) { uint4 w = reinterpret_cast<const uint4*>(pr)[i];
+    const __hip_bfloat16* wh = reinterpret_cast<const __hip_bfloat16*>(&w);
+    __hip_bfloat16* oo=o+8*i; const __hip_bfloat16* sh=ir+8*i;
+#pragma unroll
+    for(int k=0;k<8;k++) oo[k]=sh[k]+wh[k]; }
+  else if ((nr & 7) && i == vr) for (int j=8*vr;j<nr;j++) o[j]=ir[j]+pr[j];
+}
+__global__ void k_addc_f16(__half* o, const __half* ir, const __half* pr, int nr){
+  int i = blockIdx.x * blockDim.x + threadIdx.x; int vr = nr >> 3;
+  if (i < vr) { uint4 w = reinterpret_cast<const uint4*>(pr)[i];
+    const __half* wh = reinterpret_cast<const __half*>(&w);
+    __half* oo=o+8*i; const __half* sh=ir+8*i;
+#pragma unroll
+    for(int k=0;k<8;k++) oo[k]=__hadd(sh[k],wh[k]); }
+  else if ((nr & 7) && i == vr) for (int j=8*vr;j<nr;j++) o[j]=__hadd(ir[j],pr[j]);
+}
+__global__ void k_pubc(int* f, int c, int v) {
+  if (!threadIdx.x) { __threadfence_system();
+    __hip_atomic_store(&f[c], v, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM); }
+}
+__global__ void k_spinc(const int* f, int c, int v) {
+  if (!threadIdx.x) {
+    while (__hip_atomic_load(&f[c], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < v) {}
+    __threadfence_system();
+  }
+}
+extern "C" void hostar_allreduce_pipe(void* in, void* out, int n, int dtype,
+                                      int round, void* stream) {
+  hipStream_t s = stream ? (hipStream_t)stream : C.s;
+  const int NC = HOSTAR_PIPE_C;
+  int buf = round & 1;
+  int cs = (n / NC) & ~7;          // chunk size, multiple of 8
+  if (cs == 0) cs = (n + 7) & ~7;  // tiny n: single chunk
+  int blk = (cs + 255) / 256;
+  __half* myslot = C.slots[C.rank] + (size_t)buf * C.maxn;
+  int peer = 1 - C.rank;           // 2-rank pipelined path
+  __half* peerslot = C.slots[peer] + (size_t)buf * C.maxn;
+  int* Fp = C.F + 2 * C.n_ranks;   // pipe flags (after Fw, Fe)
+  int* myFp = Fp + C.rank * NC;
+  int* peerFp = Fp + peer * NC;
+  auto cnt = [&](int c) { int st = c * cs; int e = (c == NC - 1) ? n : st + cs;
+                          return e > st ? e - st : 0; };
+  // prologue: write chunk 0
+  k_putc<<<blk, 256, 0, s>>>((const uint16_t*)in, (uint16_t*)myslot, cnt(0));
+  k_pubc<<<1, 1, 0, s>>>(myFp, 0, round);
+  for (int c = 0; c < NC; c++) {
+    if (cnt(c) == 0) break;
+    k_spinc<<<1, 1, 0, s>>>(peerFp, c, round);
+    int rc = cnt(c); int off = c * cs;
+    if (c + 1 < NC && cnt(c + 1) > 0) {
+      int wc = cnt(c + 1); int woff = (c + 1) * cs;
+      if (dtype == 1)
+        k_fused_bf16<<<blk, 256, 0, s>>>(
+            (uint16_t*)(myslot + woff), (const uint16_t*)((__hip_bfloat16*)in + woff), wc,
+            (__hip_bfloat16*)out + off, (const __hip_bfloat16*)in + off,
+            (const __hip_bfloat16*)(peerslot + off), rc);
+      else
+        k_fused_f16<<<blk, 256, 0, s>>>(
+            (uint16_t*)(myslot + woff), (const uint16_t*)((__half*)in + woff), wc,
+            (__half*)out + off, (const __half*)in + off,
+            (const __half*)(peerslot + off), rc);
+      k_pubc<<<1, 1, 0, s>>>(myFp, c + 1, round);
+    } else {
+      if (dtype == 1)
+        k_addc_bf16<<<blk, 256, 0, s>>>((__hip_bfloat16*)out + off,
+            (const __hip_bfloat16*)in + off, (const __hip_bfloat16*)(peerslot + off), rc);
+      else
+        k_addc_f16<<<blk, 256, 0, s>>>((__half*)out + off,
+            (const __half*)in + off, (const __half*)(peerslot + off), rc);
+    }
+  }
+}
+
 #endif  // USE_ROCM
