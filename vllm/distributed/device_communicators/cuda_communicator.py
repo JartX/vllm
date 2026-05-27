@@ -267,7 +267,13 @@ class CudaCommunicator(DeviceCommunicatorBase):
             out = fi_ar_comm.all_reduce(input_)
             assert out is not None
             return out
+        # Host-staged AllReduce (RCCL-free, no P2P). Checked independently
+        # of ca_comm.disabled — works even when IPC/P2P is dead.
         ca_comm = self.ca_comm
+        if ca_comm is not None and ca_comm._hostar is not None:
+            if ca_comm._hostar.should_use(input_):
+                ca_comm._hostar.all_reduce(input_)
+                return input_
         if (
             ca_comm is not None
             and not ca_comm.disabled

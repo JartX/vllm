@@ -1,0 +1,62 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Host-staged AllReduce for 2× RX 7900 XTX without P2P (RCCL-free).
+
+Small-payload TP AllReduce path that stages through pinned host memory and
+busy-polls a cross-process flag; graph-capturable. Beats RCCL ~9-13× on the
+10-512KB regime, but end-to-end ties RCCL because the 587us call overlaps
+compute. Off by default — flip on with VLLM_HOSTAR=1 for a workload where
+AllReduce is on the critical path. fp16, world_size 2 or 4.
+
+Backing symbols (hostar_init/hostar_allreduce) are compiled into the _C
+extension: csrc/rocm/hostar/host_staged_all_reduce.cpp.
+"""
+
+import ctypes
+
+import torch
+
+import vllm.envs as envs
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
+_MAX_BYTES = 1 << 20  # >1MB → fall back to RCCL (crossover ~1-2MB)
+
+
+class HostStagedAllReduce:
+    def __init__(self, rank: int, world_size: int, max_elems: int = 1 << 21):
+        self.disabled = True
+        if not (envs.VLLM_HOSTAR and world_size in (2, 4)):
+            return
+        # Symbols live in the _C extension; dlopen it by its installed path.
+        # VLLM_HOSTAR_LIB overrides for a standalone libhostar.so build.
+        import vllm._C  # noqa: F401
+
+        lib_path = envs.VLLM_HOSTAR_LIB or vllm._C.__file__
+        try:
+            self._lib = ctypes.CDLL(lib_path)
+        except OSError as e:
+            logger.warning("hostar symbols not loadable (%s); using RCCL", e)
+            return
+        self._lib.hostar_init.argtypes = [
+            ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_int
+        ]
+        self._lib.hostar_allreduce.argtypes = [
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p
+        ]
+        if self._lib.hostar_init(b"/vllm_hostar", rank, max_elems,
+                                 world_size) != 0:
+            logger.warning("hostar_init failed; using RCCL")
+            return
+        self.max_elems = max_elems
+        self.disabled = False
+
+    def should_use(self, inp: torch.Tensor) -> bool:
+        return (not self.disabled and inp.dtype == torch.float16
+                and inp.numel() <= self.max_elems
+                and inp.numel() * 2 <= _MAX_BYTES)
+
+    def all_reduce(self, inp: torch.Tensor) -> None:
+        stream = torch.cuda.current_stream().cuda_stream
+        self._lib.hostar_allreduce(inp.data_ptr(), inp.numel(), stream)
