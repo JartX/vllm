@@ -73,8 +73,15 @@ __global__ void k_spin(const int* F, int n, int rank) {
   }
 }
 // Copy this rank's data into its host-pinned slot (16-bit elems, dtype-agnostic).
-__global__ void k_put(const uint16_t* src, uint16_t* slot, int n) {
+// Each rank owns a DOUBLE buffer (two maxn-sized halves); the round parity picks
+// the half, so consecutive rounds never reuse the same buffer. That lets the
+// consumer read round k's buffer with no read-acknowledge phase: by the time a
+// rank rewrites a half (round k+2) the peer has provably consumed it (round k),
+// enforced by the data-ready (Fw) wait alone.
+__global__ void k_put(const uint16_t* src, uint16_t* slotbase, int maxn,
+                      int rank, int n) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
+  uint16_t* slot = slotbase + (size_t)(g_cur[rank] & 1) * maxn;
   if (i < n) slot[i] = src[i];
 }
 // out = src + peer, in a single pass. The reduction is OUT-OF-PLACE (vLLM's
@@ -84,9 +91,11 @@ __global__ void k_put(const uint16_t* src, uint16_t* slot, int n) {
 // read with SYSTEM-scope acquire loads (32-bit, two 16-bit elems per load) so
 // each read goes to memory rather than this GPU's stale read cache — defeating
 // the cross-chipset "consumer reads stale slot data after the flag" race.
-__global__ void k_add(__half* out, const __half* src, const __half* p, int n) {
+__global__ void k_add(__half* out, const __half* src, const __half* pbase,
+                      int maxn, int rank, int n) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   int pairs = n >> 1;
+  const __half* p = pbase + (size_t)(g_cur[rank] & 1) * maxn;
   if (i < pairs) {
     const unsigned* p32 = reinterpret_cast<const unsigned*>(p);
     unsigned w = __hip_atomic_load(&p32[i], __ATOMIC_ACQUIRE,
@@ -102,9 +111,11 @@ __global__ void k_add(__half* out, const __half* src, const __half* p, int n) {
   }
 }
 __global__ void k_add_bf16(__hip_bfloat16* out, const __hip_bfloat16* src,
-                           const __hip_bfloat16* p, int n) {
+                           const __hip_bfloat16* pbase, int maxn, int rank,
+                           int n) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   int pairs = n >> 1;
+  const __hip_bfloat16* p = pbase + (size_t)(g_cur[rank] & 1) * maxn;
   if (i < pairs) {
     const unsigned* p32 = reinterpret_cast<const unsigned*>(p);
     unsigned w = __hip_atomic_load(&p32[i], __ATOMIC_ACQUIRE,
@@ -122,8 +133,8 @@ __global__ void k_add_bf16(__hip_bfloat16* out, const __hip_bfloat16* src,
 
 struct Ctx {
   int rank, n_ranks, maxn;
-  __half* slots[HOSTAR_MAX_RANKS];  // shared host slot per rank
-  int* F;                           // shared flag array base (Fw then Fr)
+  __half* slots[HOSTAR_MAX_RANKS];  // per rank: a DOUBLE buffer (2 * maxn elems)
+  int* F;                           // shared data-ready flags Fw[n_ranks]
   hipStream_t s;
 };
 static Ctx C;
@@ -137,10 +148,11 @@ extern "C" int hostar_init(const char* shm, int rank, int max_elems,
   int prev_dev = 0;
   hipGetDevice(&prev_dev);
   hipSetDevice(rank);
-  // Flag region holds TWO arrays of n_ranks ints: Fw[] (data-ready), Fr[]
-  // (read-done), for the two-phase handshake.
+  // Layout: per rank a double buffer (2 * max_elems 16-bit elems), then the
+  // data-ready flags Fw[n_ranks]. Double buffering removes the read-ack phase,
+  // so only one flag array is needed.
   size_t bytes =
-      (size_t)n_ranks * max_elems * 2 + 2 * n_ranks * sizeof(int) + 128;
+      (size_t)n_ranks * 2 * max_elems * 2 + n_ranks * sizeof(int) + 128;
 
   // Cross-process shared buffer via memfd (NOT shm_open). Registering a
   // file-backed /dev/shm mapping with hipHostRegister corrupts vLLM's CUDA-
@@ -182,13 +194,14 @@ extern "C" int hostar_init(const char* shm, int rank, int max_elems,
   if (hipHostRegister(p, bytes, hipHostRegisterPortable) != hipSuccess)
     return -2;
   __half* base = (__half*)p;
-  C.F = (int*)(base + (size_t)n_ranks * max_elems);
+  C.F = (int*)(base + (size_t)n_ranks * 2 * max_elems);
   C.rank = rank;
   C.n_ranks = n_ranks;
   C.maxn = max_elems;
-  for (int r = 0; r < n_ranks; r++) C.slots[r] = base + (size_t)r * max_elems;
+  for (int r = 0; r < n_ranks; r++)
+    C.slots[r] = base + (size_t)r * 2 * max_elems;  // 2 halves per rank
   if (rank == 0)
-    for (int r = 0; r < 2 * n_ranks; r++) C.F[r] = 0;
+    for (int r = 0; r < n_ranks; r++) C.F[r] = 0;
   usleep(500000);  // let rank 0's flag-zeroing land before any peer proceeds
   hipStreamCreate(&C.s);
   hipSetDevice(prev_dev);
@@ -204,13 +217,15 @@ extern "C" void hostar_allreduce(void* in, void* out, int n, int dtype,
                                  void* stream) {
   hipStream_t s = stream ? (hipStream_t)stream : C.s;
   int* Fw = C.F;
-  int* Fr = C.F + C.n_ranks;
   int blocks = (n + 255) / 256;
+  int mn = C.maxn;
 
-  // Phase 1 — stage my data, publish "ready", wait for peers.
+  // Stage my data into this round's buffer half, publish "ready", wait for every
+  // peer. No read-ack phase: double buffering guarantees the half I'm about to
+  // write was already consumed by every peer (see k_put).
   k_round<<<1, 1, 0, s>>>(C.rank);
   k_put<<<blocks, 256, 0, s>>>((const uint16_t*)in, (uint16_t*)C.slots[C.rank],
-                               n);
+                               mn, C.rank, n);
   k_pub<<<1, 1, 0, s>>>(Fw, C.rank);
   k_spin<<<1, 1, 0, s>>>(Fw, C.n_ranks, C.rank);
 
@@ -223,17 +238,12 @@ extern "C" void hostar_allreduce(void* in, void* out, int n, int dtype,
     if (dtype == 1)
       k_add_bf16<<<blocks, 256, 0, s>>>((__hip_bfloat16*)out,
                                         (const __hip_bfloat16*)src,
-                                        (const __hip_bfloat16*)C.slots[p], n);
+                                        (const __hip_bfloat16*)C.slots[p], mn,
+                                        C.rank, n);
     else
       k_add<<<blocks, 256, 0, s>>>((__half*)out, (const __half*)src,
-                                   (const __half*)C.slots[p], n);
+                                   (const __half*)C.slots[p], mn, C.rank, n);
     src = out;
   }
-
-  // Phase 2 — read-acknowledge: publish "I've consumed peers' slots", then wait
-  // until every peer has consumed MINE before returning, so the next round's
-  // k_put can't overwrite my slot while a peer is still reading it.
-  k_pub<<<1, 1, 0, s>>>(Fr, C.rank);
-  k_spin<<<1, 1, 0, s>>>(Fr, C.n_ranks, C.rank);
 }
 #endif  // USE_ROCM
