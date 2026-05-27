@@ -49,27 +49,24 @@ __device__ int g_cur[HOSTAR_MAX_RANKS];
 __global__ void k_round(int rank) {
   if (!threadIdx.x) g_cur[rank] = atomicAdd(&g_round[rank], 1) + 1;
 }
-// Publish a host flag = current round, after a system fence so all prior writes
-// to host-pinned memory by this GPU (the slot copy) are visible system-wide
-// before the flag (only an explicit __threadfence_system orders bulk data vs
-// the flag across the PCH chipset).
-__global__ void k_pub(int* F, int rank) {
-  if (!threadIdx.x) {
-    __threadfence_system();
-    __hip_atomic_store(&F[rank], g_cur[rank], __ATOMIC_RELEASE,
-                       __HIP_MEMORY_SCOPE_SYSTEM);
-  }
-}
-// Wait until every peer's flag in `F` has reached this rank's current round.
-__global__ void k_spin(const int* F, int n, int rank) {
+// Publish "my data is ready" then wait until every peer is ready, in one
+// single-thread kernel (merging the old k_pub + k_spin saves a launch per
+// all-reduce). The leading __threadfence_system makes this GPU's slot writes
+// (k_put) visible system-wide before the flag store; the trailing one orders
+// the peers' slot data (made visible by the acquire-loads) before the k_add
+// that follows on the same stream. Both fences are required to cross the PCH
+// chipset; they are the same two fences as before, just in one kernel.
+__global__ void k_pubspin(int* F, int n, int rank) {
   if (!threadIdx.x) {
     int me = g_cur[rank];
+    __threadfence_system();
+    __hip_atomic_store(&F[rank], me, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
     for (int p = 0; p < n; p++) {
       if (p == rank) continue;
       while (__hip_atomic_load(&F[p], __ATOMIC_ACQUIRE,
                                __HIP_MEMORY_SCOPE_SYSTEM) < me) { /* spin */ }
     }
-    __threadfence_system();  // order the spin-acquire before subsequent reads
+    __threadfence_system();  // order peers' slot data before subsequent k_add
   }
 }
 // Copy this rank's data into its host-pinned slot (16-bit elems, dtype-agnostic).
@@ -222,8 +219,7 @@ extern "C" void hostar_allreduce(void* in, void* out, int n, int dtype,
   k_round<<<1, 1, 0, s>>>(C.rank);
   k_put<<<blocks, 256, 0, s>>>((const uint16_t*)in, (uint16_t*)C.slots[C.rank],
                                mn, C.rank, n);
-  k_pub<<<1, 1, 0, s>>>(Fw, C.rank);
-  k_spin<<<1, 1, 0, s>>>(Fw, C.n_ranks, C.rank);
+  k_pubspin<<<1, 1, 0, s>>>(Fw, C.n_ranks, C.rank);
 
   // Read + accumulate every peer's slot into `out` directly from host memory.
   // The first peer reads src = `in` (seeds out without a separate copy, leaving
