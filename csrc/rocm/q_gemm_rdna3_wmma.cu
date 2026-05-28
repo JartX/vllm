@@ -44,12 +44,21 @@
 
 #include "qdq_4_rdna3.cuh"
 
+#if defined(__HIPCC__) && defined(__gfx1100__)
+  #define __HIP__RDNA3__
+#endif
+
 namespace vllm {
 namespace gptq_rdna3_wmma {
 
 // Pull dequant types from the sibling namespace.
 using vllm::gptq_rdna3::bf162_t;
 using vllm::gptq_rdna3::bf16_t;
+
+// Device code below uses RDNA3-only __builtin_amdgcn_wmma_* intrinsics;
+// non-RDNA3 device passes fall through to empty __global__ stubs at the
+// #else block at the end of this TU.
+#if defined(__HIP__RDNA3__) || !defined(__HIP_DEVICE_COMPILE__)
 
 // PRECISE dequant variants live HERE, not in the shared qdq_4_rdna3.cuh
 // header. Reason: hipcc takes different register/scheduling decisions when
@@ -215,6 +224,9 @@ __forceinline__ __device__ void atomic_add_pk_bf16(bf162_t* addr, bf162_t val) {
   }
 }
 
+#endif  // helpers guard; K-split heuristics below are pure host/device
+        // arithmetic, called from launch_* on non-RDNA3 device passes too.
+
 // K-split factor heuristic. Returns the gridDim.z to use for a given K.
 // Aim: each block does at least ~16 K-tiles (= K=256) so the per-block
 // constant overhead (LDS init, kernel prologue) is amortised. Upper
@@ -268,6 +280,8 @@ __host__ __device__ static inline int compute_wmma_k_split_mn(
   return compute_wmma_k_split(size_k);
 }
 
+#if defined(__HIP__RDNA3__) || !defined(__HIP_DEVICE_COMPILE__)
+
 // Native AMDGPU vector types expected by the WMMA built-ins.
 using v16fp16 = _Float16 __attribute__((ext_vector_type(16)));
 using v16bf16 = __bf16 __attribute__((ext_vector_type(16)));
@@ -316,6 +330,11 @@ template <>
 __device__ __forceinline__ bf16_t tzero<bf16_t>() {
   return __float2bfloat16(0.0f);
 }
+
+#endif  // helpers guard (each __global__ below has its own guard so launch_*
+        // host code remains visible to the parser on non-RDNA3 device passes)
+
+#if defined(__HIP__RDNA3__) || !defined(__HIP_DEVICE_COMPILE__)
 
 // ===========================================================================
 // WMMA kernel: 16M × 16N tile per block, 1 wave, full K traversal.
@@ -573,6 +592,15 @@ __global__ void gemm_q4_wmma_kernel_16x16_1w(
   }
 }
 
+#else  // non-RDNA3 device pass: empty kernel for symbol parity.
+template <typename T>
+__global__ void gemm_q4_wmma_kernel_16x16_1w(const T*, const uint32_t*,
+                                             const uint32_t*, const T*, T*,
+                                             const int, const int, const int,
+                                             const int, const int, const int*) {
+}
+#endif
+
 template <typename T>
 void launch_gemm_q4_wmma_16x16_1w(const T* a, const uint32_t* b_q_weight,
                          const uint32_t* b_qzeros, const T* b_scales,
@@ -589,6 +617,8 @@ void launch_gemm_q4_wmma_16x16_1w(const T* a, const uint32_t* b_q_weight,
       a, b_q_weight, b_qzeros, b_scales, c, size_m, size_n, size_k, groups,
       zero_offset, b_q_perm);
 }
+
+#if defined(__HIP__RDNA3__) || !defined(__HIP_DEVICE_COMPILE__)
 
 // ===========================================================================
 // 32x16_2w kernel: 2 waves per block, 32M × 16N tile, double-buffered LDS.
@@ -809,6 +839,15 @@ __global__ void gemm_q4_wmma_kernel_32x16_2w(
   }
 }
 
+#else  // non-RDNA3 device pass: empty kernel for symbol parity.
+template <typename T>
+__global__ void gemm_q4_wmma_kernel_32x16_2w(const T*, const uint32_t*,
+                                             const uint32_t*, const T*, T*,
+                                             const int, const int, const int,
+                                             const int, const int, const int*) {
+}
+#endif
+
 template <typename T>
 void launch_gemm_q4_wmma_32x16_2w(const T* a, const uint32_t* b_q_weight,
                             const uint32_t* b_qzeros, const T* b_scales,
@@ -839,6 +878,8 @@ void launch_gemm_q4_wmma_32x16_2w(const T* a, const uint32_t* b_q_weight,
       a, b_q_weight, b_qzeros, b_scales, c, size_m, size_n, size_k, groups,
       zero_offset, b_q_perm);
 }
+
+#if defined(__HIP__RDNA3__) || !defined(__HIP_DEVICE_COMPILE__)
 
 // ===========================================================================
 // 64x16_4w kernel: 4 waves per block, 64M × 16N tile, double-buffered LDS.
@@ -1053,6 +1094,15 @@ __global__ void gemm_q4_wmma_kernel_64x16_4w(
   }
 }
 
+#else  // non-RDNA3 device pass: empty kernel for symbol parity.
+template <typename T>
+__global__ void gemm_q4_wmma_kernel_64x16_4w(const T*, const uint32_t*,
+                                             const uint32_t*, const T*, T*,
+                                             const int, const int, const int,
+                                             const int, const int, const int*) {
+}
+#endif
+
 template <typename T>
 void launch_gemm_q4_wmma_64x16_4w(const T* a, const uint32_t* b_q_weight,
                             const uint32_t* b_qzeros, const T* b_scales,
@@ -1075,6 +1125,8 @@ void launch_gemm_q4_wmma_64x16_4w(const T* a, const uint32_t* b_q_weight,
       a, b_q_weight, b_qzeros, b_scales, c, size_m, size_n, size_k, groups,
       zero_offset, b_q_perm);
 }
+
+#if defined(__HIP__RDNA3__) || !defined(__HIP_DEVICE_COMPILE__)
 
 // ===========================================================================
 // 64x32_4w kernel: 4 waves per block, 64M × 32N tile, double-buffered LDS.
@@ -1294,6 +1346,15 @@ __global__ void gemm_q4_wmma_kernel_64x32_4w(
   store_acc(c_acc1, n_tile + 16);
 }
 
+#else  // non-RDNA3 device pass: empty kernel for symbol parity.
+template <typename T>
+__global__ void gemm_q4_wmma_kernel_64x32_4w(const T*, const uint32_t*,
+                                             const uint32_t*, const T*, T*,
+                                             const int, const int, const int,
+                                             const int, const int, const int*) {
+}
+#endif
+
 template <typename T>
 void launch_gemm_q4_wmma_64x32_4w(const T* a, const uint32_t* b_q_weight,
                             const uint32_t* b_qzeros, const T* b_scales,
@@ -1318,6 +1379,8 @@ void launch_gemm_q4_wmma_64x32_4w(const T* a, const uint32_t* b_q_weight,
       a, b_q_weight, b_qzeros, b_scales, c, size_m, size_n, size_k, groups,
       zero_offset, b_q_perm);
 }
+
+#if defined(__HIP__RDNA3__) || !defined(__HIP_DEVICE_COMPILE__)
 
 // ===========================================================================
 // 64x64_4w kernel: 4 waves per block, 64M × 64N tile, 4 wmmas per wave per K-iter.
@@ -1934,6 +1997,28 @@ __global__ void gemm_q4_wmma_kernel_128x64_k32(
   store_acc(c_acc2, n_tile + 32);
   store_acc(c_acc3, n_tile + 48);
 }
+
+#else  // non-RDNA3 device pass: empty kernels for symbol parity (covers the
+       // three kernels that share this launcher).
+template <typename T>
+__global__ void gemm_q4_wmma_kernel_64x64_4w(const T*, const uint32_t*,
+                                             const uint32_t*, const T*, T*,
+                                             const int, const int, const int,
+                                             const int, const int, const int*) {
+}
+template <typename T>
+__global__ void gemm_q4_wmma_kernel_128x64_k16(const T*, const uint32_t*,
+                                               const uint32_t*, const T*, T*,
+                                               const int, const int, const int,
+                                               const int, const int,
+                                               const int*) {}
+template <typename T>
+__global__ void gemm_q4_wmma_kernel_128x64_k32(const T*, const uint32_t*,
+                                               const uint32_t*, const T*, T*,
+                                               const int, const int, const int,
+                                               const int, const int,
+                                               const int*) {}
+#endif
 
 template <typename T>
 void launch_gemm_q4_wmma_64x64_4w(const T* a, const uint32_t* b_q_weight,
