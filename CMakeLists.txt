@@ -318,7 +318,6 @@ set(VLLM_EXT_SRC
   "csrc/quantization/activation_kernels.cu"
   "csrc/cuda_utils_kernels.cu"
   "csrc/custom_all_reduce.cu"
-  "csrc/rocm/hostar/host_staged_all_reduce.cu"
   "csrc/torch_bindings.cpp"
   "csrc/fused_deepseek_v4_qnorm_rope_kv_insert_kernel.cu")
 

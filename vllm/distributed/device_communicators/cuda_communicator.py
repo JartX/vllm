@@ -85,17 +85,6 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self.symm_mem_comm: SymmMemCommunicator | None = None
         self.fi_ar_comm: FlashInferAllReduce | None = None
 
-        # Host-staged AllReduce (RCCL-free, no P2P). Created on the TP group
-        # independently of custom allreduce: on no-P2P boxes ca_comm is never
-        # built, so hostar must not depend on it. Off unless VLLM_HOSTAR=1.
-        self._hostar = None
-        if self.world_size > 1 and "tp" in unique_name:
-            from vllm.distributed.device_communicators.host_staged_all_reduce import (
-                HostStagedAllReduce,
-            )
-
-            self._hostar = HostStagedAllReduce(self.rank, self.world_size)
-
         if use_torch_symm_mem and current_platform.is_cuda():
             self.symm_mem_comm = SymmMemCommunicator(
                 group=self.cpu_group,
@@ -278,13 +267,6 @@ class CudaCommunicator(DeviceCommunicatorBase):
             out = fi_ar_comm.all_reduce(input_)
             assert out is not None
             return out
-        # Host-staged AllReduce (RCCL-free, no P2P). Lives on the communicator
-        # itself, not on ca_comm — ca_comm is None whenever custom allreduce is
-        # disabled (always true on no-P2P boxes), so gating on it would never
-        # fire. Checked here independently; out-of-place (returns a fresh tensor)
-        # to satisfy the functional all_reduce op contract.
-        if self._hostar is not None and self._hostar.should_use(input_):
-            return self._hostar.all_reduce(input_)
         ca_comm = self.ca_comm
         if (
             ca_comm is not None
