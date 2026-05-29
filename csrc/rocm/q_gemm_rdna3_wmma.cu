@@ -603,10 +603,10 @@ __global__ void gemm_q4_wmma_kernel_16x16_1w(const T*, const uint32_t*,
 
 template <typename T>
 void launch_gemm_q4_wmma_16x16_1w(const T* a, const uint32_t* b_q_weight,
-                         const uint32_t* b_qzeros, const T* b_scales,
-                         const int* b_q_perm, T* c, int size_m, int size_n,
-                         int size_k, int groups, int zero_offset,
-                         cudaStream_t stream) {
+                                  const uint32_t* b_qzeros, const T* b_scales,
+                                  const int* b_q_perm, T* c, int size_m,
+                                  int size_n, int size_k, int groups,
+                                  int zero_offset, cudaStream_t stream) {
   // 1 wave per block (32 lanes), 16x16 C tile per block. gridDim.z splits
   // K so that more blocks (and therefore more waves) are in flight; with
   // K_SPLIT > 1 the kernel switches to atomic write-back at the epilogue.
@@ -850,10 +850,10 @@ __global__ void gemm_q4_wmma_kernel_32x16_2w(const T*, const uint32_t*,
 
 template <typename T>
 void launch_gemm_q4_wmma_32x16_2w(const T* a, const uint32_t* b_q_weight,
-                            const uint32_t* b_qzeros, const T* b_scales,
-                            const int* b_q_perm, T* c, int size_m, int size_n,
-                            int size_k, int groups, int zero_offset,
-                            cudaStream_t stream) {
+                                  const uint32_t* b_qzeros, const T* b_scales,
+                                  const int* b_q_perm, T* c, int size_m,
+                                  int size_n, int size_k, int groups,
+                                  int zero_offset, cudaStream_t stream) {
   // Fallback to v1 for size_m < 32. With M-tile=32 the v2 block has 2 waves
   // working on rows [0..15] and [16..31]; at M < 32 the second wave processes
   // out-of-range M rows (zero-padded a_frag → wmma produces nothing useful)
@@ -862,8 +862,9 @@ void launch_gemm_q4_wmma_32x16_2w(const T* a, const uint32_t* b_q_weight,
   // max-num-seqs=32 lands at M≈32 steady-state; the M=16 sliver is edge),
   // but the fallback costs nothing and is the right shape.
   if (size_m < 32) {
-    launch_gemm_q4_wmma_16x16_1w<T>(a, b_q_weight, b_qzeros, b_scales, b_q_perm, c,
-                           size_m, size_n, size_k, groups, zero_offset, stream);
+    launch_gemm_q4_wmma_16x16_1w<T>(a, b_q_weight, b_qzeros, b_scales, b_q_perm,
+                                    c, size_m, size_n, size_k, groups,
+                                    zero_offset, stream);
     return;
   }
 
@@ -1105,15 +1106,15 @@ __global__ void gemm_q4_wmma_kernel_64x16_4w(const T*, const uint32_t*,
 
 template <typename T>
 void launch_gemm_q4_wmma_64x16_4w(const T* a, const uint32_t* b_q_weight,
-                            const uint32_t* b_qzeros, const T* b_scales,
-                            const int* b_q_perm, T* c, int size_m, int size_n,
-                            int size_k, int groups, int zero_offset,
-                            cudaStream_t stream) {
+                                  const uint32_t* b_qzeros, const T* b_scales,
+                                  const int* b_q_perm, T* c, int size_m,
+                                  int size_n, int size_k, int groups,
+                                  int zero_offset, cudaStream_t stream) {
   // Fall back to v2 for M < 64 (would waste 1+ waves on out-of-range rows).
   if (size_m < 64) {
-    launch_gemm_q4_wmma_32x16_2w<T>(a, b_q_weight, b_qzeros, b_scales, b_q_perm, c,
-                              size_m, size_n, size_k, groups, zero_offset,
-                              stream);
+    launch_gemm_q4_wmma_32x16_2w<T>(a, b_q_weight, b_qzeros, b_scales, b_q_perm,
+                                    c, size_m, size_n, size_k, groups,
+                                    zero_offset, stream);
     return;
   }
 
@@ -1357,17 +1358,17 @@ __global__ void gemm_q4_wmma_kernel_64x32_4w(const T*, const uint32_t*,
 
 template <typename T>
 void launch_gemm_q4_wmma_64x32_4w(const T* a, const uint32_t* b_q_weight,
-                            const uint32_t* b_qzeros, const T* b_scales,
-                            const int* b_q_perm, T* c, int size_m, int size_n,
-                            int size_k, int groups, int zero_offset,
-                            cudaStream_t stream) {
+                                  const uint32_t* b_qzeros, const T* b_scales,
+                                  const int* b_q_perm, T* c, int size_m,
+                                  int size_n, int size_k, int groups,
+                                  int zero_offset, cudaStream_t stream) {
   // Fall back to v3 when M < 64 (small-M decode/prefill stays on the
   // narrower 64M × 16N path) or when N < 32 (tile would waste a wave on
   // out-of-range cols).
   if (size_m < 64 || size_n < 32) {
-    launch_gemm_q4_wmma_64x16_4w<T>(a, b_q_weight, b_qzeros, b_scales, b_q_perm, c,
-                              size_m, size_n, size_k, groups, zero_offset,
-                              stream);
+    launch_gemm_q4_wmma_64x16_4w<T>(a, b_q_weight, b_qzeros, b_scales, b_q_perm,
+                                    c, size_m, size_n, size_k, groups,
+                                    zero_offset, stream);
     return;
   }
 
@@ -1383,7 +1384,8 @@ void launch_gemm_q4_wmma_64x32_4w(const T* a, const uint32_t* b_q_weight,
 #if defined(__HIP__RDNA3__) || !defined(__HIP_DEVICE_COMPILE__)
 
 // ===========================================================================
-// 64x64_4w kernel: 4 waves per block, 64M × 64N tile, 4 wmmas per wave per K-iter.
+// 64x64_4w kernel: 4 waves per block, 64M × 64N tile, 4 wmmas per wave per
+// K-iter.
 //
 // Doubles the N-tile from 32 → 64. Each wave issues 4 wmmas per K-iter
 // (cols 0-15, 16-31, 32-47, 48-63), all sharing the same a_frag. With
@@ -2022,15 +2024,15 @@ __global__ void gemm_q4_wmma_kernel_128x64_k32(const T*, const uint32_t*,
 
 template <typename T>
 void launch_gemm_q4_wmma_64x64_4w(const T* a, const uint32_t* b_q_weight,
-                            const uint32_t* b_qzeros, const T* b_scales,
-                            const int* b_q_perm, T* c, int size_m, int size_n,
-                            int size_k, int groups, int zero_offset,
-                            cudaStream_t stream) {
+                                  const uint32_t* b_qzeros, const T* b_scales,
+                                  const int* b_q_perm, T* c, int size_m,
+                                  int size_n, int size_k, int groups,
+                                  int zero_offset, cudaStream_t stream) {
   // Fall back to v4 when N < 64 (would waste 1+ waves on out-of-range cols).
   if (size_m < 64 || size_n < 64) {
-    launch_gemm_q4_wmma_64x32_4w<T>(a, b_q_weight, b_qzeros, b_scales, b_q_perm, c,
-                              size_m, size_n, size_k, groups, zero_offset,
-                              stream);
+    launch_gemm_q4_wmma_64x32_4w<T>(a, b_q_weight, b_qzeros, b_scales, b_q_perm,
+                                    c, size_m, size_n, size_k, groups,
+                                    zero_offset, stream);
     return;
   }
 
@@ -2161,4 +2163,3 @@ torch::Tensor gptq_gemm_rdna3_wmma(torch::Tensor a, torch::Tensor b_q_weight,
 
   return c;
 }
-
