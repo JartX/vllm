@@ -32,9 +32,34 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     pack_quantized_values_into_int32,
 )
+from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
 
 logger = init_logger(__name__)
+
+
+def try_make(weight_quant, input_quant, moe_config):
+    """Return an RDNA3 MoE method if the HW + kernel are available, else None.
+
+    Called from compressed_tensors_moe.py dispatch. All arch detection
+    lives here so the dispatch file stays platform-agnostic.
+    """
+    if not current_platform.is_rocm() or weight_quant.num_bits != 4:
+        return None
+    try:
+        from vllm.platforms.rocm import on_gfx1100
+    except ImportError:
+        return None
+    if not (
+        on_gfx1100()
+        and hasattr(torch.ops, "_rocm_C")
+        and hasattr(torch.ops._rocm_C, "moe_gptq_gemm_rdna3")
+    ):
+        return None
+    logger.info_once(
+        "Using CompressedTensorsWNA16RDNA3MoEMethod (native RDNA3 HIP kernel)"
+    )
+    return CompressedTensorsWNA16RDNA3MoEMethod(weight_quant, input_quant, moe_config)
 
 
 def _synthesize_qzeros(
