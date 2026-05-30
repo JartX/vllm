@@ -25,6 +25,55 @@ from vllm.platforms import current_platform
 logger = init_logger(__name__)
 
 
+def _try_get_rocm_moe_method(
+    weight_quant,
+    input_quant,
+    moe_config,
+) -> FusedMoEMethodBase | None:
+    """Try to select a native ROCm MoE kernel, or return None to fall back.
+
+    Checks architecture-specific HIP kernels in priority order.
+    New architectures (RDNA4, etc.) can be added here.
+
+    Set VLLM_MOE_HIP_KERNEL=0 to force the Triton fallback (for A/B
+    benchmarking).
+    """
+    import os
+
+    if os.environ.get("VLLM_MOE_HIP_KERNEL", "1") == "0":
+        logger.info_once("VLLM_MOE_HIP_KERNEL=0 → using Triton MoE fallback")
+        return None
+    if not current_platform.is_rocm():
+        return None
+    if weight_quant.num_bits != 4:
+        return None
+
+    try:
+        from vllm.platforms.rocm import on_gfx1100
+    except ImportError:
+        return None
+
+    # RDNA3 (gfx1100): fused MoE W4A16 HIP kernel
+    if (
+        on_gfx1100()
+        and hasattr(torch.ops, "_rocm_C")
+        and hasattr(torch.ops._rocm_C, "moe_gptq_gemm_rdna3")
+    ):
+        from .compressed_tensors_moe_wna16_rdna3 import (
+            CompressedTensorsWNA16RDNA3MoEMethod,
+        )
+
+        logger.info_once(
+            "Using CompressedTensorsWNA16RDNA3MoEMethod (native RDNA3 HIP kernel)"
+        )
+        return CompressedTensorsWNA16RDNA3MoEMethod(
+            weight_quant, input_quant, moe_config
+        )
+
+    # Future: RDNA4, CDNA, etc. can be added here.
+    return None
+
+
 class CompressedTensorsMoEMethod(FusedMoEMethodBase):
     @staticmethod
     def get_moe_method(
@@ -98,10 +147,6 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
                 not check_moe_marlin_supports_layer(layer, group_size)
                 or current_platform.is_rocm()
             ):
-                from .compressed_tensors_moe_wna16 import (
-                    CompressedTensorsWNA16MoEMethod,
-                )
-
                 if (
                     weight_quant.strategy == QuantizationStrategy.GROUP
                     and weight_quant.actorder
@@ -110,6 +155,18 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
                     raise ValueError(
                         "WNA16MoE is not supported with actorder=group/dynamic."
                     )
+
+                # Try native ROCm HIP kernels (RDNA3, etc.)
+                rocm_method = _try_get_rocm_moe_method(
+                    weight_quant, input_quant, layer.moe_config
+                )
+                if rocm_method is not None:
+                    return rocm_method
+
+                from .compressed_tensors_moe_wna16 import (
+                    CompressedTensorsWNA16MoEMethod,
+                )
+
                 logger.info_once("Using CompressedTensorsWNA16MoEMethod")
                 return CompressedTensorsWNA16MoEMethod(
                     weight_quant, input_quant, layer.moe_config
