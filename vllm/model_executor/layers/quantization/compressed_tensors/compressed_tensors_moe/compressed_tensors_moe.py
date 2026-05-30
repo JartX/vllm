@@ -98,10 +98,6 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
                 not check_moe_marlin_supports_layer(layer, group_size)
                 or current_platform.is_rocm()
             ):
-                from .compressed_tensors_moe_wna16 import (
-                    CompressedTensorsWNA16MoEMethod,
-                )
-
                 if (
                     weight_quant.strategy == QuantizationStrategy.GROUP
                     and weight_quant.actorder
@@ -110,6 +106,18 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
                     raise ValueError(
                         "WNA16MoE is not supported with actorder=group/dynamic."
                     )
+
+                # Try native ROCm HIP kernels (RDNA3, etc.)
+                from . import rocm_moe
+
+                rocm = rocm_moe.try_make(weight_quant, input_quant, layer.moe_config)
+                if rocm is not None:
+                    return rocm
+
+                from .compressed_tensors_moe_wna16 import (
+                    CompressedTensorsWNA16MoEMethod,
+                )
+
                 logger.info_once("Using CompressedTensorsWNA16MoEMethod")
                 return CompressedTensorsWNA16MoEMethod(
                     weight_quant, input_quant, layer.moe_config
