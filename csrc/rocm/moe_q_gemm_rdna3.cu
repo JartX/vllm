@@ -323,12 +323,19 @@ __global__ void moe_gemm_q4_kernel_rdna3(
         {
           int32_t token_id = sorted_token_ids[offset_m_base];
           int token_row = token_id / top_k;
-          const uint32_t* a_words = reinterpret_cast<const uint32_t*>(
-              a + (int64_t)token_row * size_k + offset_k + a_off);
-          a_pack.u[0] = a_words[0];
-          a_pack.u[1] = a_words[1];
-          a_pack.u[2] = a_words[2];
-          a_pack.u[3] = a_words[3];
+          if (token_row < size_m) {
+            const uint32_t* a_words = reinterpret_cast<const uint32_t*>(
+                a + (int64_t)token_row * size_k + offset_k + a_off);
+            a_pack.u[0] = a_words[0];
+            a_pack.u[1] = a_words[1];
+            a_pack.u[2] = a_words[2];
+            a_pack.u[3] = a_words[3];
+          } else {
+            a_pack.u[0] = 0;
+            a_pack.u[1] = 0;
+            a_pack.u[2] = 0;
+            a_pack.u[3] = 0;
+          }
         }
 
         // sum_a for bias correction

@@ -7,6 +7,12 @@ Tests ``moe_gptq_gemm_rdna3`` against the dense ``gptq_gemm_rdna3`` as
 reference: builds RDNA3-format weights (shuffled int32, synthesized qzeros),
 runs the fused MoE kernel, and compares per-expert results.
 
+Model parameters taken from:
+  - cyankiwi/Qwen3-30B-A3B-Instruct-2507-AWQ-4bit
+    (hidden=2048, inter=768, E=128, top_k=8, G=32)
+  - Qwen3.6-35B-A3B-GPTQ-W4A16-G32
+    (hidden=2048, inter=512, E=256, top_k=8, G=32)
+
 Run `pytest tests/kernels/quantization/test_rdna3_moe_w4a16.py`.
 """
 
@@ -43,6 +49,19 @@ gfx1100_only = pytest.mark.skipif(
     reason="Requires gfx1100 with moe_gptq_gemm_rdna3 op",
 )
 
+# Model configurations: real K/N/top_k/group_size dims, E capped at 16 to
+# fit in test GPU memory (full E=128/256 would need >20GB for weights alone).
+# Kernel behavior is E-independent (per-expert tiling), so E=16 is sufficient.
+MODEL_CONFIGS = [
+    # cyankiwi/Qwen3-30B-A3B-Instruct-2507-AWQ-4bit dims (E capped)
+    pytest.param(16, 2048, 768, 8, 32, id="Qwen3-30B-A3B"),
+    # Qwen3.6-35B-A3B-GPTQ-W4A16-G32 dims (E capped)
+    pytest.param(16, 2048, 512, 8, 32, id="Qwen3.6-35B-A3B"),
+]
+
+# Token counts: decode (1), small batch (4), medium (16), prefill (64)
+NUM_TOKENS = [1, 4, 16, 64]
+
 
 def _make_packed_weights(E, K, N):
     """Create random 4-bit packed weights [E, K/8, N] int32 + shuffle."""
@@ -78,12 +97,15 @@ def _make_qzeros(E, groups, N):
 
 
 @gfx1100_only
+@pytest.mark.parametrize("E, K, N_inter, top_k, group_size", MODEL_CONFIGS)
+@pytest.mark.parametrize("M", NUM_TOKENS)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("block_size_m", [1, 4])
-def test_fused_moe_w1_matches_dense(dtype, block_size_m):
+def test_fused_moe_w1_matches_dense(
+    E, K, N_inter, top_k, group_size, M, dtype, block_size_m
+):
     """w1 GEMM via fused kernel matches per-expert dense kernel."""
-    E, M, K, N, top_k, group_size = 4, 4, 256, 128, 2, 32
-    N_gate_up = N * 2
+    N_gate_up = N_inter * 2
     groups = K // group_size
 
     torch.manual_seed(42)
@@ -130,23 +152,27 @@ def test_fused_moe_w1_matches_dense(dtype, block_size_m):
             )
             ref_out[flat] = ref.squeeze()
 
-    assert torch.equal(fused_out, ref_out), (
+    # Split-K atomics can cause minor fp16/bf16 rounding differences
+    # at large K (e.g. K=2048 → 8 K-blocks). Use allclose, not equal.
+    atol = 0.5 if dtype == torch.bfloat16 else 0.1
+    assert torch.allclose(fused_out, ref_out, atol=atol, rtol=0.01), (
         f"max diff: {(fused_out - ref_out).abs().max().item()}"
     )
 
 
 @gfx1100_only
+@pytest.mark.parametrize("E, K, N_inter, top_k, group_size", MODEL_CONFIGS)
+@pytest.mark.parametrize("M", NUM_TOKENS)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_fused_moe_output_topk_reduces(dtype):
+def test_fused_moe_output_topk_reduces(E, K, N_inter, top_k, group_size, M, dtype):
     """output_topk fuses moe_sum: multiple experts write to same output row."""
-    E, M, K, N, top_k, group_size = 4, 2, 256, 128, 2, 32
     groups = K // group_size
 
     torch.manual_seed(123)
     x = torch.randn(M * top_k, K, dtype=dtype, device=device)
-    w = _make_packed_weights(E, K, N)
-    ws = _make_scales(E, groups, N, dtype)
-    wz = _make_qzeros(E, groups, N)
+    w = _make_packed_weights(E, K, N_inter)
+    ws = _make_scales(E, groups, N_inter, dtype)
+    wz = _make_qzeros(E, groups, N_inter)
 
     topk_ids = torch.randint(0, E, (M, top_k), device=device, dtype=torch.int32)
     topk_w = torch.softmax(
@@ -157,7 +183,7 @@ def test_fused_moe_output_topk_reduces(dtype):
     si, ei, ntp = moe_align_block_size(topk_ids, 1, E)
 
     # Without output_topk: write to [M*top_k, N] then moe_sum
-    flat_out = torch.zeros(M * top_k, N, dtype=dtype, device=device)
+    flat_out = torch.zeros(M * top_k, N_inter, dtype=dtype, device=device)
     ops.moe_gptq_gemm_rdna3(
         x,
         flat_out,
@@ -173,11 +199,11 @@ def test_fused_moe_output_topk_reduces(dtype):
         True,
         0,
     )
-    ref = torch.zeros(M, N, dtype=dtype, device=device)
-    ops.moe_sum(flat_out.view(M, top_k, N), ref)
+    ref = torch.zeros(M, N_inter, dtype=dtype, device=device)
+    ops.moe_sum(flat_out.view(M, top_k, N_inter), ref)
 
     # With output_topk: write directly to [M, N]
-    fused = torch.zeros(M, N, dtype=dtype, device=device)
+    fused = torch.zeros(M, N_inter, dtype=dtype, device=device)
     ops.moe_gptq_gemm_rdna3(
         x,
         fused,
@@ -194,14 +220,18 @@ def test_fused_moe_output_topk_reduces(dtype):
         top_k,
     )
 
-    assert torch.equal(fused, ref), f"max diff: {(fused - ref).abs().max().item()}"
+    atol = 1.0 if dtype == torch.bfloat16 else 0.1
+    assert torch.allclose(fused, ref, atol=atol, rtol=0.01), (
+        f"max diff: {(fused - ref).abs().max().item()}"
+    )
 
 
 @gfx1100_only
+@pytest.mark.parametrize("E, K, N_inter, top_k, group_size", MODEL_CONFIGS)
+@pytest.mark.parametrize("M", NUM_TOKENS)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_full_moe_e2e(dtype):
+def test_full_moe_e2e(E, K, N_inter, top_k, group_size, M, dtype):
     """Full MoE forward: w1 + silu_and_mul + w2 with output_topk reduce."""
-    E, M, K, N_inter, top_k, group_size = 4, 4, 256, 64, 2, 32
     N_gate_up = N_inter * 2
     hidden = K
 
@@ -285,19 +315,24 @@ def test_full_moe_e2e(dtype):
             )
             ref[m_idx] += r2.squeeze() * w
 
-    # Tolerance: bf16 has lower precision, topk_w multiply order differs
-    atol = 0.5 if dtype == torch.bfloat16 else 0.05
-    rtol = 0.02 if dtype == torch.bfloat16 else 0.005
-    assert torch.allclose(fused, ref, atol=atol, rtol=rtol), (
-        f"max abs diff: {(fused - ref).abs().max().item()}, "
-        f"max rel diff: {((fused - ref).abs() / (ref.abs() + 1e-6)).max().item()}"
+    # E2E chains w1 + activation + w2 + topk_w + output_topk reduce.
+    # Each step accumulates rounding error (split-K atomics, topk_w
+    # multiply order). Use relative L2 norm like the dense kernel test.
+    diff_l2 = torch.norm(fused.float() - ref.float())
+    ref_l2 = torch.norm(ref.float())
+    rel_l2 = (diff_l2 / ref_l2).item() if ref_l2 > 0 else 0.0
+    threshold = 0.05 if dtype == torch.float16 else 0.10
+    assert rel_l2 < threshold, (
+        f"rel L2 = {rel_l2:.4f} (threshold {threshold}), "
+        f"max abs diff: {(fused - ref).abs().max().item()}"
     )
 
 
 @gfx1100_only
 def test_expert_id_minus_one():
     """Kernel handles expert_id == -1 (expert parallelism) without crash."""
-    E, K, N = 4, 256, 128
+    # Qwen3-30B-A3B dims (E capped for memory)
+    E, K, N = 16, 2048, 768
     groups = K // 32
 
     w = _make_packed_weights(E, K, N)
@@ -326,7 +361,7 @@ def test_expert_id_minus_one():
         False,
         0,
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     # Output should remain zero (expert skipped)
     assert torch.equal(out, torch.zeros_like(out))

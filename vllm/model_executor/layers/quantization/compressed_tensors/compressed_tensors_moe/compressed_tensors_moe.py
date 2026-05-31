@@ -107,12 +107,14 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
                         "WNA16MoE is not supported with actorder=group/dynamic."
                     )
 
-                # Try native ROCm HIP kernels (RDNA3, etc.)
-                from . import rocm_moe
+                # Native ROCm HIP kernels (RDNA3, etc.)
+                if current_platform.is_rocm():
+                    from . import rocm_moe
 
-                rocm = rocm_moe.try_make(weight_quant, input_quant, layer.moe_config)
-                if rocm is not None:
-                    return rocm
+                    if rocm_moe.is_supported(weight_quant):
+                        return rocm_moe.make_method(
+                            weight_quant, input_quant, layer.moe_config
+                        )
 
                 from .compressed_tensors_moe_wna16 import (
                     CompressedTensorsWNA16MoEMethod,
