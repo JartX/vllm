@@ -596,6 +596,23 @@ if (VLLM_GPU_LANG STREQUAL "HIP")
     "csrc/cuda_view.cu"
     "csrc/libtorch_stable/cuda_utils_kernels.cu"
   )
+  # RDNA3 INT8 per-token-head paged prefill attention (gfx1100)
+  list(APPEND VLLM_EXT_SRC
+    "csrc/attention/paged_prefill_attn_rdna3_v2_int8.cu"
+  )
+  # RDNA3 INT4 per-token-head paged prefill attention (gfx1100)
+  list(APPEND VLLM_EXT_SRC
+    "csrc/attention/paged_prefill_attn_rdna3_v2_int4.cu"
+  )
+  # RDNA3 INT4 fused reshape_and_cache (RHT + quantize + pack, gfx1100)
+  list(APPEND VLLM_EXT_SRC
+    "csrc/attention/reshape_cache_int4_rdna3.cu"
+  )
+  # RDNA3 INT4/INT8 HIP decode attention (split-KV, gfx1100)
+  list(APPEND VLLM_EXT_SRC
+    "csrc/attention/pth_decode_int4_rdna3.cu"
+    "csrc/attention/pth_decode_int8_rdna3.cu"
+  )
 # if ROCM endif
 endif()
 
