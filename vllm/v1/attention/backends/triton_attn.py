@@ -30,10 +30,7 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
 )
-from vllm.v1.attention.backends.utils import (
-    get_kv_cache_layout,
-    get_num_attention_heads_from_layers,
-)
+from vllm.v1.attention.backends.utils import get_kv_cache_layout
 from vllm.v1.attention.ops.triton_per_token_head_attention import (
     triton_per_token_head_attention,
     triton_per_token_head_prefill,
