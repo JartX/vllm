@@ -85,6 +85,8 @@ if TYPE_CHECKING:
     VLLM_MAIN_CUDA_VERSION: str = "13.0"
     VLLM_FLOAT32_MATMUL_PRECISION: Literal["highest", "high", "medium"] = "highest"
     VLLM_BATCH_INVARIANT: bool = False
+    VLLM_HOSTAR: bool = False
+    VLLM_HOSTAR_LIB: str = ""
     VLLM_TRITON_ATTN_USE_TD: bool | None = None
     MAX_JOBS: str | None = None
     NVCC_THREADS: str | None = None
@@ -603,6 +605,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # unset (default) lets the `triton_attn` backend auto-select per
     # platform (currently auto-enabled on XPU only); ``1`` forces TD on;
     # ``0`` forces TD off.  Useful for A/B benchmarking the TD path.
+    "VLLM_HOSTAR":
+    lambda: os.getenv("VLLM_HOSTAR", "0") == "1",
+    "VLLM_HOSTAR_LIB":
+    lambda: os.getenv("VLLM_HOSTAR_LIB", ""),
     "VLLM_TRITON_ATTN_USE_TD": lambda: {"1": True, "0": False}.get(
         os.getenv("VLLM_TRITON_ATTN_USE_TD", "").strip()
     ),
