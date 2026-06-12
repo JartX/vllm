@@ -349,12 +349,22 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 )
 
                 assert non_spec_query_start_loc_cpu is not None
-                chunk_indices = prepare_chunk_indices(
-                    non_spec_query_start_loc_cpu, FLA_CHUNK_SIZE
-                ).to(device=gpu_device, non_blocking=True)
-                chunk_offsets = prepare_chunk_offsets(
-                    non_spec_query_start_loc_cpu, FLA_CHUNK_SIZE
-                ).to(device=gpu_device, non_blocking=True)
+                # NOTE: pin the source CPU tensors so the non_blocking H2D copy
+                # is actually safe. With pageable (non-pinned) memory and a
+                # truly-async runtime (e.g. torch 2.10 on ROCm) the copy may not
+                # land before the consuming FLA chunk kernel reads it, so the
+                # kernel sees uninitialised GPU memory as chunk_offsets ->
+                # garbage `boh` -> OOB page fault. Same fix as MLA (#45074).
+                chunk_indices = (
+                    prepare_chunk_indices(non_spec_query_start_loc_cpu, FLA_CHUNK_SIZE)
+                    .pin_memory()
+                    .to(device=gpu_device, non_blocking=True)
+                )
+                chunk_offsets = (
+                    prepare_chunk_offsets(non_spec_query_start_loc_cpu, FLA_CHUNK_SIZE)
+                    .pin_memory()
+                    .to(device=gpu_device, non_blocking=True)
+                )
 
         if num_prefills > 0:
             has_initial_state = context_lens_tensor > 0

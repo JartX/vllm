@@ -40,6 +40,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     scale,
     N: tl.int64,  # num of sequences
     T: tl.int64,  # num of tokens
+    num_state_slots: tl.int64,  # rows in the SSM state cache (ht.shape[0])
     B: tl.constexpr,
     H: tl.constexpr,
     HV: tl.constexpr,
@@ -159,11 +160,16 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             final_state_idx = tl.load(
                 ssm_state_indices + i_n * stride_indices_seq + i_t
             ).to(tl.int64)
-            # Only store if state index is valid (not NULL_BLOCK_ID=0)
+            # Only store if state index is valid: not NULL_BLOCK_ID=0 (lower
+            # bound) AND within the allocated state cache (upper bound). The
+            # upper-bound check is a hard backstop: a stale/out-of-range slot
+            # index here would otherwise write hundreds of MB past `ht` and
+            # page-fault the GPU. Skipping is recoverable; an OOB write is not.
             if final_state_idx > 0:
-                p_ht = ht + final_state_idx * stride_final_state_token
-                p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
-                tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
+                if final_state_idx < num_state_slots:
+                    p_ht = ht + final_state_idx * stride_final_state_token
+                    p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
+                    tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
         else:
             p_ht = ht + (bos + i_t) * stride_final_state_token
             p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
@@ -258,6 +264,7 @@ def fused_sigmoid_gating_delta_rule_update(
         scale=scale,
         N=N,
         T=T,
+        num_state_slots=final_state.shape[0],
         B=B,
         H=H,
         HV=HV,

@@ -347,6 +347,55 @@ def chunk_gated_delta_rule_fwd_h(
             chunk_offsets = prepare_chunk_offsets(cu_seqlens, BT)
     assert K <= 256, "current kernel does not support head dimension larger than 256."
 
+    # --- GDN prefill OOB diagnostic (RDNA3 chunk_delta_h page-fault hunt) ---
+    # The kernel launches an N*H grid and, for program i_n, reads
+    # chunk_offsets[i_n] (-> boh) and cu_seqlens[i_n:i_n+2] (-> T), then writes
+    # chunks [boh .. boh+cdiv(T,BT)-1] into `h` (NT chunks). An OOB write at a
+    # high address can only happen if cu_seqlens / chunk_offsets / chunk_indices
+    # are mutually INCONSISTENT (e.g. the chunk metadata was built from a
+    # different query_start_loc than the one passed as cu_seqlens), or if the
+    # k/w/u token count T disagrees with cu_seqlens[-1]. These are FREE to check
+    # (shapes/len) and turn the silent GPU fault into a named Python error.
+    if cu_seqlens is not None:
+        if len(chunk_offsets) < N + 1:
+            raise RuntimeError(
+                "GDN chunk_delta_h OOB: len(chunk_offsets)="
+                f"{len(chunk_offsets)} < N+1={N + 1} "
+                f"(N=len(cu_seqlens)-1). NT=len(chunk_indices)={NT}, "
+                f"k.shape={tuple(k.shape)}, u.shape={tuple(u.shape)}, BT={BT}"
+            )
+        if B != 1:
+            raise RuntimeError(
+                f"GDN chunk_delta_h OOB: varlen expects B==1 but k.shape[0]={B}; "
+                f"k.shape={tuple(k.shape)}, cu_seqlens len={len(cu_seqlens)}"
+            )
+        import os
+
+        if os.environ.get("VLLM_GDN_DEBUG_OOB") == "1":
+            cs = cu_seqlens.detach().to("cpu").tolist()
+            co = chunk_offsets.detach().to("cpu").tolist()
+            problems = []
+            if cs[-1] != T:
+                problems.append(f"cu_seqlens[-1]={cs[-1]} != T(k.shape[1])={T}")
+            if any(cs[i + 1] < cs[i] for i in range(len(cs) - 1)):
+                problems.append("cu_seqlens not monotonic")
+            max_chunk = max(
+                (
+                    co[i] + triton.cdiv(cs[i + 1] - cs[i], BT)
+                    for i in range(min(N, len(cs) - 1))
+                ),
+                default=0,
+            )
+            if max_chunk > NT:
+                problems.append(f"max written chunk {max_chunk} > NT={NT}")
+            if problems:
+                raise RuntimeError(
+                    "GDN chunk_delta_h OOB: "
+                    + "; ".join(problems)
+                    + f" | N={N} NT={NT} BT={BT} k.shape={tuple(k.shape)} "
+                    f"u.shape={tuple(u.shape)} cu_seqlens={cs} chunk_offsets={co}"
+                )
+
     h = k.new_empty(B, NT, H, V, K)
     final_state = (
         k.new_empty(N, H, V, K, dtype=torch.float32) if output_final_state else None
