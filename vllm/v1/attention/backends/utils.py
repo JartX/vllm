@@ -849,10 +849,19 @@ def compute_causal_conv1d_metadata(
                     MAX_NUM_PROGRAMS
                 ).fill_(PAD_SLOT_ID)
 
-        batch_ptr[0:mlist_len].copy_(mlist, non_blocking=True)
+        # ROCm/HIP: blocking H2D. These program->sequence index buffers feed
+        # the causal_conv1d Triton kernel (idx_seq = tl.load(batch_ptr + pid)).
+        # A non_blocking copy may not land before the kernel reads it on a
+        # truly-async ROCm runtime -> garbage idx_seq -> OOB. Same race class as
+        # chunk_indices/chunk_offsets in gdn_attn.py. Microseconds for these
+        # tiny int32 tensors. CUDA keeps the async copy.
+        from vllm.platforms import current_platform
+
+        _nb = not current_platform.is_rocm()
+        batch_ptr[0:mlist_len].copy_(mlist, non_blocking=_nb)
         token_chunk_offset_ptr[  # type: ignore
             0:mlist_len
-        ].copy_(offsetlist, non_blocking=True)
+        ].copy_(offsetlist, non_blocking=_nb)
         nums_dict[BLOCK_M]["batch_ptr"] = batch_ptr
         nums_dict[BLOCK_M]["token_chunk_offset_ptr"] = token_chunk_offset_ptr  # type: ignore
 
