@@ -111,8 +111,13 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             state_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq + i_t).to(
                 tl.int64
             )
-            # Skip if state index is invalid (NULL_BLOCK_ID=0)
+            # Skip if state index is invalid: NULL_BLOCK_ID=0 (lower bound) or
+            # out of the allocated state cache (upper bound). Without the upper
+            # bound a stale/garbage index reads OOB from h0 (matching the
+            # unguarded write below) -> garbage state or page fault.
             if state_idx <= 0:
+                return
+            if state_idx >= num_state_slots:
                 return
             p_h0 = h0 + state_idx * stride_init_state_token
         else:
