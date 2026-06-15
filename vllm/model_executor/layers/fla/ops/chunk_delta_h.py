@@ -369,32 +369,25 @@ def chunk_gated_delta_rule_fwd_h(
                 f"GDN chunk_delta_h OOB: varlen expects B==1 but k.shape[0]={B}; "
                 f"k.shape={tuple(k.shape)}, cu_seqlens len={len(cu_seqlens)}"
             )
-        import os
-
-        if os.environ.get("VLLM_GDN_DEBUG_OOB") == "1":
+        # Value-level OOB check — ALWAYS ON (no env gate). Spawned workers do
+        # not inherit VLLM_GDN_DEBUG_OOB, so a gated check never runs in the
+        # worker that actually executes the kernel. Evaluated on-GPU with a
+        # single scalar sync on the happy path; the full tensor dump only
+        # happens when an inconsistency is detected.
+        _seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
+        _nt_local = (_seqlens + (BT - 1)) // BT
+        _max_chunk = (chunk_offsets[:N] + _nt_local[:N]).max()
+        _bad = (_max_chunk > NT) | (cu_seqlens[-1] != T) | (_seqlens < 0).any()
+        if bool(_bad.item()):
             cs = cu_seqlens.detach().to("cpu").tolist()
             co = chunk_offsets.detach().to("cpu").tolist()
-            problems = []
-            if cs[-1] != T:
-                problems.append(f"cu_seqlens[-1]={cs[-1]} != T(k.shape[1])={T}")
-            if any(cs[i + 1] < cs[i] for i in range(len(cs) - 1)):
-                problems.append("cu_seqlens not monotonic")
-            max_chunk = max(
-                (
-                    co[i] + triton.cdiv(cs[i + 1] - cs[i], BT)
-                    for i in range(min(N, len(cs) - 1))
-                ),
-                default=0,
+            raise RuntimeError(
+                "GDN chunk_delta_h OOB (deep): "
+                f"cu_seqlens[-1]={cs[-1]} vs T(k.shape[1])={T}; "
+                f"max_written_chunk={int(_max_chunk.item())} vs NT={NT}; "
+                f"N={N} BT={BT} k.shape={tuple(k.shape)} u.shape={tuple(u.shape)} "
+                f"cu_seqlens={cs} chunk_offsets={co}"
             )
-            if max_chunk > NT:
-                problems.append(f"max written chunk {max_chunk} > NT={NT}")
-            if problems:
-                raise RuntimeError(
-                    "GDN chunk_delta_h OOB: "
-                    + "; ".join(problems)
-                    + f" | N={N} NT={NT} BT={BT} k.shape={tuple(k.shape)} "
-                    f"u.shape={tuple(u.shape)} cu_seqlens={cs} chunk_offsets={co}"
-                )
 
     h = k.new_empty(B, NT, H, V, K)
     final_state = (

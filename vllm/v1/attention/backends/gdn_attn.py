@@ -8,6 +8,7 @@ from typing import Literal
 import torch
 
 from vllm.config import VllmConfig
+from vllm.platforms import current_platform
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -199,8 +200,12 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 spec_sequence_masks = None
                 spec_sequence_masks_cpu = None
             else:
+                # ROCm: blocking H2D (same cross-stream async race as the FLA
+                # chunk metadata; a non_blocking pageable copy may not land
+                # before the GPU-side spec/non-spec split reads it).
                 spec_sequence_masks = spec_sequence_masks_cpu.to(
-                    query_start_loc.device, non_blocking=True
+                    query_start_loc.device,
+                    non_blocking=not current_platform.is_rocm(),
                 )
 
         if spec_sequence_masks is None:
@@ -349,22 +354,28 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 )
 
                 assert non_spec_query_start_loc_cpu is not None
-                # NOTE: pin the source CPU tensors so the non_blocking H2D copy
-                # is actually safe. With pageable (non-pinned) memory and a
-                # truly-async runtime (e.g. torch 2.10 on ROCm) the copy may not
-                # land before the consuming FLA chunk kernel reads it, so the
-                # kernel sees uninitialised GPU memory as chunk_offsets ->
-                # garbage `boh` -> OOB page fault. Same fix as MLA (#45074).
-                chunk_indices = (
-                    prepare_chunk_indices(non_spec_query_start_loc_cpu, FLA_CHUNK_SIZE)
-                    .pin_memory()
-                    .to(device=gpu_device, non_blocking=True)
+                ci_cpu = prepare_chunk_indices(
+                    non_spec_query_start_loc_cpu, FLA_CHUNK_SIZE
                 )
-                chunk_offsets = (
-                    prepare_chunk_offsets(non_spec_query_start_loc_cpu, FLA_CHUNK_SIZE)
-                    .pin_memory()
-                    .to(device=gpu_device, non_blocking=True)
+                co_cpu = prepare_chunk_offsets(
+                    non_spec_query_start_loc_cpu, FLA_CHUNK_SIZE
                 )
+                if current_platform.is_rocm():
+                    # ROCm/HIP: blocking H2D. A non_blocking copy may not land
+                    # before the FLA chunk kernel reads it (garbage chunk_offsets
+                    # -> garbage `boh` -> OOB page fault), and pin_memory event
+                    # tracking is unreliable on HIP so it is not bulletproof.
+                    chunk_indices = ci_cpu.to(device=gpu_device)
+                    chunk_offsets = co_cpu.to(device=gpu_device)
+                else:
+                    # CUDA: pinned async copy (pin keeps the source alive until
+                    # the copy completes).
+                    chunk_indices = ci_cpu.pin_memory().to(
+                        device=gpu_device, non_blocking=True
+                    )
+                    chunk_offsets = co_cpu.pin_memory().to(
+                        device=gpu_device, non_blocking=True
+                    )
 
         if num_prefills > 0:
             has_initial_state = context_lens_tensor > 0
