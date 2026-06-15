@@ -287,10 +287,17 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
                         q_to_klen_cpu = (
                             cached_len_per_req[q_to_req_cpu.long()] + pos_in_req + 1
                         )
-                    self._q_to_req_buf[:total_q].copy_(q_to_req_cpu, non_blocking=True)
-                    self._q_to_klen_buf[:total_q].copy_(
-                        q_to_klen_cpu, non_blocking=True
-                    )
+                    # ROCm: blocking H2D. q_to_req/q_to_klen feed the RDNA3 HIP
+                    # decode kernel (pth_decode_int8_rdna3). On a truly-async
+                    # ROCm runtime a non_blocking copy that lands on the copy
+                    # stream after the kernel reads it on the compute stream
+                    # leaves a garbage kv_len -> multi-billion-iteration loop
+                    # (GPU hang -> 300s client timeout) or block_table OOB read
+                    # (page fault). A blocking copy is microseconds for these
+                    # tiny int32 maps; keep the async path on CUDA.
+                    _qnb = not current_platform.is_rocm()
+                    self._q_to_req_buf[:total_q].copy_(q_to_req_cpu, non_blocking=_qnb)
+                    self._q_to_klen_buf[:total_q].copy_(q_to_klen_cpu, non_blocking=_qnb)
         else:
             all_pure_first_prefill = False
 

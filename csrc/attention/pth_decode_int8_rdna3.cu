@@ -65,7 +65,15 @@ __global__ void decode_int8_stage1_v3(
   const int tid = threadIdx.x;  // 0..31
 
   const int req = q_to_req[qi];
-  const int kv_len = q_to_klen[qi];
+  // Defensive clamp on kv_len. A garbage value here (e.g. q_to_klen not yet
+  // landed from an async H2D copy, or a stale persistent buffer) would make the
+  // KV loop below run for billions of iterations (GPU hang -> 300s client
+  // timeout) or index block_table far out of bounds (page fault). Bound it to
+  // the allocated KV capacity; for a valid kv_len this is a no-op.
+  int kv_len = q_to_klen[qi];
+  const int max_kv = max_blocks * block_size;
+  if (kv_len < 0) kv_len = 0;
+  if (kv_len > max_kv) kv_len = max_kv;
   const int kvh = hi / (num_q_heads / num_kv_heads);
 
   const int tps = (kv_len + num_splits - 1) / num_splits;
