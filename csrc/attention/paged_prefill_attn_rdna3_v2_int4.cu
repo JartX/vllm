@@ -304,8 +304,12 @@ __device__ __forceinline__ void attn_step(
 
 // ---- Main kernel ----------------------------------------------------------
 
+// See the INT8 sibling: declaring the real HEAD_SIZE-thread bound lets the
+// compiler use up to 256 VGPRs instead of the 1024-default-conservative 192,
+// cutting the per-thread scratch spill (1088 B at HS=256) on long prefill.
 template <typename T, int HEAD_SIZE>
-__global__ void paged_prefill_attn_kernel_v2_int4(
+__global__ void __launch_bounds__(HEAD_SIZE)
+paged_prefill_attn_kernel_v2_int4(
     T* __restrict__ out, const T* __restrict__ q,
     const uint8_t* __restrict__ k_cache, const uint8_t* __restrict__ v_cache,
     const float* __restrict__ k_scale_cache,

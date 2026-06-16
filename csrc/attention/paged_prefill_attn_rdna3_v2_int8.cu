@@ -334,8 +334,14 @@ __device__ __forceinline__ void attn_step_wave_int8(
 // Main INT8 per-token-head kernel
 // ---------------------------------------------------------------------------
 
+// __launch_bounds__(HEAD_SIZE): the block launches exactly HEAD_SIZE threads
+// (THREADS = HEAD_SIZE). Without this the compiler assumes the 1024-thread
+// default and budgets VGPRs ultra-conservatively (capped at 192 -> ~600 B/
+// thread scratch spill at HS=256). Declaring the real 256-thread bound lets it
+// use up to 256 VGPRs, cutting the spill and ~1.27x on long-context prefill.
 template <typename T, int HEAD_SIZE>
-__global__ void paged_prefill_attn_kernel_v2_int8(
+__global__ void __launch_bounds__(HEAD_SIZE)
+paged_prefill_attn_kernel_v2_int8(
     T* __restrict__ out, const T* __restrict__ q,
     const T* __restrict__ k_chunk,            // current chunk K (fp16/bf16)
     const T* __restrict__ v_chunk,            // current chunk V (fp16/bf16)
