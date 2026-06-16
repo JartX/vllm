@@ -37,6 +37,9 @@ using vllm::prefill_attn_rdna3::v16bf16;
 using vllm::prefill_attn_rdna3::v16fp16;
 using vllm::prefill_attn_rdna3::v8fp32;
 using vllm::prefill_attn_rdna3::wmma_mma;
+using vllm::prefill_attn_rdna3::wmma_mma_ii8;
+using vllm::prefill_attn_rdna3::v16i8;
+using vllm::prefill_attn_rdna3::v8i32;
 using vllm::prefill_attn_rdna3::WmmaNative;
 
 constexpr int K_TILE = 16;
@@ -331,6 +334,136 @@ __device__ __forceinline__ void attn_step_wave_int8(
 }
 
 // ---------------------------------------------------------------------------
+// INT8-WMMA-QK path (Phase 1, the O(N^2) cached-prefix cost).
+//
+// Instead of dequantizing int8 K->fp16 and running fp16 WMMA, this loads K as
+// raw int8 into LDS (no dequant, half the LDS), quantizes Q to int8 per-row,
+// and runs Q.K^T through the native wmma_i32_16x16x16_iu8 (i32 accumulate),
+// dequantizing the score by qscale[row]*kscale[token]. P.V stays fp16 (V
+// dequant in loader). Measured ~1.5x over the dequant-fp16 path at long ctx on
+// gfx1100 (the int8 attention O(N^2) coefficient drops ~1.8x->~1.0x vs fp16
+// Triton). Q is quantized lane-locally (each lane holds its full row, no
+// cross-lane reduce); per-row qscale is broadcast via LDS.
+// ---------------------------------------------------------------------------
+
+// Load a K tile as raw int8 into LDS: 16 contiguous int8 per (d_chunk, k_idx).
+template <typename T, int HEAD_SIZE>
+__device__ __forceinline__ void load_k_tile_int8_raw(
+    int8_t* __restrict__ K_lds_i8, const int8_t* __restrict__ k_cache,
+    const float* __restrict__ k_scale_cache, const int* __restrict__ block_table,
+    int seq_idx, int kv_head_idx, int start_n, int seq_ctx_len, int block_size,
+    int max_blocks_per_seq, int64_t stride_kc_block, int64_t stride_kc_head,
+    int64_t stride_kc_slot, int64_t stride_ks_blk, int64_t stride_ks_slot,
+    int64_t stride_ks_head, float* __restrict__ scale_lds, int tid) {
+  constexpr int X_INT8 = 16;
+  constexpr int D_CHUNKS = HEAD_SIZE / X_INT8;
+  const int my_k_idx = tid / D_CHUNKS;
+  const int my_dh = tid % D_CHUNKS;
+  const int abs_k = start_n + my_k_idx;
+  const bool valid_k = abs_k < seq_ctx_len;
+  const int log_block = abs_k / block_size;
+  const int slot = abs_k - log_block * block_size;
+  const int p_block =
+      valid_k ? block_table[seq_idx * max_blocks_per_seq + log_block] : 0;
+  if (my_dh == 0) {
+    scale_lds[my_k_idx] =
+        valid_k ? k_scale_cache[p_block * stride_ks_blk + slot * stride_ks_slot +
+                                kv_head_idx * stride_ks_head]
+                : 0.0f;
+  }
+  const int d_base = my_dh * X_INT8;
+  const int8_t* src = k_cache + (int64_t)p_block * stride_kc_block +
+                      (int64_t)slot * stride_kc_slot +
+                      (int64_t)kv_head_idx * stride_kc_head + (int64_t)d_base;
+  int4 v;
+  if (valid_k) v = *(const int4*)src; else { v.x=v.y=v.z=v.w=0; }
+  *(int4*)&K_lds_i8[my_dh * (K_TILE * 16) + my_k_idx * 16] = v;
+}
+
+// Phase-1 attn step: int8 WMMA Q.K^T + dequant, then online softmax (with lazy
+// rescale) and fp16 P.V. Mirrors attn_step_wave_int8 after the QK section.
+template <typename T, int HEAD_SIZE, int X>
+__device__ __forceinline__ void attn_step_int8qk(
+    const int8_t* __restrict__ K_lds_i8, const T* __restrict__ V_lds,
+    T* __restrict__ P_lds_wave, const float* __restrict__ k_scale_lds,
+    const float* __restrict__ v_scale_lds, const float* __restrict__ qscale_lds,
+    v16i8 (&q_i8)[HEAD_SIZE / 16], v8fp32 (&out_acc)[HEAD_SIZE / 16],
+    float (&m_state)[8], float (&l_state)[8], int valid_q_count,
+    int valid_k_count, float sm_scale, int lane_lo, int lane_hi) {
+  using V16 = typename WmmaNative<T>::v16;
+  constexpr int FRAGS = HEAD_SIZE / 16;
+
+  // ---- Q @ K via int8 WMMA (i32 accumulate) ----
+  v8i32 s_i = {0, 0, 0, 0, 0, 0, 0, 0};
+  #pragma unroll
+  for (int dh = 0; dh < FRAGS; ++dh) {
+    v16i8 kf = *(const v16i8*)&K_lds_i8[dh * (K_TILE * 16) + lane_lo * 16];
+    s_i = wmma_mma_ii8(q_i8[dh], kf, s_i);
+  }
+
+  // ---- dequant: s = i32 * qscale[row] * kscale[token] * sm ----
+  const float k_sc = k_scale_lds[lane_lo];
+  const bool k_in = (lane_lo < valid_k_count);
+  float s_acc[8];
+  #pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const int m_row = 2 * i + lane_hi;
+    const bool m_in = (m_row < valid_q_count);
+    const float q_sc = qscale_lds[m_row];
+    s_acc[i] = (m_in && k_in) ? ((float)s_i[i] * sm_scale * k_sc * q_sc)
+                              : -INFINITY;
+  }
+
+  // ---- online softmax (lazy rescale of out_acc) ----
+  float m_ij[8], m_new[8], alpha[8], p_ij[8], l_ij[8];
+  #pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    m_ij[i] = wave16_max(s_acc[i]);
+    m_new[i] = fmaxf(m_state[i], m_ij[i]);
+    alpha[i] = (m_state[i] == -INFINITY) ? 0.0f : __expf(m_state[i] - m_new[i]);
+    p_ij[i] = (m_new[i] == -INFINITY) ? 0.0f : __expf(s_acc[i] - m_new[i]);
+    l_ij[i] = wave16_sum(p_ij[i]);
+    l_state[i] = l_state[i] * alpha[i] + l_ij[i];
+    m_state[i] = m_new[i];
+  }
+  // alpha == 1 (uniform across wave) for almost every tile once the global max
+  // is seen; skip the spill-touching out_acc rescale then. Divergence-free.
+  bool need_rescale = false;
+  #pragma unroll
+  for (int i = 0; i < 8; ++i) need_rescale |= (alpha[i] != 1.0f);
+  if (need_rescale) {
+    #pragma unroll
+    for (int dh = 0; dh < FRAGS; ++dh)
+      #pragma unroll
+      for (int i = 0; i < 8; ++i) out_acc[dh][i] *= alpha[i];
+  }
+
+  const float v_sc = v_scale_lds[lane_lo];
+  #pragma unroll
+  for (int i = 0; i < 8; ++i) p_ij[i] *= v_sc;
+
+  #pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const int m_row = 2 * i + lane_hi;
+    P_lds_wave[m_row * K_TILE + lane_lo] = to_T<T>(p_ij[i]);
+  }
+  V16 p_frag;
+  int4 p_lo = *(const int4*)&P_lds_wave[lane_lo * K_TILE + 0];
+  int4 p_hi = *(const int4*)&P_lds_wave[lane_lo * K_TILE + 8];
+  __builtin_memcpy(&p_frag, &p_lo, 16);
+  __builtin_memcpy(((char*)&p_frag) + 16, &p_hi, 16);
+  #pragma unroll
+  for (int dh = 0; dh < FRAGS; ++dh) {
+    V16 v_frag;
+    int4 v_lo = *(const int4*)&V_lds[(dh * 16 + lane_lo) * K_TILE + 0];
+    int4 v_hi = *(const int4*)&V_lds[(dh * 16 + lane_lo) * K_TILE + 8];
+    __builtin_memcpy(&v_frag, &v_lo, 16);
+    __builtin_memcpy(((char*)&v_frag) + 16, &v_hi, 16);
+    out_acc[dh] = wmma_mma(p_frag, v_frag, out_acc[dh]);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Main INT8 per-token-head kernel
 // ---------------------------------------------------------------------------
 
@@ -407,51 +540,70 @@ paged_prefill_attn_kernel_v2_int8(
   const int num_queries_per_kv = num_query_heads / num_kv_heads;
   const int kv_head_idx = head_idx / num_queries_per_kv;
 
-  // ---- Load Q (per-wave, same as fp16 v2) ----
-  V16 q_frags[FRAGS];
-  if (valid_q) {
-    const T* q_row = q + (int64_t)(q_start_token + my_q_pos) * stride_q_token +
-                     (int64_t)head_idx * stride_q_head;
-  #pragma unroll
-    for (int dh = 0; dh < FRAGS; ++dh) {
-      __builtin_memcpy(&q_frags[dh], q_row + dh * 16, sizeof(V16));
-    }
-  } else {
-  #pragma unroll
-    for (int dh = 0; dh < FRAGS; ++dh) {
-  #pragma unroll
-      for (int k = 0; k < 16; ++k) q_frags[dh][k] = (E)0;
-    }
-  }
+  // ---- Shared LDS ----
+  __shared__ int8_t K_lds_i8[FRAGS * K_TILE * 16];      // phase1 raw int8 K
+  __shared__ T K_lds_raw[FRAGS * 2 * K_TILE * X_FP16];  // phase2 fp16 chunk K
+  __shared__ T V_lds[HEAD_SIZE * K_TILE];
+  __shared__ T P_lds[NUM_WAVES][M_PER_WAVE * K_TILE];
+  __shared__ float k_scale_lds[K_TILE];
+  __shared__ float v_scale_lds[K_TILE];
+  __shared__ float qscale_lds[NUM_WAVES][M_PER_WAVE];  // per-row Q scale
+  T* P_lds_wave = &P_lds[wave_id][0];
 
   // Per-wave online-softmax state.
   float m_state[8], l_state[8];
   v8fp32 out_acc[FRAGS];
   #pragma unroll
-  for (int i = 0; i < 8; ++i) {
-    m_state[i] = -INFINITY;
-    l_state[i] = 0.0f;
-  }
+  for (int i = 0; i < 8; ++i) { m_state[i] = -INFINITY; l_state[i] = 0.0f; }
   #pragma unroll
-  for (int dh = 0; dh < FRAGS; ++dh) {
+  for (int dh = 0; dh < FRAGS; ++dh)
     out_acc[dh] = (v8fp32){0, 0, 0, 0, 0, 0, 0, 0};
+
+  // ---- Load Q (fp16/bf16, temp scope), quantize to int8 per row ----
+  // Each lane holds its whole query row, so the max is lane-local (no reduce).
+  // q_frags dies at the end of this scope; only q_i8 survives into phase 1,
+  // freeing VGPRs. Phase 2 reloads Q in fp16.
+  v16i8 q_i8[FRAGS];
+  {
+    V16 q_frags[FRAGS];
+    if (valid_q) {
+      const T* q_row = q + (int64_t)(q_start_token + my_q_pos) * stride_q_token +
+                       (int64_t)head_idx * stride_q_head;
+      #pragma unroll
+      for (int dh = 0; dh < FRAGS; ++dh)
+        __builtin_memcpy(&q_frags[dh], q_row + dh * 16, sizeof(V16));
+    } else {
+      #pragma unroll
+      for (int dh = 0; dh < FRAGS; ++dh)
+        #pragma unroll
+        for (int k = 0; k < 16; ++k) q_frags[dh][k] = (E)0;
+    }
+    float qmax = 1e-8f;
+    #pragma unroll
+    for (int dh = 0; dh < FRAGS; ++dh)
+      #pragma unroll
+      for (int k = 0; k < 16; ++k)
+        qmax = fmaxf(qmax, fabsf(to_f<T>((T)q_frags[dh][k])));
+    const float qinv = 127.0f / qmax;
+    #pragma unroll
+    for (int dh = 0; dh < FRAGS; ++dh)
+      #pragma unroll
+      for (int k = 0; k < 16; ++k) {
+        int v = (int)lrintf(to_f<T>((T)q_frags[dh][k]) * qinv);
+        v = max(-127, min(127, v));
+        q_i8[dh][k] = (int8_t)v;
+      }
+    if (lane_hi == 0) qscale_lds[wave_id][lane_lo] = qmax * (1.0f / 127.0f);
   }
+  __syncthreads();
 
-  // ---- Shared LDS ----
-  __shared__ T K_lds_raw[FRAGS * 2 * K_TILE * X_FP16];  // 4 KB
-  __shared__ T V_lds[HEAD_SIZE * K_TILE];               // 4 KB
-  __shared__ T P_lds[NUM_WAVES][M_PER_WAVE * K_TILE];
-  __shared__ float k_scale_lds[K_TILE];  // 64 B
-  __shared__ float v_scale_lds[K_TILE];  // 64 B
-  T* P_lds_wave = &P_lds[wave_id][0];
-
-  // ---- PHASE 1: Cached prefix (INT8 paged cache, no causal) ----
+  // ---- PHASE 1: Cached prefix (INT8 paged cache, int8 WMMA QK, no causal) ----
   for (int start_n = 0; start_n < ctx_len; start_n += K_TILE) {
-    load_k_tile_paged_int8_coop<T, HEAD_SIZE>(
-        K_lds_raw, k_cache, k_scale_cache, block_table, seq_idx, kv_head_idx,
+    load_k_tile_int8_raw<T, HEAD_SIZE>(
+        K_lds_i8, k_cache, k_scale_cache, block_table, seq_idx, kv_head_idx,
         start_n, ctx_len, block_size, max_blocks_per_seq, stride_kcache_block,
-        stride_kcache_head, stride_kcache_dhi, stride_kcache_slot,
-        stride_ks_blk, stride_ks_slot, stride_ks_head, k_scale_lds, tid);
+        stride_kcache_head, stride_kcache_slot, stride_ks_blk, stride_ks_slot,
+        stride_ks_head, k_scale_lds, tid);
     load_v_tile_paged_int8_coop<T, HEAD_SIZE>(
         V_lds, v_cache, v_scale_cache, block_table, seq_idx, kv_head_idx,
         start_n, ctx_len, block_size, max_blocks_per_seq, stride_vcache_block,
@@ -460,11 +612,10 @@ paged_prefill_attn_kernel_v2_int8(
     __syncthreads();
 
     const int valid_k_count = min(K_TILE, ctx_len - start_n);
-    attn_step_wave_int8<T, HEAD_SIZE, X_FP16, /*CAUSAL_MASK=*/false>(
-        K_lds_raw, V_lds, P_lds_wave, k_scale_lds, v_scale_lds, q_frags,
-        out_acc, m_state, l_state, wave_q_tile_start, start_n,
-        valid_q_count_for_wave, valid_k_count, sm_scale, lane, lane_lo,
-        lane_hi);
+    attn_step_int8qk<T, HEAD_SIZE, X_FP16>(
+        K_lds_i8, V_lds, P_lds_wave, k_scale_lds, v_scale_lds,
+        &qscale_lds[wave_id][0], q_i8, out_acc, m_state, l_state,
+        valid_q_count_for_wave, valid_k_count, sm_scale, lane_lo, lane_hi);
     __syncthreads();
   }
 
@@ -477,6 +628,21 @@ paged_prefill_attn_kernel_v2_int8(
   const int causal_k_upper =
       causal ? (q_tile_start + valid_q_count_for_block) : query_len;
   const int phase2_k_end = min(query_len, causal_k_upper);
+
+  // Reload Q in fp16 for phase 2 (it was only kept as int8 during phase 1).
+  V16 q_frags[FRAGS];
+  if (valid_q) {
+    const T* q_row = q + (int64_t)(q_start_token + my_q_pos) * stride_q_token +
+                     (int64_t)head_idx * stride_q_head;
+    #pragma unroll
+    for (int dh = 0; dh < FRAGS; ++dh)
+      __builtin_memcpy(&q_frags[dh], q_row + dh * 16, sizeof(V16));
+  } else {
+    #pragma unroll
+    for (int dh = 0; dh < FRAGS; ++dh)
+      #pragma unroll
+      for (int k = 0; k < 16; ++k) q_frags[dh][k] = (E)0;
+  }
 
   for (int start_n = 0; start_n < phase2_k_end; start_n += K_TILE) {
     // Phase 2 uses fp16 K/V from k_chunk/v_chunk (same as v2 kernel).
