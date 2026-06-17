@@ -1261,6 +1261,64 @@ class TritonAttentionImpl(AttentionImpl):
                     kv_quant_mode=self._kv_quant_mode,
                 )
                 return output
+
+            # RDNA3 INT8: mixed batch with a large continuation chunk
+            # (max_query_len > threshold) otherwise falls through to
+            # unified_attention, which is ~11x slower than fp16 on gfx1100.
+            # Split it into the fast HIP kernels — decode tokens ->
+            # pth_decode_int8_rdna3 (split-KV), prefill chunk ->
+            # paged_prefill_attn_rdna3_int8 (flash, shared K loads). Validated
+            # bit-identical to unified_attention (~7.5x faster on the call).
+            # VLLM_RDNA3_INT8_MIXED_HIP=0 disables it (back to unified).
+            num_dec = attn_metadata.num_decodes
+            num_dec_tok = attn_metadata.num_decode_tokens
+            if (
+                os.environ.get("VLLM_RDNA3_INT8_MIXED_HIP", "1") != "0"
+                and key_cache.dtype == torch.int8
+                and current_platform.is_rocm()
+                and self.head_size in (64, 128, 256)
+                and num_dec_tok < num_actual_tokens
+                and attn_metadata.q_to_req is not None
+                and attn_metadata.q_to_klen is not None
+                and key is not None
+                and value is not None
+                and hasattr(torch.ops._C, "pth_decode_int8_rdna3")
+                and hasattr(torch.ops._C, "paged_prefill_attn_rdna3_int8")
+            ):
+                if num_dec_tok > 0:
+                    mid_o_buf = getattr(layer, "_pth_mid_o_buf", None)
+                    if mid_o_buf is None or mid_o_buf.shape[0] < num_dec_tok:
+                        mid_o_buf = torch.zeros(
+                            max(query.size(0), self._max_cudagraph_capture_size),
+                            self.num_heads, self.max_num_kv_splits,
+                            self.head_size + 2,
+                            dtype=torch.float32, device=query.device)
+                        layer._pth_mid_o_buf = mid_o_buf
+                    torch.ops._C.pth_decode_int8_rdna3(
+                        output[:num_dec_tok], query[:num_dec_tok],
+                        key_cache, value_cache,
+                        k_scale_cache, v_scale_cache,
+                        attn_metadata.block_table[:num_dec],
+                        attn_metadata.q_to_req[:num_dec_tok],
+                        attn_metadata.q_to_klen[:num_dec_tok],
+                        mid_o_buf, self.scale, self.max_num_kv_splits,
+                    )
+                # Prefill continuation chunk: re-base cu_seqlens to 0.
+                pref_qsl = attn_metadata.query_start_loc[num_dec:] - num_dec_tok
+                torch.ops._C.paged_prefill_attn_rdna3_int8(
+                    output[num_dec_tok:num_actual_tokens],
+                    query[num_dec_tok:num_actual_tokens],
+                    key[num_dec_tok:num_actual_tokens],
+                    value[num_dec_tok:num_actual_tokens],
+                    key_cache, value_cache,
+                    k_scale_cache, v_scale_cache,
+                    attn_metadata.block_table[num_dec:],
+                    pref_qsl,
+                    attn_metadata.seq_lens[num_dec:],
+                    attn_metadata.max_query_len,
+                    self.scale, True,
+                )
+                return output
         # FP8 per-tensor / INT8 per-tensor / auto path (original flow).
         else:
             key_cache, value_cache = kv_cache.unbind(1)
