@@ -48,6 +48,7 @@ __global__ void decode_int8_stage1_v3(
     float* __restrict__ mid_o,
     float sm_scale,
     int num_q_heads, int num_kv_heads, int block_size, int max_blocks,
+    int num_reqs, int num_phys_blocks,
     int num_splits,
     int64_t sq0, int64_t sq1,
     int64_t skb, int64_t sks, int64_t skh,
@@ -64,13 +65,20 @@ __global__ void decode_int8_stage1_v3(
   const int si = blockIdx.z;
   const int tid = threadIdx.x;  // 0..31
 
-  const int req = q_to_req[qi];
-  // Defensive clamp on kv_len. A garbage value here (e.g. q_to_klen not yet
-  // landed from an async H2D copy, or a stale persistent buffer) would make the
-  // KV loop below run for billions of iterations (GPU hang -> 300s client
-  // timeout) or index block_table far out of bounds (page fault). Bound it to
-  // the allocated KV capacity; for a valid kv_len this is a no-op.
+  // Defensive validation of the per-query metadata. q_to_req / q_to_klen are
+  // built on the host and copied H2D; on ROCm an ill-ordered/not-yet-landed
+  // async copy (or a stale persistent buffer) can leave garbage here. Without
+  // guards a garbage req indexes block_table out of bounds (page fault) and a
+  // garbage kv_len makes the KV loop run for billions of iterations (the
+  // 0.1 tok/s / 30s hang -> 300s client timeout -> worker death). Bound both
+  // to the allocated capacity so garbage is harmless; for valid values these
+  // are no-ops. A request id out of range yields an empty (zeroed) output.
+  int req = q_to_req[qi];
   int kv_len = q_to_klen[qi];
+  if (req < 0 || req >= num_reqs) {
+    req = 0;
+    kv_len = 0;
+  }
   const int max_kv = max_blocks * block_size;
   if (kv_len < 0) kv_len = 0;
   if (kv_len > max_kv) kv_len = max_kv;
@@ -109,7 +117,14 @@ __global__ void decode_int8_stage1_v3(
   for (int kv = start; kv < end; ++kv) {
     const int lb = kv / block_size;
     const int slot = kv - lb * block_size;
-    if (lb != prev_lb) { pb = block_table[req * max_blocks + lb]; prev_lb = lb; }
+    if (lb != prev_lb) {
+      pb = block_table[req * max_blocks + lb];
+      // A garbage physical block id would index K_cache/V_cache out of bounds.
+      // Fall back to block 0 (always allocated) so the read stays in-bounds;
+      // under valid metadata this never triggers.
+      if (pb < 0 || pb >= num_phys_blocks) pb = 0;
+      prev_lb = lb;
+    }
 
     // Vectorized load: 2 dwords = 8 int8 values for K
     // (8 bytes per thread, loaded as two uint32)
@@ -226,6 +241,8 @@ void pth_decode_int8_rdna3(
   const int num_kv_heads = k_scale_cache.size(2);
   const int block_size = key_cache.size(1);
   const int max_blocks = block_table.size(1);
+  const int num_reqs = block_table.size(0);
+  const int num_phys_blocks = key_cache.size(0);
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
   TORCH_CHECK(head_size == 256,
@@ -255,7 +272,8 @@ void pth_decode_int8_rdna3(
       (const int*)q_to_klen.data_ptr(),                                        \
       (float*)mid_o_buf.data_ptr(),                                            \
       (float)sm_scale,                                                         \
-      num_q_heads, num_kv_heads, block_size, max_blocks, ns,                   \
+      num_q_heads, num_kv_heads, block_size, max_blocks,                       \
+      num_reqs, num_phys_blocks, ns,                                           \
       query.stride(0), query.stride(1),                                        \
       key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),           \
       value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),     \

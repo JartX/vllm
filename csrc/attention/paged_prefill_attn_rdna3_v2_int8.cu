@@ -525,7 +525,16 @@ paged_prefill_attn_kernel_v2_int8(
   const int q_end_token = cu_seqlens_q[seq_idx + 1];
   const int query_len = q_end_token - q_start_token;
   const int seq_len = seq_lens[seq_idx];
-  const int ctx_len = seq_len - query_len;
+  int ctx_len = seq_len - query_len;
+  // Defensive clamp on the cached-prefix length. ctx_len drives the phase-1
+  // loop and the paged block_table lookups; a garbage seq_len (e.g. an async
+  // H2D copy not yet landed on ROCm, or a stale persistent buffer) would make
+  // this loop run for billions of iterations and index block_table past
+  // max_blocks_per_seq (page fault). Bound it to the per-seq KV capacity; for a
+  // valid seq_len this is a no-op.
+  const int max_ctx = max_blocks_per_seq * block_size;
+  if (ctx_len < 0) ctx_len = 0;
+  if (ctx_len > max_ctx) ctx_len = max_ctx;
 
   const int q_tile_start = q_tile_idx * BLOCK_M;
   if (q_tile_start >= query_len) return;

@@ -106,6 +106,32 @@ class ConstantList(Generic[T], Sequence):
         return self._x.copy()
 
 
+_H2D_NON_BLOCKING: bool | None = None
+
+
+def _h2d_non_blocking() -> bool:
+    """Whether host->device metadata copies may be non-blocking.
+
+    On ROCm, a ``non_blocking=True`` H2D copy from pinned memory is issued on a
+    separate DMA/blit queue that is NOT ordered against the compute stream. The
+    per-step metadata buffers (``seq_lens``, ``block_table``, ``slot_mapping``,
+    ``query_start_loc``, ...) are persistent and reused every step; with the
+    pipelined batch queue (``step_with_batch_queue``) the copy for step N+1 can
+    land in such a buffer while step N's (slower, int8 per-token-head) attention
+    kernel is still reading it -> garbage ``seq_lens``/``block_table`` -> GPU
+    hang (0.1 tok/s) or out-of-bounds page fault. fp16 is fast enough to finish
+    its read before the copy lands, which is why only int8 crashes. Forcing the
+    copy blocking on ROCm keeps it on the compute stream (ordered); on CUDA the
+    async fast path is kept. Computed once and cached (this is on the hot path).
+    """
+    global _H2D_NON_BLOCKING
+    if _H2D_NON_BLOCKING is None:
+        from vllm.platforms import current_platform
+
+        _H2D_NON_BLOCKING = not current_platform.is_rocm()
+    return _H2D_NON_BLOCKING
+
+
 class CpuGpuBuffer:
     """Buffer to easily copy tensors between CPU and GPU."""
 
@@ -136,9 +162,10 @@ class CpuGpuBuffer:
             self.np = self.cpu.numpy()
 
     def copy_to_gpu(self, n: int | None = None) -> torch.Tensor:
+        nb = _h2d_non_blocking()
         if n is None:
-            return self.gpu.copy_(self.cpu, non_blocking=True)
-        return self.gpu[:n].copy_(self.cpu[:n], non_blocking=True)
+            return self.gpu.copy_(self.cpu, non_blocking=nb)
+        return self.gpu[:n].copy_(self.cpu[:n], non_blocking=nb)
 
     def copy_to_cpu(self, n: int | None = None) -> torch.Tensor:
         """NOTE: Because this method is non-blocking, explicit synchronization

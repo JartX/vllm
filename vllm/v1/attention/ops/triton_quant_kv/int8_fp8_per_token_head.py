@@ -69,6 +69,7 @@ def _reshape_cache_per_token_head_kernel(
     stride_vs_blk: tl.int64,
     stride_vs_slot: tl.int64,
     stride_vs_head: tl.int64,
+    num_slots,
     block_size: tl.constexpr,
     head_size: tl.constexpr,
     head_size_v: tl.constexpr,
@@ -93,7 +94,14 @@ def _reshape_cache_per_token_head_kernel(
     head = tl.program_id(1)
 
     slot = tl.load(slot_mapping_ptr + tok).to(tl.int64)
-    if slot < 0:
+    # Bound the slot to the allocated KV capacity. A garbage slot here — e.g.
+    # slot_mapping not yet landed from an async H2D copy, or a stale persistent
+    # buffer — would make ``blk = slot // block_size`` index the cache far out
+    # of bounds and issue an out-of-bounds WRITE (the historical RW:0x1 TCP
+    # page fault, int8-specific because fp16 uses a different write path). The
+    # ``slot < 0`` skip is the standard padding sentinel; the upper bound is
+    # the defensive clamp. For a valid slot both checks are no-ops.
+    if slot < 0 or slot >= num_slots:
         return
 
     blk = slot // block_size
@@ -179,7 +187,9 @@ def _run_reshape_and_cache(
 ) -> None:
     num_tokens, num_kv_heads, head_size = key.shape
     head_size_v = value.shape[2]
+    num_blocks = key_cache.shape[0]
     block_size = key_cache.shape[1]
+    num_slots = num_blocks * block_size
     head_size_padded = triton.next_power_of_2(max(head_size, head_size_v))
 
     if current_platform.is_rocm() or current_platform.is_xpu():
@@ -211,6 +221,7 @@ def _run_reshape_and_cache(
         stride_vs_blk=v_scale_cache.stride(0),
         stride_vs_slot=v_scale_cache.stride(1),
         stride_vs_head=v_scale_cache.stride(2),
+        num_slots=num_slots,
         block_size=block_size,
         head_size=head_size,
         head_size_v=head_size_v,

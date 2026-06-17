@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """High-Performance Triton-only Attention layer."""
 
+import os
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -990,9 +991,17 @@ class TritonAttentionImpl(AttentionImpl):
 
                 # RDNA3 HIP kernel for INT8 per-token-head prefill.
                 # Gate: int8 cache + RDNA3 + has the compiled op.
+                # Diagnostic kill-switch: VLLM_RDNA3_INT8_PREFILL_HIP=0 forces
+                # the Triton prefill path below instead of this HIP kernel,
+                # keeping the int8 cache. Use it to A/B-isolate whether a hang
+                # or fault originates in the HIP kernel vs shared metadata.
                 _head_size = query.shape[2]
+                _int8_prefill_hip = (
+                    os.environ.get("VLLM_RDNA3_INT8_PREFILL_HIP", "1") != "0"
+                )
                 if (
-                    use_qk_int8_wmma
+                    _int8_prefill_hip
+                    and use_qk_int8_wmma
                     and _head_size in (64, 128, 256)
                     and hasattr(torch.ops, "_C")
                     and hasattr(torch.ops._C, "paged_prefill_attn_rdna3_int8")

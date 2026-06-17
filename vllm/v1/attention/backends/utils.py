@@ -364,8 +364,16 @@ def make_local_attention_virtual_batches(
     # tensor first, which recovers perf.
     # Upload the index tensors to the block_table's device up-front so that the
     # fancy indexing below doesn't implicitly force a synchronous H2D copy.
-    batch_indices_torch = torch.from_numpy(batch_indices).to(device, non_blocking=True)
-    block_indices_torch = torch.from_numpy(block_indices).to(device, non_blocking=True)
+    # On ROCm these H2D copies are made blocking: a non_blocking copy can race
+    # the consuming kernel (cross-stream ordering is not guaranteed on HIP),
+    # and the custom int8 per-token-head attention kernels read this metadata
+    # directly on the GPU — a not-yet-landed copy yields garbage indices and an
+    # out-of-bounds access (page fault / hang). See the matching gate below.
+    from vllm.platforms import current_platform
+
+    _nb = not current_platform.is_rocm()
+    batch_indices_torch = torch.from_numpy(batch_indices).to(device, non_blocking=_nb)
+    block_indices_torch = torch.from_numpy(block_indices).to(device, non_blocking=_nb)
 
     # Save as a lambda so we can return this for update_block_table
     make_block_table = lambda block_table: block_table[
@@ -379,8 +387,8 @@ def make_local_attention_virtual_batches(
 
     return CommonAttentionMetadata(
         query_start_loc_cpu=query_start_loc_cpu,
-        query_start_loc=query_start_loc_cpu.to(device=device, non_blocking=True),
-        seq_lens=seq_lens_cpu.to(device=device, non_blocking=True),
+        query_start_loc=query_start_loc_cpu.to(device=device, non_blocking=_nb),
+        seq_lens=seq_lens_cpu.to(device=device, non_blocking=_nb),
         num_reqs=len(seq_lens_cpu),
         num_actual_tokens=common_attn_metadata.num_actual_tokens,
         max_query_len=seqlens_q_local.max(),
