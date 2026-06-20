@@ -956,4 +956,12 @@ def mamba_get_block_table_tensor(
             dtype=torch.int32,
         )
         indices_to_gather = (start_indices.unsqueeze(1) + offsets).to(torch.int64)
+        # Clamp to the valid block_table column range. ``start_indices`` is only
+        # clamped at the lower bound; a stale/edge-case ``seq_lens`` in a
+        # heterogeneous (mixed context-length) decode batch can drive
+        # ``start_index + offset`` past ``block_table.size(1)``, making this
+        # gather read out of bounds -> garbage block ids -> GPU page fault
+        # (RDNA3 int8/GDN crash). Graph-safe, no host sync; a no-op for valid
+        # lengths.
+        indices_to_gather = indices_to_gather.clamp_(max=block_table.size(1) - 1)
         return torch.gather(block_table, 1, indices_to_gather)
