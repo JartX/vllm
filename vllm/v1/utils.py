@@ -657,14 +657,21 @@ def copy_slice(
     from_tensor: torch.Tensor, to_tensor: torch.Tensor, length: int
 ) -> torch.Tensor:
     """
-    Copy the first length elements of a tensor into another tensor in a
-    non-blocking manner.
+    Copy the first length elements of a tensor into another tensor.
 
-    Used to copy pinned CPU tensor data to pre-allocated GPU tensors.
+    Used to copy pinned CPU tensor data to pre-allocated GPU tensors. The
+    target is a persistent buffer reused every step, so on ROCm the H2D copy
+    must be blocking (ordered on the compute stream) — a non_blocking copy runs
+    on a separate DMA queue and can land in the buffer while a prior step's
+    kernel is still reading it under async scheduling (step_with_batch_queue),
+    corrupting per-step metadata. See ``_h2d_non_blocking`` / the int8 KV cache
+    async metadata-copy race fix.
 
     Returns the sliced target tensor.
     """
-    return to_tensor[:length].copy_(from_tensor[:length], non_blocking=True)
+    return to_tensor[:length].copy_(
+        from_tensor[:length], non_blocking=_h2d_non_blocking()
+    )
 
 
 def report_usage_stats(

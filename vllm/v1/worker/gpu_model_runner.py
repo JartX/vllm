@@ -2082,7 +2082,7 @@ class GPUModelRunner(
             self.prev_positions.copy_to_gpu(num_reqs)
             self.prev_num_draft_tokens.copy_to_gpu()
             cpu_values = self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs].to(
-                device=self.device, non_blocking=True
+                device=self.device, non_blocking=not current_platform.is_rocm()
             )
             update_num_computed_tokens_for_batch_change(
                 self.num_computed_tokens,
@@ -2093,9 +2093,14 @@ class GPUModelRunner(
                 cpu_values,
             )
         else:
+            # ROCm: blocking H2D. num_computed_tokens is a persistent buffer that
+            # feeds positions -> slot_mapping and seq_lens; a non_blocking copy on
+            # ROCm can land mid-kernel under async scheduling (step_with_batch_queue)
+            # -> garbage slot/seq_len -> int8 KV GPU page fault. See the int8 KV
+            # async metadata-copy race fix (_h2d_non_blocking).
             self.num_computed_tokens[:num_reqs].copy_(
                 self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
-                non_blocking=True,
+                non_blocking=not current_platform.is_rocm(),
             )
 
         self.req_indices.np[:total_num_scheduled_tokens] = req_indices
