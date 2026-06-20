@@ -23,6 +23,32 @@ Memory access fault by GPU node-N ... on address 0x...  Reason: Page not present
 - Pure decode (`num_scheduled_tokens=1`), low KV usage (4–8 %, so **not** OOM).
 - `fp16` KV never crashes — int8 only enables the long-context regime that triggers it.
 
+## Is this an int8 bug? NO — int8 is a facilitator, not the cause
+
+The "INT8" in this file/repro name is the *config under which it was observed*,
+NOT the cause. The fix is in `mamba_get_block_table_tensor` (Mamba/GDN align
+block-table gather), which is **completely dtype-independent** — it never looks
+at the KV cache dtype. The out-of-bounds gather happens the same with int8 or
+fp16.
+
+Why fp16 "never crashes" then: int8 KV is half the bytes, so it fits ~2x the
+context / more concurrent long requests in the same VRAM. fp16 **OOMs/evicts
+before** reaching the long-context, heterogeneous-batch regime where the
+`seq_lens` vs `block_table` inconsistency surfaces. The bug exists for both
+dtypes; fp16 is only circumstantially safe (runs out of memory first), not
+immune.
+
+Consequences:
+- The int8 attention/store/decode kernels (`pth_decode_int8_rdna3`,
+  `reshape_and_cache` int8, `paged_prefill_attn_rdna3_int8`) are **EXONERATED**
+  — the whole "int8 fatal kernel" framing was a red herring.
+- This fix benefits **all** Mamba/hybrid models in align mode, any KV dtype,
+  CUDA included (where the same OOB is UB rather than a hard fault). Worth
+  upstreaming as a Mamba bug, not a ROCm/int8 one.
+- The correct one-line label for the bug is: *OOB in the Mamba align
+  block-table gather, reachable when context/batch is large enough — which int8
+  merely permits.*
+
 ## How to reproduce (reliable, ~20–25 requests)
 
 `tools/rdna3/repro_int8_gdn_pagefault.py`. The trigger is a decode batch of
