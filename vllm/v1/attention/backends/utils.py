@@ -17,7 +17,7 @@ from typing_extensions import runtime_checkable
 
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.utils.math_utils import cdiv
-from vllm.utils.torch_utils import async_tensor_h2d
+from vllm.utils.torch_utils import PIN_MEMORY, async_tensor_h2d, np_to_pinned_tensor
 from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 
 if TYPE_CHECKING:
@@ -364,16 +364,8 @@ def make_local_attention_virtual_batches(
     # tensor first, which recovers perf.
     # Upload the index tensors to the block_table's device up-front so that the
     # fancy indexing below doesn't implicitly force a synchronous H2D copy.
-    # On ROCm these H2D copies are made blocking: a non_blocking copy can race
-    # the consuming kernel (cross-stream ordering is not guaranteed on HIP),
-    # and the custom int8 per-token-head attention kernels read this metadata
-    # directly on the GPU — a not-yet-landed copy yields garbage indices and an
-    # out-of-bounds access (page fault / hang). See the matching gate below.
-    from vllm.platforms import current_platform
-
-    _nb = not current_platform.is_rocm()
-    batch_indices_torch = torch.from_numpy(batch_indices).to(device, non_blocking=_nb)
-    block_indices_torch = torch.from_numpy(block_indices).to(device, non_blocking=_nb)
+    batch_indices_torch = async_tensor_h2d(batch_indices, device=device)
+    block_indices_torch = async_tensor_h2d(block_indices, device=device)
 
     # Save as a lambda so we can return this for update_block_table
     make_block_table = lambda block_table: block_table[
@@ -387,8 +379,8 @@ def make_local_attention_virtual_batches(
 
     return CommonAttentionMetadata(
         query_start_loc_cpu=query_start_loc_cpu,
-        query_start_loc=query_start_loc_cpu.to(device=device, non_blocking=_nb),
-        seq_lens=seq_lens_cpu.to(device=device, non_blocking=_nb),
+        query_start_loc=async_tensor_h2d(query_start_loc_cpu, device=device),
+        seq_lens=async_tensor_h2d(seq_lens_cpu, device=device),
         num_reqs=len(seq_lens_cpu),
         num_actual_tokens=common_attn_metadata.num_actual_tokens,
         max_query_len=seqlens_q_local.max(),
@@ -816,14 +808,12 @@ def create_fast_prefill_custom_backend(
 
 
 def compute_causal_conv1d_metadata(
-    query_start_loc_p_cpu: torch.Tensor,
-    *,
-    device: torch.device,
-):
+    query_start_loc_p_cpu: torch.Tensor, *, device: torch.device
+) -> tuple[dict[int, dict[str, Any]], torch.Tensor, torch.Tensor]:
     # Needed for causal_conv1d. Use the CPU query_start_loc to avoid DtoH sync.
     assert query_start_loc_p_cpu.device.type == "cpu"
     seqlens = query_start_loc_p_cpu.diff()
-    nums_dict = {}  # type: ignore
+    nums_dict: dict[int, dict[str, Any]] = {}
     batch_ptr = None
     token_chunk_offset_ptr = None
     for BLOCK_M in [8]:  # cover all BLOCK_M values
@@ -831,7 +821,7 @@ def compute_causal_conv1d_metadata(
         nums_dict[BLOCK_M] = {}
         nums_dict[BLOCK_M]["nums"] = nums
         nums_dict[BLOCK_M]["tot"] = nums.sum().item()
-        mlist = torch.from_numpy(np.repeat(np.arange(len(nums)), nums))
+        mlist = np_to_pinned_tensor(np.repeat(np.arange(len(nums)), nums))
         nums_dict[BLOCK_M]["mlist"] = mlist
         mlist_len = len(nums_dict[BLOCK_M]["mlist"])
         nums_dict[BLOCK_M]["mlist_len"] = mlist_len
@@ -839,7 +829,7 @@ def compute_causal_conv1d_metadata(
         offsetlist = []  # type: ignore
         for idx, num in enumerate(nums):
             offsetlist.extend(range(num))
-        offsetlist = torch.tensor(offsetlist, dtype=torch.int32)
+        offsetlist = torch.tensor(offsetlist, dtype=torch.int32, pin_memory=PIN_MEMORY)
         nums_dict[BLOCK_M]["offsetlist"] = offsetlist
 
         if batch_ptr is None:
@@ -853,25 +843,25 @@ def compute_causal_conv1d_metadata(
         else:
             if batch_ptr.nelement() < MAX_NUM_PROGRAMS:
                 batch_ptr.resize_(MAX_NUM_PROGRAMS).fill_(PAD_SLOT_ID)
-                token_chunk_offset_ptr.resize_(  # type: ignore
-                    MAX_NUM_PROGRAMS
-                ).fill_(PAD_SLOT_ID)
+                assert token_chunk_offset_ptr is not None
+                token_chunk_offset_ptr.resize_(MAX_NUM_PROGRAMS).fill_(PAD_SLOT_ID)
 
         # ROCm/HIP: blocking H2D. These program->sequence index buffers feed
         # the causal_conv1d Triton kernel (idx_seq = tl.load(batch_ptr + pid)).
         # A non_blocking copy may not land before the kernel reads it on a
         # truly-async ROCm runtime -> garbage idx_seq -> OOB. Same race class as
         # chunk_indices/chunk_offsets in gdn_attn.py. Microseconds for these
-        # tiny int32 tensors. CUDA keeps the async copy.
+        # tiny int32 tensors. CUDA keeps the async copy. (#45424 generalizes the
+        # async_tensor_h2d paths but not this raw .copy_, so the ROCm gate stays.)
         from vllm.platforms import current_platform
 
         _nb = not current_platform.is_rocm()
+        assert batch_ptr is not None
         batch_ptr[0:mlist_len].copy_(mlist, non_blocking=_nb)
-        token_chunk_offset_ptr[  # type: ignore
-            0:mlist_len
-        ].copy_(offsetlist, non_blocking=_nb)
+        assert token_chunk_offset_ptr is not None
+        token_chunk_offset_ptr[0:mlist_len].copy_(offsetlist, non_blocking=_nb)
         nums_dict[BLOCK_M]["batch_ptr"] = batch_ptr
-        nums_dict[BLOCK_M]["token_chunk_offset_ptr"] = token_chunk_offset_ptr  # type: ignore
+        nums_dict[BLOCK_M]["token_chunk_offset_ptr"] = token_chunk_offset_ptr
 
     return nums_dict, batch_ptr, token_chunk_offset_ptr
 
