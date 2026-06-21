@@ -1044,7 +1044,11 @@ def triton_per_token_head_attention(
     # vector mul-reduce fallback for MHA models (kv_group < 2).
     use_packed_gqa = packing_factor > 1 and 2 <= kv_group <= 32
 
-    # Pre-allocated buffer reuse (TQ pattern: allocate once, slice by batch)
+    # Pre-allocated buffer reuse (TQ pattern: allocate once, slice by batch).
+    # Cache on buf_holder ONLY when there was no buffer yet; never REPLACE an
+    # existing (possibly CUDA-graph-captured) buffer with a bigger one -- the
+    # decode graph bakes in its pointer, so an oversized eager batch uses a
+    # transient buffer instead of clobbering the captured one.
     if mid_o_buf is not None and mid_o_buf.shape[0] >= total_q:
         mid_o = mid_o_buf[:total_q, :Hq, :NUM_KV_SPLITS, :]
     else:
@@ -1053,7 +1057,7 @@ def triton_per_token_head_attention(
             dtype=torch.float32,
             device=device,
         )
-        if buf_holder is not None:
+        if buf_holder is not None and mid_o_buf is None:
             buf_holder._pth_mid_o_buf = mid_o
 
     if output is not None:
@@ -1062,14 +1066,14 @@ def triton_per_token_head_attention(
         out = output_buf[:total_q, :Hq, :D]
     else:
         out = torch.empty((total_q, Hq, D), dtype=query.dtype, device=device)
-        if buf_holder is not None:
+        if buf_holder is not None and output_buf is None:
             buf_holder._pth_output_buf = out
 
     if lse_buf is not None and lse_buf.shape[0] >= total_q:
         lse = lse_buf[:total_q, :Hq]
     else:
         lse = torch.empty((total_q, Hq), dtype=torch.float32, device=device)
-        if buf_holder is not None:
+        if buf_holder is not None and lse_buf is None:
             buf_holder._pth_lse_buf = lse
 
     # Stage 1 — four dispatches, all write the same mid_o layout consumed

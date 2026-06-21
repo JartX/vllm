@@ -772,15 +772,30 @@ class TritonAttentionImpl(AttentionImpl):
         ):
             self._ensure_scale_caches(kv_cache)
             key_cache, value_cache = kv_cache.unbind(1)
+            # FIX (RDNA3 int8 mixed-batch page fault): the persistent buffer is
+            # allocated ONCE at the cudagraph capture size and NEVER reassigned.
+            # The decode CUDA graph bakes in this pointer at capture; the old code
+            # reallocated + reassigned _pth_mid_o_buf whenever query.size(0) grew
+            # past it (continuation-decode batches: max_query_len<=128 so a
+            # prefix-cache resume puts decodes + per-req chunks up to 128 tokens
+            # here, easily >8). That freed the capture-time buffer, and a later
+            # decode-graph replay then wrote split-KV partials into the freed
+            # (reused, read-only) pages -> the marching TCP-client WRITE page fault
+            # in dmesg (RW:1, PERMISSION_FAULTS, 66KB = mid_o head-stride). Larger
+            # (eager-only; captured sizes are <= capture size) batches use a
+            # transient buffer instead of clobbering the persistent one.
             mid_o_buf = getattr(layer, "_pth_mid_o_buf", None)
-            if mid_o_buf is None or mid_o_buf.shape[0] < query.size(0):
-                buf_size = max(query.size(0),
-                               self._max_cudagraph_capture_size)
+            if mid_o_buf is None:
                 mid_o_buf = torch.zeros(
-                    buf_size, self.num_heads,
+                    self._max_cudagraph_capture_size, self.num_heads,
                     self.max_num_kv_splits, self.head_size + 2,
                     dtype=torch.float32, device=query.device)
                 layer._pth_mid_o_buf = mid_o_buf
+            if mid_o_buf.shape[0] < query.size(0):
+                mid_o_buf = torch.zeros(
+                    query.size(0), self.num_heads,
+                    self.max_num_kv_splits, self.head_size + 2,
+                    dtype=torch.float32, device=query.device)
             # FIX (RDNA3 int8 decode use-after-free): under async scheduling the
             # caching allocator can free + REUSE a transient input's memory
             # before this async kernel reads it. Symptoms (both confirmed via
@@ -827,30 +842,37 @@ class TritonAttentionImpl(AttentionImpl):
         ):
             self._ensure_scale_caches(kv_cache)
             key_cache, value_cache = kv_cache.unbind(1)
+            # Capture-stable buffer (see the int8 fast-path fix above): allocate
+            # once at the cudagraph capture size and NEVER reassign -- the decode
+            # graph bakes in this pointer; a larger eager batch uses a transient.
             mid_o_buf = getattr(layer, "_pth_mid_o_buf", None)
-            if mid_o_buf is None or mid_o_buf.shape[0] < query.size(0):
-                buf_size = max(query.size(0),
-                               self._max_cudagraph_capture_size)
+            if mid_o_buf is None:
                 mid_o_buf = torch.zeros(
-                    buf_size, self.num_heads,
+                    self._max_cudagraph_capture_size, self.num_heads,
                     self.max_num_kv_splits, self.head_size + 2,
                     dtype=torch.float32, device=query.device)
                 layer._pth_mid_o_buf = mid_o_buf
+            if mid_o_buf.shape[0] < query.size(0):
+                mid_o_buf = torch.zeros(
+                    query.size(0), self.num_heads,
+                    self.max_num_kv_splits, self.head_size + 2,
+                    dtype=torch.float32, device=query.device)
             q_slice = query[:num_actual_tokens]
             o_slice = output[:num_actual_tokens]
             # HS=256 v2 kernel: Q pre-rotated externally, output post-rotated.
-            # Pre-allocate to max cudagraph capture size so the buffer address
-            # is stable across ALL captures — avoids pointer invalidation when
-            # captures [1, 2, 4] run sequentially.
+            # q_rot is likewise capture-stable: allocate once at capture size,
+            # never reassign (transient for larger eager batches).
             if self.head_size > 128:
                 q_rot = getattr(layer, "_pth_q_rot_buf", None)
-                if q_rot is None or q_rot.shape[0] < query.size(0):
-                    buf_size = max(query.size(0),
-                                   self._max_cudagraph_capture_size)
+                if q_rot is None:
                     q_rot = torch.empty(
-                        buf_size, self.num_heads, self.head_size,
-                        dtype=query.dtype, device=query.device)
+                        self._max_cudagraph_capture_size, self.num_heads,
+                        self.head_size, dtype=query.dtype, device=query.device)
                     layer._pth_q_rot_buf = q_rot
+                if q_rot.shape[0] < query.size(0):
+                    q_rot = torch.empty(
+                        query.size(0), self.num_heads, self.head_size,
+                        dtype=query.dtype, device=query.device)
                 q_rot[:num_actual_tokens].copy_(q_slice)
                 q_slice = q_rot[:num_actual_tokens]
                 torch.ops._C.rht_rotate_inplace_rdna3(
@@ -1244,23 +1266,37 @@ class TritonAttentionImpl(AttentionImpl):
                 # RDNA3 HIP decode kernel for INT4 — eliminates Triton
                 # dispatch overhead (~40 µs/call) with fused RHT.
                 if self._rdna3_int4_decode_ready:
+                    # Capture-stable buffers (see the int8 fast-path fix): allocate
+                    # once at the cudagraph capture size, NEVER reassign the
+                    # persistent one (the decode graph bakes in its pointer); a
+                    # larger eager batch uses a transient buffer.
                     mid_o_buf = getattr(layer, "_pth_mid_o_buf", None)
                     if mid_o_buf is None:
+                        mid_o_buf = torch.zeros(
+                            self._max_cudagraph_capture_size, self.num_heads,
+                            self.max_num_kv_splits, self.head_size + 2,
+                            dtype=torch.float32, device=query.device)
+                        layer._pth_mid_o_buf = mid_o_buf
+                    if mid_o_buf.shape[0] < query.size(0):
                         mid_o_buf = torch.zeros(
                             query.size(0), self.num_heads,
                             self.max_num_kv_splits, self.head_size + 2,
                             dtype=torch.float32, device=query.device)
-                        layer._pth_mid_o_buf = mid_o_buf
                     rht_signs = self._get_rht_signs(query.device)
                     q_slice = query[:num_actual_tokens]
                     o_slice = output[:num_actual_tokens]
                     if self.head_size > 128:
                         q_rot = getattr(layer, "_pth_q_rot_buf", None)
-                        if q_rot is None or q_rot.shape[0] < num_actual_tokens:
+                        if q_rot is None:
+                            q_rot = torch.empty(
+                                self._max_cudagraph_capture_size, self.num_heads,
+                                self.head_size,
+                                dtype=query.dtype, device=query.device)
+                            layer._pth_q_rot_buf = q_rot
+                        if q_rot.shape[0] < query.size(0):
                             q_rot = torch.empty(
                                 query.size(0), self.num_heads, self.head_size,
                                 dtype=query.dtype, device=query.device)
-                            layer._pth_q_rot_buf = q_rot
                         q_rot[:num_actual_tokens].copy_(q_slice)
                         q_slice = q_rot[:num_actual_tokens]
                         torch.ops._C.rht_rotate_inplace_rdna3(
@@ -1335,14 +1371,27 @@ class TritonAttentionImpl(AttentionImpl):
                 and hasattr(torch.ops._C, "paged_prefill_attn_rdna3_int8")
             ):
                 if num_dec_tok > 0:
-                    mid_o_buf = getattr(layer, "_pth_mid_o_buf", None)
+                    # FIX (RDNA3 int8 mixed-batch page fault): use a DEDICATED
+                    # buffer here, never layer._pth_mid_o_buf. That attr is the
+                    # pure-decode buffer whose pointer the decode CUDA graph bakes
+                    # in at capture. A mixed batch has query.size(0) = decode
+                    # tokens + a large prefill chunk, so the old shared code
+                    # reallocated + REASSIGNED _pth_mid_o_buf to a big tensor,
+                    # freeing the capture-time buffer. On a later decode-graph
+                    # replay the kernel then wrote split-KV partials into that
+                    # freed (reused, read-only) region -> the marching TCP-client
+                    # WRITE page fault seen in dmesg (RW:1, PERMISSION_FAULTS,
+                    # 66KB = mid_o head-stride). A separate buffer keeps the
+                    # decode graph's pointer stable. Size by num_dec_tok (the
+                    # actual decode rows the kernel writes), not query.size(0).
+                    mid_o_buf = getattr(layer, "_pth_mid_o_buf_mixed", None)
                     if mid_o_buf is None or mid_o_buf.shape[0] < num_dec_tok:
                         mid_o_buf = torch.zeros(
-                            max(query.size(0), self._max_cudagraph_capture_size),
+                            max(num_dec_tok, self._max_cudagraph_capture_size),
                             self.num_heads, self.max_num_kv_splits,
                             self.head_size + 2,
                             dtype=torch.float32, device=query.device)
-                        layer._pth_mid_o_buf = mid_o_buf
+                        layer._pth_mid_o_buf_mixed = mid_o_buf
                     torch.ops._C.pth_decode_int8_rdna3(
                         output[:num_dec_tok], query[:num_dec_tok],
                         key_cache, value_cache,
