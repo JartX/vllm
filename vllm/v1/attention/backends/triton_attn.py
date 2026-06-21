@@ -781,6 +781,25 @@ class TritonAttentionImpl(AttentionImpl):
                     self.max_num_kv_splits, self.head_size + 2,
                     dtype=torch.float32, device=query.device)
                 layer._pth_mid_o_buf = mid_o_buf
+            # FIX (RDNA3 int8 decode use-after-free): under async scheduling the
+            # caching allocator can free + REUSE a transient input's memory
+            # before this async kernel reads it. Symptoms (both confirmed via
+            # rocgdb / soak): a freed page -> GPU page fault ("Memory access
+            # fault, page not present"); a reused block -> the kernel reads
+            # another tensor's data as metadata -> garbage kv_len -> infinite KV
+            # loop -> GPU hang. record_stream tells the allocator these tensors
+            # are in use on the current stream, so their blocks are not freed/
+            # reused until the kernel completes. No copy, no extra memory.
+            # Confirmed by control: same loop with data_ptr() (no record_stream)
+            # hangs in ~20s; with record_stream it soaks 22min / 2000+ reqs.
+            _s = torch.cuda.current_stream()
+            for _t in (query, output, attn_metadata.block_table,
+                       attn_metadata.q_to_req, attn_metadata.q_to_klen,
+                       self._k_scale_cache, self._v_scale_cache, mid_o_buf):
+                try:
+                    _t.record_stream(_s)
+                except Exception:  # noqa: BLE001
+                    pass
             torch.ops._C.pth_decode_int8_rdna3(
                 output[:num_actual_tokens],
                 query[:num_actual_tokens],
