@@ -1,6 +1,6 @@
 ARG REMOTE_VLLM="0"
 ARG COMMON_WORKDIR=/app
-ARG BASE_IMAGE=rocm/vllm-dev:base_custom_rocm_7.2.1_torch_triton_0330_vllm018
+ARG BASE_IMAGE=rocm/vllm-dev:base_custom_base_rocm7.2.3_20260528
 
 ARG USE_SCCACHE
 ARG SCCACHE_DOWNLOAD_URL
@@ -79,7 +79,7 @@ WORKDIR ${COMMON_WORKDIR}
 FROM base AS build_rccl
 RUN wget "https://repo.radeon.com/rocm/apt/7.2/pool/main/r/rocm-llvm/rocm-llvm_22.0.0.26014.70200-43~22.04_amd64.deb" -O /tmp/llvm720.deb \
     && mkdir -p /tmp/llvm720 && dpkg -x /tmp/llvm720.deb /tmp/llvm720 \
-    && git clone --branch rocm-7.2.1 --depth 1 https://github.com/ROCm/rccl.git /tmp/rccl \
+    && git clone --branch rocm-7.2.3 --depth 1 https://github.com/ROCm/rccl.git /tmp/rccl \
     && cd /tmp/rccl \
     && CXX=/tmp/llvm720/opt/rocm-7.2.0/llvm/bin/amdclang++ \
        CC=/tmp/llvm720/opt/rocm-7.2.0/llvm/bin/amdclang \
@@ -363,7 +363,7 @@ COPY --from=build_rccl /tmp/rccl/build/release/librccl.so.1.0 /opt/rocm/lib/libr
 RUN rm -f /opt/rocm/lib/librccl.so.1 /opt/rocm/lib/librccl.so \
     && ln -sf librccl.so.1.0 /opt/rocm/lib/librccl.so.1 \
     && ln -sf librccl.so.1 /opt/rocm/lib/librccl.so \
-    && ln -sf /opt/rocm/lib/librccl.so.1.0 /opt/rocm-7.2.1/lib/librccl.so.1.0.70201 \
+    && ln -sf /opt/rocm/lib/librccl.so.1.0 /opt/rocm-7.2.3/lib/librccl.so.1.0.70203 \
     && ldconfig
 
 CMD ["/bin/bash"]
