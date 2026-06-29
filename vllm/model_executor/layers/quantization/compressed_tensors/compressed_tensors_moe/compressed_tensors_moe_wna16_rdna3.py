@@ -149,6 +149,72 @@ class CompressedTensorsWNA16RDNA3MoEMethod(CompressedTensorsWNA16MoEMethod):
         )
 
 
+# === Shared expert-LoRA on the RDNA3 MoE kernel ==============================
+# Optional: serve the trained 3D routed-expert LoRA on moe_gptq_gemm_rdna3 (no
+# triton). Gated by env RDNA3_EXPERT_LORA (expert_lora.pt); no-op when unset, so
+# base serving is unchanged. SHARED LoRA -> one delta for all experts (no
+# per-expert grouping): gate_up delta added to w1_out BEFORE the activation in
+# the ORIGINAL [token*top_k+k] layout; down delta added after the w2 GEMM
+# (weighted by topk + summed over top_k = the base combine). TP-sharded.
+_RDNA3_LORA = None
+
+
+def _rdna3_lora_table(device, dtype):
+    global _RDNA3_LORA
+    if _RDNA3_LORA is not None:
+        return _RDNA3_LORA
+    import os
+
+    path = os.environ.get("RDNA3_EXPERT_LORA")
+    if not path:
+        _RDNA3_LORA = {}
+        return _RDNA3_LORA
+    from vllm.distributed.parallel_state import (
+        get_tensor_model_parallel_rank,
+        get_tensor_model_parallel_world_size,
+    )
+
+    scale = float(os.environ.get("RDNA3_LORA_SCALE", "2.0"))
+    rk = get_tensor_model_parallel_rank()
+    wd = get_tensor_model_parallel_world_size()
+    sd = torch.load(path, map_location="cpu")
+    table = {}
+    for key, v in sd.items():  # key = "layer{i}"
+        i = int(key.replace("layer", ""))
+        a_gu = v["A_gu"][0]  # [r, H]   column-parallel input -> FULL
+        b_gu = v["B_gu"][0]  # [2I, r]  output sharded (gate half + up half)
+        a_dn = v["A_dn"][0]  # [r, I]   row-parallel input -> shard dim 1
+        b_dn = v["B_dn"][0]  # [H, r]   output -> FULL (partial, all-reduced)
+        inter = b_gu.shape[0] // 2
+        ish = inter // wd
+        b_gu = torch.cat(
+            [b_gu[:inter][rk * ish : (rk + 1) * ish],
+             b_gu[inter:][rk * ish : (rk + 1) * ish]],
+            dim=0,
+        )
+        ash = a_dn.shape[1] // wd
+        a_dn = a_dn[:, rk * ash : (rk + 1) * ash]
+        table[i] = (
+            a_gu.to(device, dtype), b_gu.to(device, dtype),
+            a_dn.to(device, dtype), b_dn.to(device, dtype), scale,
+        )
+    _RDNA3_LORA = table
+    return _RDNA3_LORA
+
+
+def _rdna3_lora_for(layer, device, dtype):
+    table = _rdna3_lora_table(device, dtype)
+    if not table:
+        return None
+    import re
+
+    m = re.search(r"layers\.(\d+)", getattr(layer, "layer_name", "") or "")
+    return table.get(int(m.group(1))) if m else None
+
+
+# =============================================================================
+
+
 def _rdna3_fused_moe(
     hidden_states: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -230,6 +296,17 @@ def _rdna3_fused_moe(
         apply_router_weight_on_input,
     )
 
+    # --- expert-LoRA gate_up delta (shared; before activation, original layout) ---
+    _jxl = _rdna3_lora_for(layer, device, dtype)
+    if _jxl is not None:
+        _a_gu, _b_gu, _a_dn, _b_dn, _scale = _jxl
+        _d_gu = _scale * (hidden_states @ _a_gu.t()) @ _b_gu.t()
+        _w1v = w1_out.view(num_tokens, top_k, N_gate_up)
+        if apply_router_weight_on_input:
+            _w1v.add_((_d_gu.unsqueeze(1) * topk_weights.unsqueeze(-1)).to(_w1v.dtype))
+        else:
+            _w1v.add_(_d_gu.unsqueeze(1).to(_w1v.dtype))
+
     # --- Activation (silu_and_mul etc.) ---
     apply_moe_activation(activation, act_out, w1_out)
 
@@ -258,4 +335,14 @@ def _rdna3_fused_moe(
         not apply_router_weight_on_input,
         output_topk=top_k,
     )
+
+    # --- expert-LoRA down delta (shared; after w2, with the topk combine) ---
+    if _jxl is not None:
+        _d_dn = (_scale * (act_out @ _a_dn.t()) @ _b_dn.t()).view(
+            num_tokens, top_k, hidden_size
+        )
+        if apply_router_weight_on_input:
+            out.add_(_d_dn.sum(dim=1).to(out.dtype))
+        else:
+            out.add_((_d_dn * topk_weights.unsqueeze(-1)).sum(dim=1).to(out.dtype))
     return out
