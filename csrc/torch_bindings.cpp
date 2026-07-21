@@ -2,7 +2,6 @@
 // cache.h, which is no longer included here after cache ops moved to
 // _C_stable_libtorch).
 #include <torch/all.h>
-#include "cuda_utils.h"
 #include "ops.h"
 #include "core/registration.h"
 #include <torch/library.h>
@@ -18,17 +17,10 @@
 // https://docs.google.com/document/d/1_W62p8WJOQQUzPsJYa7s701JXt0qf2OfLub2sbkHOaU/edit#heading=h.ptttacy8y1u9
 // https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/native/README.md#annotations
 
+// RDNA3 HIP kernels stay on the legacy _C extension (they use the full torch
+// API, not the stable ABI). get_cuda_view_from_cpu_tensor and the CUDA/CPU ops
+// migrated to the stable _C fragment in csrc/libtorch_stable/torch_bindings.cpp.
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
-  // vLLM custom ops
-
-#ifdef USE_ROCM
-  // TODO: Remove this once we upgrade to torch 2.11.
-  // ROCm still uses torch 2.10,
-  // So we still need to use unstable torch ABI for now.
-  ops.def("get_cuda_view_from_cpu_tensor(Tensor cpu_tensor) -> Tensor");
-  ops.impl("get_cuda_view_from_cpu_tensor", torch::kCPU,
-           &get_cuda_view_from_cpu_tensor);
-#endif
   // RDNA3 INT8 per-token-head paged prefill attention (gfx1100).
   ops.def(
       "paged_prefill_attn_rdna3_int8(Tensor! out, Tensor q, Tensor k_chunk, "
@@ -105,20 +97,6 @@ TORCH_LIBRARY_FRAGMENT(CONCAT(TORCH_EXTENSION_NAME, _custom_ar), custom_ar) {
   custom_ar.impl("qr_open_handles", torch::kCPU, &qr_open_handles);
 
   custom_ar.def("qr_max_size", &qr_max_size);
-}
-
-// TODO: Remove this once ROCm upgrade to torch 2.11.
-TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cuda_utils), cuda_utils) {
-  // Cuda utils
-  // Gets the specified device attribute.
-  cuda_utils.def("get_device_attribute(int attribute, int device_id) -> int");
-  cuda_utils.impl("get_device_attribute", &get_device_attribute);
-
-  // Gets the maximum shared memory per block device attribute.
-  cuda_utils.def(
-      "get_max_shared_memory_per_block_device_attribute(int device_id) -> int");
-  cuda_utils.impl("get_max_shared_memory_per_block_device_attribute",
-                  &get_max_shared_memory_per_block_device_attribute);
 }
 #endif
 

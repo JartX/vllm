@@ -34,6 +34,7 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.utils import (
     compute_mm_prefix_range_tensor,
     get_kv_cache_layout,
+    get_num_attention_heads_from_layers,
 )
 from vllm.v1.attention.ops.triton_per_token_head_attention import (
     triton_per_token_head_attention,
@@ -100,6 +101,8 @@ class TritonAttentionMetadata:
     prefix_scheduler_metadata: torch.Tensor | None = None
     mm_prefix_range: dict[int, list[tuple[int, int]]] | None = None
     mm_prefix_range_tensor: torch.Tensor | None = None
+    rswa_prefix_lens: torch.Tensor | None = None
+    rswa_window: int | None = None
 
     all_pure_first_prefill: bool = False
 
@@ -146,9 +149,10 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         self.block_size = kv_cache_spec.block_size
 
         model_config = vllm_config.model_config
-        self.num_heads_q = model_config.get_num_attention_heads(
-            vllm_config.parallel_config
-        )
+        # Compatible with models with non-uniform per-layer head counts.
+        self.num_heads_q = get_num_attention_heads_from_layers(
+            vllm_config, layer_names
+        ) or model_config.get_num_attention_heads(vllm_config.parallel_config)
         self.num_heads_kv = model_config.get_num_kv_heads(vllm_config.parallel_config)
         self.headdim = model_config.get_head_size()
 
@@ -205,6 +209,14 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             dtype=torch.float32,
             device=device,
         )
+        self.rswa_window = model_config.rswa_window
+        self.persistent_rswa_prefix_lens: torch.Tensor | None = None
+        if self.rswa_window is not None:
+            self.persistent_rswa_prefix_lens = torch.empty(
+                vllm_config.scheduler_config.max_num_seqs,
+                dtype=torch.int32,
+                device=device,
+            )
 
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
@@ -364,6 +376,17 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
                 mm_ranges, num_reqs, seq_lens.device
             )
 
+        rswa_prefix_lens = common_attn_metadata.rswa_prefix_lens
+        if self.rswa_window is not None and rswa_prefix_lens is not None:
+            assert self.persistent_rswa_prefix_lens is not None
+            rswa_prefix_lens = rswa_prefix_lens.to(
+                device=self.device, dtype=torch.int32, non_blocking=True
+            )
+            persistent_prefix_lens = self.persistent_rswa_prefix_lens[:num_reqs]
+            persistent_prefix_lens.copy_(rswa_prefix_lens[:num_reqs])
+            attn_metadata.rswa_prefix_lens = persistent_prefix_lens
+            attn_metadata.rswa_window = self.rswa_window
+
         return attn_metadata
 
 
@@ -407,6 +430,10 @@ class TritonAttentionBackend(AttentionBackend):
         return "TRITON_ATTN"
 
     @classmethod
+    def supports_sliding_window(cls) -> bool:
+        return True
+
+    @classmethod
     def supports_batch_invariance(cls) -> bool:
         return True
 
@@ -424,6 +451,8 @@ class TritonAttentionBackend(AttentionBackend):
     ) -> tuple[int, ...]:
         if block_size % 16 != 0:
             raise ValueError("Block size must be a multiple of 16.")
+        # Layout: (num_blocks, 2, block_size, num_kv_heads, hs). Per-token-head
+        # modes pad hs with an inline float32 scale (see _ensure_scale_caches).
         if kv_cache_uses_per_token_head_scales(cache_dtype_str):
             from vllm.utils.torch_utils import (
                 STR_DTYPE_TO_TORCH_DTYPE,
@@ -701,15 +730,15 @@ class TritonAttentionImpl(AttentionImpl):
         self._int4_scale = self.scale / head_size if _is_rdna3_int4 else 0.0
 
         # Enable tensor descriptors for Q/K/V load/store on platforms that
-        # benefit from HW 2D block reads (Intel Xe2/Xe3).  The dead branch
+        # benefit from HW 2D block reads (Intel XPU).  The dead branch
         # is eliminated at Triton compile time, so other platforms see
         # zero cost when TD is off.
         #
-        # ``VLLM_TRITON_ATTN_USE_TD`` is tri-state:
+        # ``VLLM_TRITON_USE_TD`` is tri-state:
         #   - unset (None): auto-select (TD on for XPU, off elsewhere),
         #   - ``1``: force TD on regardless of platform,
         #   - ``0``: force TD off regardless of platform (useful for A/B).
-        td_override = envs.VLLM_TRITON_ATTN_USE_TD
+        td_override = envs.VLLM_TRITON_USE_TD
         if td_override is None:
             self.use_td = current_platform.is_xpu()
         else:
@@ -1488,11 +1517,16 @@ class TritonAttentionImpl(AttentionImpl):
             sinks=self.sinks,
             output_scale=output_scale,
             mm_prefix_range=mm_prefix_range_tensor,
+            rswa_prefix_lens=attn_metadata.rswa_prefix_lens,
+            rswa_window=attn_metadata.rswa_window,
             kv_quant_mode=self._kv_quant_mode,
             k_scale_cache=k_scale_cache,
             v_scale_cache=v_scale_cache,
             chunk_lookback=self.chunk_lookback,
             use_td=self.use_td,
+            mm_prefix_clamp_sliding_window=getattr(
+                layer, "mm_prefix_clamp_sliding_window", False
+            ),
         )
 
         return output
@@ -1540,6 +1574,7 @@ class TritonAttentionImpl(AttentionImpl):
             softmax_scale=self.scale,
             sliding_window_q=self.sliding_window[0],
             sliding_window_k=self.sliding_window[1],
+            sinks=self.sinks,
         )
         return output
 
