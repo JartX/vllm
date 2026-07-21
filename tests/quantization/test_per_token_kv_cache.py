@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Tests for per-token-head KV cache quantization (INT8 and FP8).
+"""Tests for per-token-head KV cache quantization (INT4, INT8 and FP8).
 
 Covers:
 - Per-token-head Triton reshape-and-cache kernel
@@ -89,7 +89,8 @@ INT4_CONFIG = QuantConfig(
     quant_max=7.0,
     quant_min=-8.0,
     kv_quant_mode=KVQuantMode.INT4_PER_TOKEN_HEAD,
-    uses_trunc=False,  # INT4 uses round-to-nearest via rint
+    # Unused for int4 (handled by its own rint path); kept for the dataclass.
+    rounds_before_store=False,
 )
 INT2_CONFIG = QuantConfig(
     cache_dtype=torch.uint8,
@@ -97,7 +98,7 @@ INT2_CONFIG = QuantConfig(
     quant_max=3.0,
     quant_min=0.0,
     kv_quant_mode=KVQuantMode.INT2_PER_TOKEN_HEAD,
-    uses_trunc=False,  # Hadamard + Lloyd-Max
+    rounds_before_store=False,  # Hadamard + Lloyd-Max
 )
 QUANT_CONFIGS = [INT2_CONFIG, INT4_CONFIG, INT8_CONFIG, FP8_CONFIG]
 
@@ -570,6 +571,7 @@ def test_int8_per_token_head_raw_cache_matches_round_reference():
         k_scale_cache,
         v_scale_cache,
         slot_mapping,
+        kv_quant_mode=INT8_CONFIG.kv_quant_mode,
     )
 
     ref_k_quant, ref_k_scales = _quantize_per_token_head_ref(key, INT8_CONFIG)
@@ -711,7 +713,7 @@ def test_process_weights_sets_placeholder_scales(kv_cache_dtype: str):
 
 
 # ===========================================================================
-# 6. Triton unified_attention -- per-token-head scale cache (INT8 and FP8)
+# 6. Triton unified_attention -- per-token-head scale cache (INT4/INT8/FP8)
 # ===========================================================================
 @pytest.mark.parametrize(
     "seq_lens",
@@ -740,6 +742,8 @@ def test_triton_unified_attention_per_token_head_scale(
     device = "cuda"
 
     is_int2 = qcfg.kv_quant_mode == KVQuantMode.INT2_PER_TOKEN_HEAD
+    is_int4 = qcfg.kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD
+
     is_int4 = qcfg.kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD
 
     num_seqs = len(seq_lens)
@@ -888,7 +892,7 @@ def test_triton_unified_attention_per_token_head_scale(
         key_cache_deq = key_cache_q_full * k_scale_cache[:, :, :, None]
         value_cache_deq = value_cache_q_full * v_scale_cache[:, :, :, None]
 
-    if not is_int4 and not is_int2 and qcfg.uses_trunc:
+    if not is_int4 and not is_int2 and qcfg.rounds_before_store:
         key_cache_q = key_cache_q_full.to(qcfg.cache_dtype)
         value_cache_q = value_cache_q_full.to(qcfg.cache_dtype)
     elif not is_int4 and not is_int2:
@@ -991,7 +995,10 @@ def test_triton_unified_attention_per_token_head_scale(
     if is_int2:
         atol, rtol = 1.5, 1.5
     elif is_int4:
-        atol, rtol = 0.5, 0.5
+        # Hopper's attention reduction order can move a few BF16 elements by
+        # just over 1.0 after INT4 quantization.
+        atol = 1.1 if current_platform.is_device_capability_family(90) else 0.5
+        rtol = 0.5
     else:
         atol, rtol = 5e-2, 5e-2
     torch.testing.assert_close(output_q, output_ref, atol=atol, rtol=rtol)

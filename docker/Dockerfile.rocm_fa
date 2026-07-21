@@ -1,6 +1,6 @@
 ARG REMOTE_VLLM="0"
 ARG COMMON_WORKDIR=/app
-ARG BASE_IMAGE=rocm/vllm-dev:base_custom_base_rocm7.2.3_20260528
+ARG BASE_IMAGE=rocm/vllm-dev:base_custom_aiter_v0.1.16.post5_torch_d0c8b1f3_20260721_bk_11064
 
 ARG USE_SCCACHE
 ARG SCCACHE_DOWNLOAD_URL

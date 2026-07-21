@@ -328,7 +328,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         chunk_indices: torch.Tensor | None = None
         chunk_offsets: torch.Tensor | None = None
         if num_prefills > 0:
-            from vllm.model_executor.layers.fla.ops.utils import FLA_CHUNK_SIZE
+            from vllm.third_party.flash_linear_attention.ops.utils import (
+                FLA_CHUNK_SIZE,
+            )
 
             if self.gdn_prefill_backend == "cutedsl":
                 from vllm.model_executor.layers.mamba.ops.gdn_chunk_cutedsl import (
@@ -348,7 +350,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 # Only prefill batches use FLA chunk ops.
                 # Pre-compute on CPU and async-copy to GPU to avoid
                 # GPU→CPU sync (.tolist()) in prepare_chunk_indices.
-                from vllm.model_executor.layers.fla.ops.index import (
+                from vllm.third_party.flash_linear_attention.ops.index import (
                     prepare_chunk_indices,
                     prepare_chunk_offsets,
                 )
@@ -397,9 +399,10 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             f"num_decodes: {num_decodes}, num_spec_decodes: {num_spec_decodes}"
         )
 
-        # Prepare tensors for cudagraph
-        # Note: m.num_actual_tokens is already padded by the model runner for CUDAGraph
-        batch_size = m.num_actual_tokens
+        # Prepare per-request tensors for cudagraph. m.num_actual_tokens is
+        # token-padded for FULL graph replay, but the GDN state/query/accepted
+        # metadata below is indexed by request.
+        batch_size = m.num_reqs
 
         if (
             self.use_full_cuda_graph
