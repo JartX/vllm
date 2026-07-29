@@ -38,6 +38,47 @@ from vllm.scalar_type import scalar_types
 
 logger = init_logger(__name__)
 
+# --- routed-activation capture for functional-rank analysis (env-gated) ---
+# When VLLM_MOE_CAPTURE=1, records the hidden states + top-k ids the router sends
+# through a few target MoE layers, dumps them to /app/capture, then stops. Used
+# offline to measure the effective rank of each expert's ROUTED inputs (the
+# "functional" rank) vs the weight-space rank. Zero cost when unset.
+_CAPTURE_ON = bool(os.environ.get("VLLM_MOE_CAPTURE"))
+_CAP_TARGETS = {0, 23, 47}
+_CAP_MAX = int(os.environ.get("VLLM_MOE_CAPTURE_MAX", "16384"))
+_cap_order: dict = {}
+_cap_buf: dict = {}
+_cap_done: set = set()
+
+
+def _moe_capture(layer, hidden_states, topk_ids):
+    # skip vLLM's dummy profiling forward (zero inputs, fake sequential routing)
+    if hidden_states.numel() == 0 or float(hidden_states.abs().max()) < 1e-6:
+        return
+    lid = id(layer)
+    if lid not in _cap_order:
+        _cap_order[lid] = len(_cap_order)  # first-seen order == model depth
+    idx = _cap_order[lid]
+    if idx not in _CAP_TARGETS or idx in _cap_done:
+        return
+    d = _cap_buf.setdefault(idx, {"x": [], "tk": [], "n": 0})
+    take = min(hidden_states.shape[0], _CAP_MAX - d["n"])
+    if take <= 0:
+        return
+    d["x"].append(hidden_states[:take].detach().to(torch.float16).cpu())
+    d["tk"].append(topk_ids[:take].detach().cpu())
+    d["n"] += take
+    if d["n"] >= _CAP_MAX:
+        _cap_done.add(idx)
+        dev = torch.cuda.current_device()
+        os.makedirs("/app/capture", exist_ok=True)
+        torch.save(
+            {"x": torch.cat(d["x"]), "tk": torch.cat(d["tk"])},
+            f"/app/capture/layer_{idx}_r{dev}.pt",
+        )
+        print(f"[moe-capture] dumped layer {idx}: {d['n']} tokens (r{dev})",
+              flush=True)
+
 
 def _synthesize_qzeros(
     groups: int, out_features: int, device: torch.device
@@ -364,6 +405,111 @@ def _rdna3_lora_for(layer, device, dtype):
 # =============================================================================
 
 
+def _rdna3_moe_expert_major(
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    layer: RoutedExperts,
+    activation: MoEActivation,
+    apply_router_weight_on_input: bool,
+    ec,
+) -> torch.Tensor:
+    """Cold-expert offload prefill path, tiled expert-major.
+
+    The token-chunk path (see ``_rdna3_fused_moe``) reloads the cache once per
+    ``C//top_k`` tokens, so a long prompt reloads each expert ``O(tokens/C)``
+    times -> copies terabytes. Here the loop is inverted: gather the forward's
+    unique experts into groups of <= C, load each group ONCE, and GEMM every
+    token routed to it. Each unique expert is copied exactly once (``O(E)``).
+
+    Correctness across tiles rests on the fused w2 GEMM accumulating into ``out``
+    atomically (``output_topk``), so ``out`` is zeroed once and each tile adds
+    its experts' contribution. Only used when the shared expert-LoRA is inactive
+    (that delta needs the per-token top_k combine, kept on the token-chunk path).
+    """
+    num_tokens = hidden_states.shape[0]
+    top_k = topk_ids.shape[1]
+    total_tokens = num_tokens * top_k
+    dtype = hidden_states.dtype
+    device = hidden_states.device
+
+    w13_packed = ec.cache_tensor("w13_weight_packed")
+    w2_packed = ec.cache_tensor("w2_weight_packed")
+    w13_scale = ec.cache_tensor("w13_weight_scale")
+    w2_scale = ec.cache_tensor("w2_weight_scale")
+    w13_qzeros = layer.w13_qzeros
+    w2_qzeros = layer.w2_qzeros
+
+    N_gate_up = w13_packed.shape[2]
+    hidden_size = w2_packed.shape[2]
+    intermediate_size = N_gate_up // 2 if activation.is_gated else N_gate_up
+    block_size_m = 4
+
+    # scratch reused across tiles; sized to the full expansion (only in-tile
+    # pairs are written each tile, the rest stay skipped by moe_align)
+    if total_tokens <= layer.rdna3_w1_buf.shape[0]:
+        w1_out = layer.rdna3_w1_buf[:total_tokens]
+        act_out = layer.rdna3_act_buf[:total_tokens]
+    else:
+        w1_out = torch.zeros(total_tokens, N_gate_up, dtype=dtype, device=device)
+        act_out = torch.empty(
+            total_tokens, intermediate_size, dtype=dtype, device=device
+        )
+
+    topk_w_float = topk_weights.view(-1).float()
+    empty_tw = layer.rdna3_empty_tw
+    out = torch.zeros(num_tokens, hidden_size, dtype=dtype, device=device)
+
+    unique = torch.unique(topk_ids)
+    unique = unique[unique >= 0].tolist()
+    logger.info_once(
+        "[offload] expert-major prefill path active (C=%d, top_k=%d)",
+        ec.C,
+        top_k,
+    )
+    for i in range(0, len(unique), ec.C):
+        expert_map = ec.load_group(unique[i : i + ec.C])
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+            topk_ids,
+            block_size_m,
+            ec.E,
+            expert_map=expert_map,
+            ignore_invalid_experts=True,
+        )
+        w1_out.zero_()
+        ops.moe_gptq_gemm_rdna3(
+            hidden_states,
+            w1_out,
+            w13_packed,
+            w13_scale,
+            w13_qzeros,
+            topk_w_float if apply_router_weight_on_input else empty_tw,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            top_k,
+            block_size_m,
+            apply_router_weight_on_input,
+        )
+        apply_moe_activation(activation, act_out, w1_out)
+        ops.moe_gptq_gemm_rdna3(
+            act_out,
+            out,
+            w2_packed,
+            w2_scale,
+            w2_qzeros,
+            topk_w_float if not apply_router_weight_on_input else empty_tw,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            1,
+            block_size_m,
+            not apply_router_weight_on_input,
+            output_topk=top_k,
+        )
+    return out
+
+
 def _rdna3_fused_moe(
     hidden_states: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -385,12 +531,34 @@ def _rdna3_fused_moe(
     num_tokens = hidden_states.shape[0]
     top_k = topk_ids.shape[1]
 
+    if _CAPTURE_ON:
+        _moe_capture(layer, hidden_states, topk_ids)
+
     # --- cold-expert offload: chunk tokens so a step's working set <= C, then
     # gather the needed experts into cache slots and remap topk to slot space ---
     ec = getattr(layer, "expert_cache", None)
     if ec is not None:
         max_tok = max(1, ec.C // top_k)
         if num_tokens > max_tok:
+            # prefill: expert-major (each unique expert loaded once) unless the
+            # shared expert-LoRA is active, which needs the per-token top_k
+            # combine -> token-chunk (each chunk is a full per-token forward).
+            # Expert-major uses unique()/tolist() (host sync) and host-driven
+            # residency, so it is NOT cudagraph-capturable: under capture (or
+            # with LoRA) fall back to the capturable token-chunk path.
+            _lora = _rdna3_lora_for(
+                layer, hidden_states.device, hidden_states.dtype
+            )
+            if _lora is None and not torch.cuda.is_current_stream_capturing():
+                return _rdna3_moe_expert_major(
+                    hidden_states,
+                    topk_weights,
+                    topk_ids,
+                    layer,
+                    activation,
+                    apply_router_weight_on_input,
+                    ec,
+                )
             outs = [
                 _rdna3_fused_moe(
                     hidden_states[i : i + max_tok],
