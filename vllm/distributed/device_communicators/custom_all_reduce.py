@@ -209,7 +209,12 @@ class CustomAllreduce:
             yield
         finally:
             self._IS_CAPTURING = False
-            if not self.disabled and self._graph_registration:
+            if not self.disabled:
+                # Always required, even when the captured all reduces take the
+                # copy-into-the-init-buffer path: capture records every buffer
+                # the collective saw, and this call is what drains that list
+                # and patches the recorded pointers. Skipping it leaves them
+                # unresolved and the first graph replay faults.
                 self.register_graph_buffers()
 
     def register_graph_buffers(self):
