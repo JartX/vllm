@@ -70,6 +70,7 @@ class CustomAllreduce:
         are in the same node.
         """
         self._IS_CAPTURING = False
+        self._graph_registration = True
         self.disabled = True
 
         if not custom_ar:
@@ -188,6 +189,9 @@ class CustomAllreduce:
         self.rank = rank
         self.world_size = world_size
         self.fully_connected = fully_connected
+        self._graph_registration = (
+            current_platform.use_custom_allreduce_graph_registration()
+        )
         self._ptr = ops.init_custom_ar(
             self.meta_ptrs, self.rank_data, rank, self.fully_connected
         )
@@ -205,7 +209,7 @@ class CustomAllreduce:
             yield
         finally:
             self._IS_CAPTURING = False
-            if not self.disabled:
+            if not self.disabled and self._graph_registration:
                 self.register_graph_buffers()
 
     def register_graph_buffers(self):
@@ -268,7 +272,7 @@ class CustomAllreduce:
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
-                return self.all_reduce(input, registered=True)
+                return self.all_reduce(input, registered=self._graph_registration)
             else:
                 # If warm up, mimic the allocation pattern since custom
                 # allreduce is out-of-place.
