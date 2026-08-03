@@ -315,6 +315,32 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
                     self._q_to_klen_buf[:total_q].copy_(q_to_klen_cpu, non_blocking=_qnb)
         else:
             all_pure_first_prefill = False
+            # The scheduler did not materialize the CPU copy of seq_lens; the
+            # spec-decode verify step takes this branch. The per-query maps
+            # would then keep whatever the allocator left in the persistent
+            # buffers, and the metadata below hands those to the kernel either
+            # way -- whose own guards turn the garbage into kv_len 0, so
+            # attention silently returns zeros (corrupt text, drafts rejected).
+            # Derive the maps from the GPU tensors instead: same values, no D2H
+            # sync. searchsorted also covers cudagraph padding, whose queries
+            # fall past the last request and get kv_len 0.
+            if self._is_per_token_head and num_actual_tokens > 0:
+                dev = query_start_loc.device
+                idx = torch.arange(num_actual_tokens, dtype=torch.int32, device=dev)
+                qsl = query_start_loc.to(torch.int32)
+                q_lens = qsl[1:] - qsl[:-1]
+                req_ids = torch.searchsorted(qsl[1:], idx, right=True).to(torch.int32)
+                req_c = req_ids.clamp(max=num_reqs - 1).long()
+                klen = (
+                    seq_lens.to(torch.int32)[req_c]
+                    - q_lens[req_c]
+                    + (idx - qsl[:-1][req_c])
+                    + 1
+                )
+                self._q_to_req_buf[:num_actual_tokens].copy_(req_ids)
+                self._q_to_klen_buf[:num_actual_tokens].copy_(
+                    torch.where(req_ids < num_reqs, klen, torch.zeros_like(klen))
+                )
 
         if use_cascade:
             cu_prefix_query_lens = torch.tensor(
