@@ -276,7 +276,7 @@ class Attention(nn.Module, AttentionLayerBase):
         # in their checkpoint config. Honor it only when the user did not
         # explicitly pick a kv_cache_dtype; an explicit choice
         # (e.g. int8_per_token_head, bfloat16) must win. get_kv_cache_scheme_dtype
-        # maps the scheme to our extended per-token-head dtypes (int2/int4/int8/
+        # maps the scheme to our extended per-token-head dtypes (int4/int8/
         # fp8) as well as plain fp8.
         kv_cache_scheme = getattr(quant_config, "kv_cache_scheme", None)
         scheme_dtype = get_kv_cache_scheme_dtype(kv_cache_scheme)

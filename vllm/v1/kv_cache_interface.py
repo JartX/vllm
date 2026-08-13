@@ -44,9 +44,8 @@ class KVQuantMode(IntEnum):
     INT8_PER_TOKEN_HEAD = 2  # per-token-head dynamic scales for int8
     FP8_PER_TOKEN_HEAD = 3  # per-token-head dynamic scales for fp8
     INT4_PER_TOKEN_HEAD = 4  # packed 2×int4/byte, RHT + asymmetric zp
-    INT2_PER_TOKEN_HEAD = 5  # Hadamard + Lloyd-Max 4 centroids, 4×int2/byte
-    NVFP4 = 6  # packed fp4 data + fp8 block scales
-    TURBOQUANT = 7  # Hadamard-rotated Lloyd-Max quant, packed K+V per slot
+    NVFP4 = 5  # packed fp4 data + fp8 block scales
+    TURBOQUANT = 6  # Hadamard-rotated Lloyd-Max quant, packed K+V per slot
 
     @property
     def is_per_token_head(self) -> bool:
@@ -55,7 +54,6 @@ class KVQuantMode(IntEnum):
             KVQuantMode.INT8_PER_TOKEN_HEAD,
             KVQuantMode.FP8_PER_TOKEN_HEAD,
             KVQuantMode.INT4_PER_TOKEN_HEAD,
-            KVQuantMode.INT2_PER_TOKEN_HEAD,
         )
 
     @property
@@ -66,8 +64,6 @@ class KVQuantMode(IntEnum):
     @property
     def packing_factor(self) -> int:
         """Number of quantized values stored per cache byte (1 unless packed)."""
-        if self == KVQuantMode.INT2_PER_TOKEN_HEAD:
-            return 4
         if self == KVQuantMode.INT4_PER_TOKEN_HEAD:
             return 2
         return 1
@@ -89,8 +85,6 @@ class KVQuantMode(IntEnum):
 
 def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
     """Map a ``kv_cache_dtype`` string to a :class:`KVQuantMode`."""
-    if kv_cache_dtype == "int2_per_token_head":
-        return KVQuantMode.INT2_PER_TOKEN_HEAD
     if kv_cache_dtype == "int4_per_token_head":
         return KVQuantMode.INT4_PER_TOKEN_HEAD
     if kv_cache_dtype == "int8_per_token_head":
@@ -251,8 +245,6 @@ class AttentionSpec(KVCacheSpec):
             head_dim = nvfp4_kv_cache_full_dim(self.head_size)
         elif self.kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD:
             head_dim = self.head_size // 2
-        elif self.kv_quant_mode == KVQuantMode.INT2_PER_TOKEN_HEAD:
-            head_dim = self.head_size // 4
         else:
             head_dim = self.head_size
         return (
@@ -381,8 +373,6 @@ class FullAttentionSpec(AttentionSpec):
             ) + nvfp4_kv_cache_full_dim(self.head_size_v)
         elif self.kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD:
             last_dim = self.head_size // 2 + self.head_size_v // 2
-        elif self.kv_quant_mode == KVQuantMode.INT2_PER_TOKEN_HEAD:
-            last_dim = self.head_size // 4 + self.head_size_v // 4
         else:
             last_dim = self.head_size + self.head_size_v
         return (
@@ -456,8 +446,6 @@ class MLAAttentionSpec(FullAttentionSpec):
             return self.block_size * 656
         if self.kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD:
             head_dim = self.head_size // 2
-        elif self.kv_quant_mode == KVQuantMode.INT2_PER_TOKEN_HEAD:
-            head_dim = self.head_size // 4
         else:
             head_dim = self.head_size
         return (

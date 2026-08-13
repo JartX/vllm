@@ -6,7 +6,7 @@
 These are plain attention-loop helpers — mask building, ALiBi / QQ-bias
 score post-processing, online-softmax bookkeeping, tile-loop bounds,
 sequence lookup — extracted so the 2D and 3D paths of the unified
-kernel and the packed INT4 / INT2 kernel share a single implementation.
+kernel and the packed INT4 kernel share a single implementation.
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ def cast_kv_tile(data, Q, tensor_scale, KV_QUANT_MODE: tl.constexpr):
     - ``KV_QUANT_MODE == 1`` (FP8 per-tensor): dequantize using the
       tensor-wide scale.
 
-    Sub-byte packed modes (INT4 / INT2) are dispatched to their own
+    The sub-byte packed INT4 mode is dispatched to its own
     factories in :mod:`vllm.v1.attention.ops.triton_quant_kv` and never
     reach the common kernel that uses this helper.
     """
