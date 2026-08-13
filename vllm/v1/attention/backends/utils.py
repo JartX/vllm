@@ -951,20 +951,10 @@ def compute_causal_conv1d_metadata(
                 assert token_chunk_offset_ptr is not None
                 token_chunk_offset_ptr.resize_(MAX_NUM_PROGRAMS).fill_(PAD_SLOT_ID)
 
-        # ROCm/HIP: blocking H2D. These program->sequence index buffers feed
-        # the causal_conv1d Triton kernel (idx_seq = tl.load(batch_ptr + pid)).
-        # A non_blocking copy may not land before the kernel reads it on a
-        # truly-async ROCm runtime -> garbage idx_seq -> OOB. Same race class as
-        # chunk_indices/chunk_offsets in gdn_attn.py. Microseconds for these
-        # tiny int32 tensors. CUDA keeps the async copy. (#45424 generalizes the
-        # async_tensor_h2d paths but not this raw .copy_, so the ROCm gate stays.)
-        from vllm.platforms import current_platform
-
-        _nb = not current_platform.is_rocm()
         assert batch_ptr is not None
-        batch_ptr[0:mlist_len].copy_(mlist, non_blocking=_nb)
+        batch_ptr[0:mlist_len].copy_(mlist, non_blocking=True)
         assert token_chunk_offset_ptr is not None
-        token_chunk_offset_ptr[0:mlist_len].copy_(offsetlist, non_blocking=_nb)
+        token_chunk_offset_ptr[0:mlist_len].copy_(offsetlist, non_blocking=True)
         nums_dict[BLOCK_M]["batch_ptr"] = batch_ptr
         nums_dict[BLOCK_M]["token_chunk_offset_ptr"] = token_chunk_offset_ptr
 

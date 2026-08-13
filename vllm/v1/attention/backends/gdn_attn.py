@@ -8,7 +8,6 @@ from typing import Literal
 import torch
 
 from vllm.config import VllmConfig
-from vllm.platforms import current_platform
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -197,17 +196,15 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         )
 
         assert prefill_query_start_loc_cpu is not None
-        ci_cpu = prepare_chunk_indices(prefill_query_start_loc_cpu, FLA_CHUNK_SIZE)
-        co_cpu = prepare_chunk_offsets(prefill_query_start_loc_cpu, FLA_CHUNK_SIZE)
-        if current_platform.is_rocm():
-            # ROCm/HIP: blocking H2D. A non_blocking copy may not land before the
-            # FLA chunk kernel reads it (garbage chunk_offsets -> garbage `boh`
-            # -> OOB page fault), and pin_memory event tracking is unreliable on
-            # HIP so it is not bulletproof.
-            return ci_cpu.to(device=device), co_cpu.to(device=device)
         return (
-            async_tensor_h2d(ci_cpu, device=device),
-            async_tensor_h2d(co_cpu, device=device),
+            async_tensor_h2d(
+                prepare_chunk_indices(prefill_query_start_loc_cpu, FLA_CHUNK_SIZE),
+                device=device,
+            ),
+            async_tensor_h2d(
+                prepare_chunk_offsets(prefill_query_start_loc_cpu, FLA_CHUNK_SIZE),
+                device=device,
+            ),
         )
 
     def build(  # type: ignore[override]
@@ -248,12 +245,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 spec_sequence_masks = None
                 spec_sequence_masks_cpu = None
             else:
-                # ROCm: blocking H2D (same cross-stream async race as the FLA
-                # chunk metadata; a non_blocking pageable copy may not land
-                # before the GPU-side spec/non-spec split reads it).
-                spec_sequence_masks = spec_sequence_masks_cpu.to(
-                    query_start_loc.device,
-                    non_blocking=not current_platform.is_rocm(),
+                spec_sequence_masks = async_tensor_h2d(
+                    spec_sequence_masks_cpu, device=query_start_loc.device
                 )
 
         if spec_sequence_masks is None:
@@ -444,45 +437,39 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         ):
             assert spec_sequence_masks is not None
             self.spec_state_indices_tensor[:num_spec_decodes].copy_(
-                spec_state_indices_tensor,
-                non_blocking=not current_platform.is_rocm(),
+                spec_state_indices_tensor, non_blocking=True
             )
             spec_state_indices_tensor = self.spec_state_indices_tensor[:batch_size]
             spec_state_indices_tensor[num_spec_decodes:].fill_(NULL_BLOCK_ID)
 
             self.spec_sequence_masks[:num_spec_decodes].copy_(
-                spec_sequence_masks[:num_spec_decodes],
-                non_blocking=not current_platform.is_rocm(),
+                spec_sequence_masks[:num_spec_decodes], non_blocking=True
             )
             spec_sequence_masks = self.spec_sequence_masks[:batch_size]
             spec_sequence_masks[num_spec_decodes:].fill_(False)
 
             assert non_spec_token_indx is not None and spec_token_indx is not None
             self.non_spec_token_indx[: non_spec_token_indx.size(0)].copy_(
-                non_spec_token_indx,
-                non_blocking=not current_platform.is_rocm(),
+                non_spec_token_indx, non_blocking=True
             )
             non_spec_token_indx = self.non_spec_token_indx[
                 : non_spec_token_indx.size(0)
             ]
 
             self.spec_token_indx[: spec_token_indx.size(0)].copy_(
-                spec_token_indx,
-                non_blocking=not current_platform.is_rocm(),
+                spec_token_indx, non_blocking=True
             )
             spec_token_indx = self.spec_token_indx[: spec_token_indx.size(0)]
 
             self.spec_query_start_loc[: num_spec_decodes + 1].copy_(
-                spec_query_start_loc,
-                non_blocking=not current_platform.is_rocm(),
+                spec_query_start_loc, non_blocking=True
             )
             spec_num_query_tokens = spec_query_start_loc[-1]  # type: ignore[index]
             spec_query_start_loc = self.spec_query_start_loc[: batch_size + 1]
             spec_query_start_loc[num_spec_decodes + 1 :].fill_(spec_num_query_tokens)
 
             self.num_accepted_tokens[:num_spec_decodes].copy_(
-                num_accepted_tokens,
-                non_blocking=not current_platform.is_rocm(),
+                num_accepted_tokens, non_blocking=True
             )
             num_accepted_tokens = self.num_accepted_tokens[:batch_size]
             num_accepted_tokens[num_spec_decodes:].fill_(1)
@@ -493,15 +480,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             and num_spec_decodes == 0
             and num_decodes <= self.decode_cudagraph_max_bs
         ):
-            # ROCm: blocking H2D into this persistent cudagraph buffer. A
-            # non_blocking copy runs on ROCm's unordered DMA queue and can land
-            # while the replayed GDN kernels of a prior step still read it
-            # (async scheduling widens the window) -> garbage state slot index
-            # feeding the SSM/conv state writes -> GPU page fault. Mirrors the
-            # int8 KV async metadata-copy race fix (gdn_attn.py:208, :363).
             self.non_spec_state_indices_tensor[:num_decodes].copy_(
-                non_spec_state_indices_tensor,
-                non_blocking=not current_platform.is_rocm(),
+                non_spec_state_indices_tensor, non_blocking=True
             )
             non_spec_state_indices_tensor = self.non_spec_state_indices_tensor[
                 :batch_size
@@ -509,8 +489,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             non_spec_state_indices_tensor[num_decodes:].fill_(NULL_BLOCK_ID)
 
             self.non_spec_query_start_loc[: num_decodes + 1].copy_(
-                non_spec_query_start_loc,
-                non_blocking=not current_platform.is_rocm(),
+                non_spec_query_start_loc, non_blocking=True
             )
             non_spec_num_query_tokens = non_spec_query_start_loc[-1]  # type: ignore[index]
             non_spec_query_start_loc = self.non_spec_query_start_loc[: batch_size + 1]
