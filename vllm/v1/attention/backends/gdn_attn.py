@@ -9,6 +9,7 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.platforms import current_platform
+from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -21,7 +22,7 @@ from vllm.v1.attention.backends.utils import (
     mamba_get_block_table_tensor,
     split_decodes_and_prefills,
 )
-from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec
+from vllm.v1.kv_cache_interface import MambaSpec
 
 
 class GDNAttentionBackend(AttentionBackend):
@@ -80,18 +81,18 @@ class GDNAttentionMetadata:
 
 
 class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]):
+    kv_cache_spec: MambaSpec
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
 
     reorder_batch_threshold: int = 1
 
     def __init__(
         self,
-        kv_cache_spec: AttentionSpec,
+        kv_cache_spec: MambaSpec,
         layer_names: list[str],
         vllm_config: VllmConfig,
         device: torch.device,
     ):
-        assert isinstance(kv_cache_spec, MambaSpec)
         self.vllm_config = vllm_config
         self.compilation_config = vllm_config.compilation_config
         self.speculative_config = vllm_config.speculative_config
@@ -165,6 +166,50 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             device=device,
         )
 
+    def _build_chunk_metadata(
+        self,
+        prefill_query_start_loc: torch.Tensor,
+        prefill_query_start_loc_cpu: torch.Tensor,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        from vllm.third_party.flash_linear_attention.ops.utils import FLA_CHUNK_SIZE
+
+        if self.gdn_prefill_backend == "cutedsl":
+            from vllm.model_executor.layers.mamba.ops.gdn_chunk_cutedsl import (
+                prepare_metadata_cutedsl,
+            )
+
+            assert prefill_query_start_loc is not None
+            assert prefill_query_start_loc_cpu is not None
+            total_tokens = int(prefill_query_start_loc_cpu[-1].item())
+            return prepare_metadata_cutedsl(
+                prefill_query_start_loc,
+                total_tokens,
+                FLA_CHUNK_SIZE,
+            )
+
+        # Only prefill batches use FLA chunk ops.
+        # Pre-compute on CPU and async-copy to GPU to avoid
+        # GPU→CPU sync (.tolist()) in prepare_chunk_indices.
+        from vllm.third_party.flash_linear_attention.ops.index import (
+            prepare_chunk_indices,
+            prepare_chunk_offsets,
+        )
+
+        assert prefill_query_start_loc_cpu is not None
+        ci_cpu = prepare_chunk_indices(prefill_query_start_loc_cpu, FLA_CHUNK_SIZE)
+        co_cpu = prepare_chunk_offsets(prefill_query_start_loc_cpu, FLA_CHUNK_SIZE)
+        if current_platform.is_rocm():
+            # ROCm/HIP: blocking H2D. A non_blocking copy may not land before the
+            # FLA chunk kernel reads it (garbage chunk_offsets -> garbage `boh`
+            # -> OOB page fault), and pin_memory event tracking is unreliable on
+            # HIP so it is not bulletproof.
+            return ci_cpu.to(device=device), co_cpu.to(device=device)
+        return (
+            async_tensor_h2d(ci_cpu, device=device),
+            async_tensor_h2d(co_cpu, device=device),
+        )
+
     def build(  # type: ignore[override]
         self,
         common_prefix_len: int,
@@ -177,7 +222,6 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
 
         query_start_loc = m.query_start_loc
         query_start_loc_cpu = m.query_start_loc_cpu
-        context_lens_tensor = m.compute_num_computed_tokens()
         nums_dict, batch_ptr, token_chunk_offset_ptr = None, None, None
         block_table_tensor = mamba_get_block_table_tensor(
             m.block_table_tensor,
@@ -335,10 +379,6 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         prefill_state_indices: torch.Tensor | None = None
         prefill_has_initial_state: torch.Tensor | None = None
         if num_prefills > 0:
-            from vllm.third_party.flash_linear_attention.ops.utils import (
-                FLA_CHUNK_SIZE,
-            )
-
             # In a mixed non-spec batch, decodes are peeled off to the recurrent
             # kernel (decode-first front slice), so build chunk metadata from the
             # rebased prefill-only cu_seqlens; otherwise use the full non-spec one.
@@ -359,54 +399,14 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 prefill_query_start_loc_cpu = non_spec_query_start_loc_cpu
                 prefill_state_indices = non_spec_state_indices_tensor
 
-            if self.gdn_prefill_backend == "cutedsl":
-                from vllm.model_executor.layers.mamba.ops.gdn_chunk_cutedsl import (
-                    prepare_metadata_cutedsl,
-                )
-
-                assert prefill_query_start_loc is not None
-                assert prefill_query_start_loc_cpu is not None
-                total_tokens = int(prefill_query_start_loc_cpu[-1].item())
-                chunk_indices, chunk_offsets = prepare_metadata_cutedsl(
-                    prefill_query_start_loc,
-                    total_tokens,
-                    FLA_CHUNK_SIZE,
-                )
-            else:
-                gpu_device = query_start_loc.device
-                # Only prefill batches use FLA chunk ops.
-                # Pre-compute on CPU and async-copy to GPU to avoid
-                # GPU→CPU sync (.tolist()) in prepare_chunk_indices.
-                from vllm.third_party.flash_linear_attention.ops.index import (
-                    prepare_chunk_indices,
-                    prepare_chunk_offsets,
-                )
-
-                assert prefill_query_start_loc_cpu is not None
-                ci_cpu = prepare_chunk_indices(
-                    prefill_query_start_loc_cpu, FLA_CHUNK_SIZE
-                )
-                co_cpu = prepare_chunk_offsets(
-                    prefill_query_start_loc_cpu, FLA_CHUNK_SIZE
-                )
-                if current_platform.is_rocm():
-                    # ROCm/HIP: blocking H2D. A non_blocking copy may not land
-                    # before the FLA chunk kernel reads it (garbage chunk_offsets
-                    # -> garbage `boh` -> OOB page fault), and pin_memory event
-                    # tracking is unreliable on HIP so it is not bulletproof.
-                    chunk_indices = ci_cpu.to(device=gpu_device)
-                    chunk_offsets = co_cpu.to(device=gpu_device)
-                else:
-                    # CUDA: pinned async copy (pin keeps the source alive until
-                    # the copy completes).
-                    chunk_indices = ci_cpu.pin_memory().to(
-                        device=gpu_device, non_blocking=True
-                    )
-                    chunk_offsets = co_cpu.pin_memory().to(
-                        device=gpu_device, non_blocking=True
-                    )
+            chunk_indices, chunk_offsets = self._build_chunk_metadata(
+                prefill_query_start_loc,
+                prefill_query_start_loc_cpu,
+                query_start_loc.device,
+            )
 
         if num_prefills > 0:
+            context_lens_tensor = m.compute_num_computed_tokens()
             has_initial_state = context_lens_tensor > 0
             if spec_sequence_masks_cpu is not None:
                 has_initial_state = has_initial_state[~spec_sequence_masks_cpu]
