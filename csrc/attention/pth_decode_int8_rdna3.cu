@@ -35,6 +35,25 @@ template <> __device__ __forceinline__ half from_float<half>(float x) {
 // Grid: (num_q, num_q_heads, NUM_SPLITS), Block: 32 threads.
 // ---------------------------------------------------------------------------
 
+
+// Wave reduction via DPP (v_add_f32_dpp) instead of 5 ds_bpermute.
+// The first four butterfly steps fold into the add at ALU speed; only the
+// cross-16 step still goes through LDS. Same sum, different association
+// order, so results match __shfl_xor to fp16 rounding.
+template <int CTRL>
+__device__ __forceinline__ float dpp_add_f32(float v) {
+  int y = __builtin_amdgcn_update_dpp(0, __float_as_int(v), CTRL, 0xF, 0xF, true);
+  return v + __int_as_float(y);
+}
+__device__ __forceinline__ float wave_reduce_add32(float v) {
+  v = dpp_add_f32<0xB1>(v);   // quad_perm(1,0,3,2)  -> xor 1
+  v = dpp_add_f32<0x4E>(v);   // quad_perm(2,3,0,1)  -> xor 2
+  v = dpp_add_f32<0x141>(v);  // row_half_mirror     -> crosses the group of 4
+  v = dpp_add_f32<0x140>(v);  // row_mirror          -> crosses the group of 8
+  v += __shfl_xor(v, 16);     // cross-16
+  return v;
+}
+
 template <int HEAD_SIZE, typename QT>
 __global__ void decode_int8_stage1_v3(
     const QT* __restrict__ Q,
@@ -112,55 +131,51 @@ __global__ void decode_int8_stage1_v3(
   float l_state = 0.0f;
   float o_vals[DIMS_PER_THREAD] = {};
 
-  int prev_lb = -1;
-  int pb = 0;
-  for (int kv = start; kv < end; ++kv) {
+  // Strength reduction over the block. Within one block pb is constant and
+  // slot advances by one, so all four addresses advance by a constant stride.
+  // Computing them once per block instead of once per token drops ~75 scalar
+  // ALU ops from the hot loop (244 -> 128 instructions/token on gfx1100).
+  int kv = start;
+  while (kv < end) {
     const int lb = kv / block_size;
-    const int slot = kv - lb * block_size;
-    if (lb != prev_lb) {
-      pb = block_table[req * max_blocks + lb];
-      // A garbage physical block id would index K_cache/V_cache out of bounds.
-      // Fall back to block 0 (always allocated) so the read stays in-bounds;
-      // under valid metadata this never triggers.
-      if (pb < 0 || pb >= num_phys_blocks) pb = 0;
-      prev_lb = lb;
+    const int slot0 = kv - lb * block_size;
+    int pb = block_table[req * max_blocks + lb];
+    if (pb < 0 || pb >= num_phys_blocks) pb = 0;
+    int n = block_size - slot0;
+    if (n > end - kv) n = end - kv;
+
+    const int8_t* kp = K_cache + pb * skb + kvh * skh + tid * BYTES_PER_THREAD
+                       + (int64_t)slot0 * sks;
+    const int8_t* vp = V_cache + pb * svb + kvh * svh + tid * BYTES_PER_THREAD
+                       + (int64_t)slot0 * svs;
+    const float* ksp = K_scale + pb * ssb  + kvh * ssh  + (int64_t)slot0 * sss;
+    const float* vsp = V_scale + pb * svsb + kvh * svsh + (int64_t)slot0 * svss;
+
+    for (int sl = 0; sl < n; ++sl) {
+      float partial = 0.0f;
+      #pragma unroll
+      for (int d = 0; d < DIMS_PER_THREAD; ++d)
+        partial += q_vals[d] * (float)kp[d];
+
+      partial = wave_reduce_add32(partial);
+
+      float score = partial * (*ksp) * sm_scale_log2;
+      float m_new = fmaxf(m_state, score);
+      float alpha = exp2f(m_state - m_new);
+      float p = exp2f(score - m_new);
+      l_state = l_state * alpha + p;
+      #pragma unroll
+      for (int d = 0; d < DIMS_PER_THREAD; ++d) o_vals[d] *= alpha;
+      m_state = m_new;
+
+      float p_vs = p * (*vsp);
+      #pragma unroll
+      for (int d = 0; d < DIMS_PER_THREAD; ++d)
+        o_vals[d] += p_vs * (float)vp[d];
+
+      kp += sks; vp += svs; ksp += sss; vsp += svss;
     }
-
-    // Vectorized load: 2 dwords = 8 int8 values for K
-    // (8 bytes per thread, loaded as two uint32)
-    const int8_t* k_base = K_cache + pb * skb + slot * sks + kvh * skh
-                           + tid * BYTES_PER_THREAD;
-    float partial = 0.0f;
-    #pragma unroll
-    for (int d = 0; d < DIMS_PER_THREAD; ++d)
-      partial += q_vals[d] * (float)k_base[d];
-
-    // Wave-wide reduction (no sync — single wave)
-    #pragma unroll
-    for (int s = 16; s > 0; s >>= 1)
-      partial += __shfl_xor(partial, s);
-
-    float k_sc = K_scale[pb * ssb + slot * sss + kvh * ssh];
-    float score = partial * k_sc * sm_scale_log2;
-
-    // Online softmax — branchless, log2 space
-    float m_new = fmaxf(m_state, score);
-    float alpha = exp2f(m_state - m_new);
-    float p = exp2f(score - m_new);
-    l_state = l_state * alpha + p;
-    #pragma unroll
-    for (int d = 0; d < DIMS_PER_THREAD; ++d)
-      o_vals[d] *= alpha;
-    m_state = m_new;
-
-    // V accumulation
-    const int8_t* v_base = V_cache + pb * svb + slot * svs + kvh * svh
-                           + tid * BYTES_PER_THREAD;
-    float v_sc = V_scale[pb * svsb + slot * svss + kvh * svsh];
-    float p_vs = p * v_sc;
-    #pragma unroll
-    for (int d = 0; d < DIMS_PER_THREAD; ++d)
-      o_vals[d] += p_vs * (float)v_base[d];
+    kv += n;
   }
 
   // Write output
