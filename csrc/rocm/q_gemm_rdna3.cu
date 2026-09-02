@@ -715,6 +715,15 @@ torch::Tensor gptq_gemm_rdna3_wmma(torch::Tensor a, torch::Tensor b_q_weight,
 torch::Tensor gptq_gemm_rdna3(torch::Tensor a, torch::Tensor b_q_weight,
                               torch::Tensor b_qzeros, torch::Tensor b_scales,
                               torch::Tensor b_g_idx, bool use_v2_format) {
+  // Do not add a large-M path here that dequantises the weights into a dense
+  // buffer and hands them to rocBLAS. It was tried on gfx1100 (Aug 2026): the
+  // GEMM itself got 1.34x at M=2048 and cold prefill +6.6% to +7.4% end to end,
+  // and it matched the fused kernel 4/4 against golden. In production (TP4,
+  // MTP k=2, int8_per_token_head) it produced streams of "!!!!" within hours.
+  // The trigger was never identified — 156 requests against the exact failing
+  // configuration did not reproduce it — so the win is not worth the risk until
+  // someone has a harness that fails first.
+
   if (a.dim() == 2 && b_q_weight.dim() == 2 && a.size(1) % 16 == 0 &&
       b_q_weight.size(1) % 16 == 0 &&
       ((a.scalar_type() == torch::kBFloat16 && a.size(0) >= 16) ||
