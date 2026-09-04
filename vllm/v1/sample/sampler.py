@@ -232,9 +232,16 @@ class Sampler(nn.Module):
         all_random: bool,
     ) -> torch.Tensor:
         # Use in-place division to avoid creating a new tensor.
-        # Avoid division by zero if there are greedy requests.
-        if not all_random:
-            temp = torch.where(temp < _SAMPLING_EPS, 1.0, temp)
+        # The guard against division by zero is unconditional. `all_random`
+        # only says that no request in *this* batch is greedy; it does not say
+        # the device tensor is free of zeros. `temperature` is a persistent
+        # buffer filled by an async H2D copy from a pinned tensor the scheduler
+        # mutates in place, so a 0.0 written for a greedy request can still be
+        # read here on a later step whose batch has no greedy request at all.
+        # Dividing by it yields inf, softmax turns the row into NaN, and argmax
+        # over a NaN row returns 0, so the request silently emits token id 0.
+        # `all_random` is now unused; kept to avoid changing the signature.
+        temp = torch.where(temp < _SAMPLING_EPS, 1.0, temp)
         return logits.div_(temp.unsqueeze(dim=1))
 
     @staticmethod
