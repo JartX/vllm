@@ -1,5 +1,37 @@
 # RDNA3 INT8 + hybrid-GDN GPU page fault — investigation & status
 
+> ## ⛔ SUPERSEDED — read this first (2026-09-04)
+>
+> **The label on this document is wrong.** It calls the root cause "OOB in the Mamba
+> align block-table gather". Measurement on gfx1100 says otherwise: the fault is in
+> the **sampler**, in `vllm/v1/sample/ops/topk_topp_sampler.py`.
+>
+> `apply_top_k_top_p_pytorch` computes the gather index as `logits_sort.size(1) - k`
+> with **no upper or lower bound**. A `top_k` of 0 yields an index exactly one past the
+> end, and on RDNA3 that raises `HSA_STATUS_ERROR_EXCEPTION ... code: 0x1016` and
+> **aborts the whole HSA queue** — every in-flight request dies, not just that one.
+> When the bad index happens to land inside a valid page you get a garbage threshold
+> instead: the entire row is masked to `-inf`, softmax returns NaN, and `argmax` picks
+> index 0 — token id 0, which is `!`. That is the `!!!!` degeneration.
+>
+> vLLM itself produces the offending value: `sampling_params.py:529` rewrites every
+> greedy request (`temperature: 0` — e.g. the router's health probe) to `top_k = 0`.
+> The `apply_top_k_top_p_triton` branch, taken when `logits.shape[0] >= 8`, is immune;
+> the vulnerable PyTorch branch is the one taken at **small batch, i.e. under light
+> load**, which is exactly when the probe fires (it only probes an idle backend).
+>
+> This also corrects the reading of the June commits. `bbcc5d8c6f` (the revert of the
+> align-gather clamp) was not an oversight: it was made 5 minutes before `04fe48d2df`,
+> which records a `faulthandler` stack pinning the death at `copy_slice` ←
+> `_make_sampling_metadata` — the per-step sampling H2D copy, *not* a GDN/attention
+> kernel. The clamp was reverted in order to reproduce.
+>
+> Full write-up, measurements and reproducers:
+> `w4a16_trainer/docs/BANGS_AUDITORIA_04SEP.md` §11 and `docs/bangs_repro/`.
+>
+> Everything below is kept as the historical record of the June investigation. Its
+> "dead ends" list is still accurate; its conclusion is not.
+
 Status: **crash fixed (contained); upstream root cause of the metadata
 inconsistency still open.** This file is the hand-off so the work can continue
 in a new session.
