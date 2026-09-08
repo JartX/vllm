@@ -930,6 +930,17 @@ def triton_per_token_head_attention(
     if mid_o_buf is not None and mid_o_buf.shape[0] >= total_q:
         mid_o = mid_o_buf[:total_q, :Hq, :NUM_KV_SPLITS, :]
     else:
+        if mid_o_buf is not None:
+            # A batch above the capture-stable buffer gets a transient one.
+            # Holding the splits at max makes that allocation grow linearly with
+            # the batch -- GiB-sized on a wide head -- and it OOMs the worker
+            # mid-forward. Split-K only buys parallelism when there are few
+            # query tokens, so trade splits for batch and stay within the buffer
+            # this one stands in for. Rounded down to a power of two: it is a
+            # tl.constexpr, so each distinct value costs a Triton recompile.
+            budget = mid_o_buf.shape[0] * mid_o_buf.shape[2]
+            capped = max(1, min(NUM_KV_SPLITS, budget // total_q))
+            NUM_KV_SPLITS = 1 << (capped.bit_length() - 1)
         mid_o = torch.empty(
             (total_q, Hq, NUM_KV_SPLITS, D + 1),
             dtype=torch.float32,

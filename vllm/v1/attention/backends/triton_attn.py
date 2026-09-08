@@ -823,11 +823,10 @@ class TritonAttentionImpl(AttentionImpl):
                     self.max_num_kv_splits, self.head_size + 2,
                     dtype=torch.float32, device=query.device)
                 layer._pth_mid_o_buf = mid_o_buf
+            num_kv_splits = self.max_num_kv_splits
             if mid_o_buf.shape[0] < query.size(0):
-                mid_o_buf = torch.zeros(
-                    query.size(0), self.num_heads,
-                    self.max_num_kv_splits, self.head_size + 2,
-                    dtype=torch.float32, device=query.device)
+                mid_o_buf, num_kv_splits = self._transient_mid_o(
+                    query.size(0), query.device)
             # FIX (RDNA3 int8 decode use-after-free): under async scheduling the
             # caching allocator can free + REUSE a transient input's memory
             # before this async kernel reads it. Symptoms (both confirmed via
@@ -857,7 +856,7 @@ class TritonAttentionImpl(AttentionImpl):
                 attn_metadata.q_to_klen,
                 mid_o_buf,
                 self.scale,
-                self.max_num_kv_splits,
+                num_kv_splits,
             )
             return output
 
@@ -883,11 +882,10 @@ class TritonAttentionImpl(AttentionImpl):
                     self.max_num_kv_splits, self.head_size + 2,
                     dtype=torch.float32, device=query.device)
                 layer._pth_mid_o_buf = mid_o_buf
+            num_kv_splits = self.max_num_kv_splits
             if mid_o_buf.shape[0] < query.size(0):
-                mid_o_buf = torch.zeros(
-                    query.size(0), self.num_heads,
-                    self.max_num_kv_splits, self.head_size + 2,
-                    dtype=torch.float32, device=query.device)
+                mid_o_buf, num_kv_splits = self._transient_mid_o(
+                    query.size(0), query.device)
             q_slice = query[:num_actual_tokens]
             o_slice = output[:num_actual_tokens]
             # HS=256 v2 kernel: Q pre-rotated externally, output post-rotated.
@@ -918,7 +916,7 @@ class TritonAttentionImpl(AttentionImpl):
                 attn_metadata.q_to_klen,
                 mid_o_buf,
                 self._int4_scale,
-                self.max_num_kv_splits,
+                num_kv_splits,
             )
             if self.head_size > 128:
                 torch.ops._C.rht_rotate_inplace_rdna3(
@@ -1279,11 +1277,10 @@ class TritonAttentionImpl(AttentionImpl):
                             self.max_num_kv_splits, self.head_size + 2,
                             dtype=torch.float32, device=query.device)
                         layer._pth_mid_o_buf = mid_o_buf
+                    num_kv_splits = self.max_num_kv_splits
                     if mid_o_buf.shape[0] < query.size(0):
-                        mid_o_buf = torch.zeros(
-                            query.size(0), self.num_heads,
-                            self.max_num_kv_splits, self.head_size + 2,
-                            dtype=torch.float32, device=query.device)
+                        mid_o_buf, num_kv_splits = self._transient_mid_o(
+                            query.size(0), query.device)
                     rht_signs = self._get_rht_signs(query.device)
                     q_slice = query[:num_actual_tokens]
                     o_slice = output[:num_actual_tokens]
@@ -1313,7 +1310,7 @@ class TritonAttentionImpl(AttentionImpl):
                         attn_metadata.q_to_klen,
                         mid_o_buf,
                         self._int4_scale,
-                        self.max_num_kv_splits,
+                        num_kv_splits,
                     )
                     if self.head_size > 128:
                         torch.ops._C.rht_rotate_inplace_rdna3(
@@ -1517,6 +1514,42 @@ class TritonAttentionImpl(AttentionImpl):
             key_cache = key_cache.view(self.fp8_dtype)
             value_cache = value_cache.view(self.fp8_dtype)
         return key_cache, value_cache
+
+    def _transient_mid_o(
+        self, num_q: int, device: torch.device
+    ) -> tuple[torch.Tensor, int]:
+        """Bounded stand-in for the capture-stable ``_pth_mid_o_buf``.
+
+        The persistent buffer is sized for the cudagraph capture size, so an
+        eager batch above it needs its own. Sizing that one with
+        ``max_num_kv_splits`` makes it grow without bound with the batch: a
+        continuation-decode step admits ``_CONTINUATION_DECODE_THRESHOLD``
+        tokens per request, and a prefix-cache resume of ``max_num_seqs``
+        requests reaches hundreds of query tokens. At head_size=256 with 256
+        splits that is 2 MiB per token, and the allocation OOMs the worker
+        mid-forward -- which strands its peers in the next collective, so the
+        engine dies on an all-gather timeout far from the real fault.
+
+        Split-K only buys parallelism when there are few query tokens; a batch
+        this size already saturates the GPU. So trade splits for batch and keep
+        the transient buffer no larger than the persistent one.
+
+        Returns:
+            The buffer and the split count it was sized for. The kernels take
+            the count as an argument and read the layout from the tensor's
+            strides, so the two must be passed together.
+        """
+        budget = self._max_cudagraph_capture_size * self.max_num_kv_splits
+        num_kv_splits = max(1, min(self.max_num_kv_splits, budget // num_q))
+        mid_o_buf = torch.zeros(
+            num_q,
+            self.num_heads,
+            num_kv_splits,
+            self.head_size + 2,
+            dtype=torch.float32,
+            device=device,
+        )
+        return mid_o_buf, num_kv_splits
 
     def _forward_encoder_attention(
         self,
