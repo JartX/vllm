@@ -831,6 +831,32 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     ) -> torch.Tensor:
         return self._forward_method(hidden_states)
 
+    def _core_attn_out_dtype(self, activation_dtype: torch.dtype) -> torch.dtype:
+        """Precision for the GDN readout buffer.
+
+        The readout ``o = state @ q`` is an *unnormalized* accumulator: it is
+        only normalized later, by ``RMSNormGated``. With an fp32 SSM state it
+        can exceed fp16's 65504, so storing it into an fp16 buffer overflows to
+        ``inf`` and the norm turns that into ``NaN`` -- the model then emits a
+        single repeated token.
+
+        Upstream PR #54146 widens the readout inside the kernel wrapper, but the
+        value lands in this buffer one line later and is downcast again, so both
+        changes are needed. ``RMSNormGated`` already upcasts with ``x.float()``,
+        so it consumes an fp32 buffer unchanged.
+
+        Only fp16 activations are affected: bf16 shares fp32's exponent range,
+        so bf16 and fp32 activations keep their dtype and stay byte-identical.
+        """
+        if activation_dtype is not torch.float16:
+            return activation_dtype
+        kv_cache = getattr(self, "kv_cache", None)
+        if kv_cache is None or len(kv_cache) < 2:
+            return activation_dtype
+        if getattr(kv_cache[1], "dtype", None) is torch.float32:
+            return torch.float32
+        return activation_dtype
+
     def _output_projection(
         self,
         core_attn_out: torch.Tensor,
@@ -864,7 +890,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             projected_states_ba = projected_states_ba.view(num_tokens, -1)
             core_attn_out = torch.empty(
                 (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
-                dtype=hidden_states.dtype,
+                dtype=self._core_attn_out_dtype(hidden_states.dtype),
                 device=hidden_states.device,
             )
             z = torch.empty(
@@ -911,7 +937,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         if use_fused_gdn_decode:
             core_attn_out = torch.zeros(
                 (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
-                dtype=hidden_states.dtype,
+                dtype=self._core_attn_out_dtype(hidden_states.dtype),
                 device=hidden_states.device,
             )
             torch.ops.vllm.qwen_gdn_attention_core_fused_norm_packed(
@@ -947,7 +973,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # see discussions in https://github.com/vllm-project/vllm/pull/28182
         core_attn_out = torch.zeros(
             (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
-            dtype=hidden_states.dtype,
+            dtype=self._core_attn_out_dtype(hidden_states.dtype),
             device=hidden_states.device,
         )
 
@@ -987,10 +1013,16 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # ============================================================
         core_attn_out = torch.zeros(
             (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
-            dtype=hidden_states.dtype,
+            dtype=self._core_attn_out_dtype(hidden_states.dtype),
             device=hidden_states.device,
         )
-        z = torch.empty_like(core_attn_out)
+        # z is written by the kernels in the activation dtype; only the readout
+        # buffer may be widened, so pin z instead of mirroring core_attn_out.
+        z = torch.empty(
+            core_attn_out.shape,
+            dtype=hidden_states.dtype,
+            device=core_attn_out.device,
+        )
 
         torch.ops.vllm.gdn_attention_core_xpu(
             core_attn_out,
@@ -1042,7 +1074,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         num_tokens = hidden_states.size(0)
         core_attn_out = torch.zeros(
             (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
-            dtype=hidden_states.dtype,
+            dtype=self._core_attn_out_dtype(hidden_states.dtype),
             device=hidden_states.device,
         )
 
