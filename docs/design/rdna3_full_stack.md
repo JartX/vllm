@@ -298,6 +298,98 @@ MAX_JOBS=$(nproc) PYTORCH_ROCM_ARCH=gfx1100 python3 setup.py build_ext --inplace
 
 ---
 
+## Custom All-Reduce over PCIe P2P
+
+`e59a122a91` enables the custom all-reduce on gfx11 and `f1be45cd60` keeps
+`register_graph_buffers()` unconditional.
+`RocmPlatform.use_custom_allreduce_graph_registration()` returns `False` on
+gfx11, so captured collectives copy into the buffer registered at init instead
+of writing through the graph's own pointers.
+
+That only holds when the driver's peer access is backed by a root complex that
+actually supports P2PDMA. Measured on two boxes with the same GPUs (RX 7900
+XTX, gfx1100) and the same model artifact:
+
+| box | peer access | TP | custom AR | output |
+| --- | --- | --- | --- | --- |
+| EPYC 7252 | native | 4 | on | correct — 2 days serving |
+| i9-13900K / Z790 | only after force-adding `8086:a700` to the kernel P2PDMA allowlist | 2 | on | garbage |
+
+On the second box, with custom AR enabled and a sanity check in the same engine
+start:
+
+| algorithm | sane completions |
+| --- | --- |
+| 1stage — the only one the C++ picks at `world_size == 2` | 2/10 |
+| 2stage — `VLLM_CUSTOM_ALLREDUCE_ALGO=2stage` | 0/10 |
+| `--disable-custom-all-reduce` | 9/9 |
+
+Refuted as causes, each by measurement: the `max_size` cap (8 MiB and 96 MiB
+both corrupt), `dtype` (fp16 and bf16), `trust_remote_code`, the model artifact
+(two different checkpoints), and the graph-registration bug above — the gfx11
+hook already forces `registered=False`. The build is refuted too: the failing
+box corrupts identically on `v0.26.1rc1.dev333` (July image) and on
+`v0.28.1rc1.dev667`, a build of this branch that is *newer* than the one
+serving correctly on the EPYC box.
+
+Two firmware knobs on the failing box were tried and refuted as well, both
+individually and together, each verified in the register and in `lspci` before
+the run:
+
+| knob | root ports | result |
+| --- | --- | --- |
+| ACS P2P Request/Completion Redirect cleared (`ACSCtl` `0x1d` -> `0x11`) | both | garbage |
+| AtomicOp Egress Blocking cleared (`DevCtl2` bit 7, set only on one port) | `00:06.0` | garbage |
+
+Neither is surprising on reflection: they are permission bits, not ordering
+guarantees. They say whether a transaction may pass, not that it arrives in
+order carrying current data.
+
+What is left is the link itself. The two GPUs sit under *different* root ports,
+so they are in different PCIe hierarchy domains, and the specification makes
+routing peer-to-peer between hierarchy domains through a Root Complex optional
+and implementation-defined. The kernel's `pci_p2pdma_whitelist` exists for
+exactly this: its Intel entries are Xeon and Skylake-E server silicon, several
+carrying `REQ_SAME_HOST_BRIDGE`, and there is no desktop part on it. Forcing a
+Raptor Lake-S host bridge into that list puts the machine outside every case
+the kernel treats as validated.
+
+The collective's contract is producer-consumer across that link. Its barrier
+uses `st_flag_volatile` / `ld_flag_volatile` -- posted writes and remote reads,
+not atomics -- so `st_flag_release` orders the GPU's own memory pipeline and
+cannot order anything inside the fabric once the TLPs are in flight. A bulk DMA
+copy has no such contract, which is why `rocm-bandwidth-test` passes.
+
+The fix is topological, not a setting: put both GPUs under the same switch, so
+peer traffic never leaves one hierarchy domain. Until then
+`--disable-custom-all-reduce` is correct on such a box -- and remains wrong on
+one where peer access is native.
+
+Three traps worth writing down:
+
+1. **Nothing validates P2P on ROCm.** `CustomAllreduce.__init__` skips the
+   functional test — `if not current_platform.is_rocm() and not _can_p2p(...)`
+   — and the `fully_connected` gate only applies when `world_size > 2`. At TP2
+   on gfx11 the collective is enabled purely on the driver's
+   `can_device_access_peer` flag, with nothing behind it.
+
+2. **A bulk D2D content check does not cover this.** `rocm-bandwidth-test -a -v`
+   passes on the failing box with four patterns and no PCIe error counters set.
+   A large
+   sequential DMA is not the access pattern a collective uses — but neither is
+   the fine-grained one sufficient to explain it, since 2stage corrupts too.
+
+3. **Throughput alone will not catch it.** The corrupted engine benchmarks
+   _faster_: raising `max_size` lets the prefill collectives through instead of
+   falling back to PYNCCL, so the speedup and the corruption arrive together.
+   Any
+   measurement of a collective on this hardware has to include an output sanity
+   check in the same engine start, and the checker has to be proven against a
+   known-bad sample first — a detector that greps for `!!!!` reports the generic
+   garbage here as clean.
+
+---
+
 ## Branch Structure
 
 ### Independent PR branches (each targets `main`)
