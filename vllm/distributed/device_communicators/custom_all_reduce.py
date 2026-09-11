@@ -241,6 +241,23 @@ class CustomAllreduce:
                 "specify disable_custom_all_reduce=True explicitly."
             )
             return
+        # This collective is a pull: every rank reads every peer's buffer.
+        # A PCIe root complex that does not route peer-to-peer reads answers
+        # those loads with zeros instead of an error, so each rank reduces its
+        # own contribution against zero and the model emits garbage with
+        # nothing logged. Writes are unaffected, which is why a DMA bandwidth
+        # test passes on such a box. QuickReduce pushes and works there.
+        # TODO: replace the architecture test with a peer-read probe, so a
+        # gfx11 pair that does sit behind one switch keeps this path.
+        if current_platform.is_rocm() and "gfx11" in getattr(
+            torch.cuda.get_device_properties(0), "gcnArchName", ""
+        ):
+            logger.warning(
+                "Custom allreduce is disabled on gfx11: this collective reads "
+                "peer buffers, which a desktop root complex may not route."
+            )
+            return
+
         # test P2P capability, this checks software/cudaruntime support
         # this is expensive to compute at the first time
         # then we cache the result

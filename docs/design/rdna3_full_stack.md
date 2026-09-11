@@ -329,7 +329,7 @@ both corrupt), `dtype` (fp16 and bf16), `trust_remote_code`, the model artifact
 (two different checkpoints), and the graph-registration bug above — the gfx11
 hook already forces `registered=False`. The build is refuted too: the failing
 box corrupts identically on `v0.26.1rc1.dev333` (July image) and on
-`v0.28.1rc1.dev667`, a build of this branch that is *newer* than the one
+`v0.28.1rc1.dev667`, a build of this branch that is _newer_ than the one
 serving correctly on the EPYC box.
 
 Two firmware knobs on the failing box were tried and refuted as well, both
@@ -345,25 +345,83 @@ Neither is surprising on reflection: they are permission bits, not ordering
 guarantees. They say whether a transaction may pass, not that it arrives in
 order carrying current data.
 
-What is left is the link itself. The two GPUs sit under *different* root ports,
-so they are in different PCIe hierarchy domains, and the specification makes
-routing peer-to-peer between hierarchy domains through a Root Complex optional
-and implementation-defined. The kernel's `pci_p2pdma_whitelist` exists for
-exactly this: its Intel entries are Xeon and Skylake-E server silicon, several
-carrying `REQ_SAME_HOST_BRIDGE`, and there is no desktop part on it. Forcing a
-Raptor Lake-S host bridge into that list puts the machine outside every case
-the kernel treats as validated.
+What is left is the link itself, and it can be measured directly. A HIP probe
+that allocates on both GPUs and drives the same bytes in each direction, with
+every launch error-checked and every buffer verified locally first:
 
-The collective's contract is producer-consumer across that link. Its barrier
-uses `st_flag_volatile` / `ld_flag_volatile` -- posted writes and remote reads,
-not atomics -- so `st_flag_release` orders the GPU's own memory pipeline and
-cannot order anything inside the fabric once the TLPs are in flight. A bulk DMA
-copy has no such contract, which is why `rocm-bandwidth-test` passes.
+| operation | 0 -> 1 | 1 -> 0 |
+| --- | --- | --- |
+| local fill, read back on the same GPU (control) | ok | ok |
+| kernel WRITES into the peer's buffer | ok | ok |
+| kernel READS the peer's buffer | all zeros | all zeros |
+| `hipMemcpyPeer` scheduled on the **source** stream (push) | ok | ok |
+| `hipMemcpyPeer` scheduled on the **destination** stream (pull) | all zeros | all zeros |
 
-The fix is topological, not a setting: put both GPUs under the same switch, so
-peer traffic never leaves one hierarchy domain. Until then
-`--disable-custom-all-reduce` is correct on such a box -- and remains wrong on
-one where peer access is native.
+Symmetric, and identical for cached and uncached allocations. This root complex
+forwards peer writes and answers peer reads with zeros — not with an error, so
+nothing is logged and no PCIe error counter moves. Forcing `8086:a700` into
+`pci_p2pdma_whitelist` decides only whether Linux sets the mapping up; it
+cannot make the hardware route read completions between root ports.
+
+That is the whole corruption. `cross_device_reduce_1stage` is a pull:
+`packed_reduce` walks `dp.ptrs[i][idx]` across every peer. Those loads return
+zeros, so each rank reduces its own contribution against zero. The barrier is
+unaffected because it only _writes_ to the peer
+(`__scoped_atomic_store_n(..., __MEMORY_SCOPE_SYSTEM)` on the ROCm branch, then
+a device-scope spin on memory the peer wrote), which is why the engine neither
+hangs nor produces NaN — it produces confident, wrong numbers. 2stage corrupts
+for the same reason: it also reads.
+
+It also explains the false green. `rocm-bandwidth-test -a -v` reports PASS
+between the two GPUs because HSA schedules the async copy on the **source**
+agent, so the benchmark only ever exercises a push. Asked for one direction
+with `-s 1 -d 2` it validates the `[1][1]` diagonal — a device copying to
+itself — and prints `N/A` for the cell that was the point of the run.
+
+### The fix: push instead of pull
+
+A push all-reduce works on this hardware. Each rank writes its contribution
+into a slot the peer owns, then reduces reading only its own memory. Measured
+against RCCL on the same box, per all-reduce:
+
+| payload | RCCL | push | |
+| --- | --- | --- | --- |
+| 16 KiB | 51.5 us | 8.4 us | 6.1x |
+| 64 KiB | 70.0 us | 20.8 us | 3.4x |
+| 256 KiB | 151.4 us | 93.1 us | 1.6x |
+| 1 MiB | 507.5 us | 375.9 us | 1.35x |
+| 4 MiB | 1946.6 us | 1572.0 us | 1.24x |
+
+The inbox has to be uncached. With a cacheable peer mapping the writes are
+absorbed by the _writer's_ L2 and never reach the wire; at 4 MiB that test
+still passed, which is a size-dependent false green that only the
+deliberately-wrong control caught.
+
+vLLM already ships a push collective: QuickReduce writes into every peer's
+buffer in phase 1A and reduces out of `buffer_list[rank]`. It was gated to
+gfx94/gfx95, and it returns wrong results on RDNA3 for an unrelated reason —
+`BufferResource` builds word 3 of the buffer descriptor as `0x00020000`, the
+gfx9 encoding. On gfx1100 that makes `buffer_load_dwordx4` return zeros:
+
+| word 3 | result on gfx1100 |
+| --- | --- |
+| `0x00020000` (what QuickReduce used) | 4095/4096 zeros |
+| `0x31014000` (RDNA gfx10+) | ok |
+
+With the descriptor selected per architecture, QuickReduce is bit-exact against
+RCCL at every size tested, in fp16 and bf16, and all four codecs (FP, INT8,
+INT6, INT4) compute correctly — their errors grow in the expected order,
+`4e-3 / 1.8e-2 / 7e-2`. End to end on the 27B at TP2, six distinct prompts,
+streaming, TTFT kept separate:
+
+| all-reduce | decode (median) | TTFT |
+| --- | --- | --- |
+| PYNCCL (`--disable-custom-all-reduce`) | 46.26 tok/s | 148 ms |
+| QuickReduce, FP codec | **49.23 tok/s** | 139 ms |
+| QuickReduce, INT8 codec | 42.50 tok/s | 130 ms |
+
+FP is the one to use: quantizing the payload costs more than the link saves at
+decode sizes, even on a 3.5 GB/s link. The pull collective stays off on gfx11.
 
 Three traps worth writing down:
 
@@ -371,24 +429,22 @@ Three traps worth writing down:
    functional test — `if not current_platform.is_rocm() and not _can_p2p(...)`
    — and the `fully_connected` gate only applies when `world_size > 2`. At TP2
    on gfx11 the collective is enabled purely on the driver's
-   `can_device_access_peer` flag, with nothing behind it.
+   `can_device_access_peer` flag, with nothing behind it. The check that would
+   have caught this is a peer _read_, which is what the collective needs and
+   what nothing tests.
 
-2. **A bulk D2D content check does not cover this.** `rocm-bandwidth-test -a -v`
-   passes on the failing box with four patterns and no PCIe error counters set.
-   A large
-   sequential DMA is not the access pattern a collective uses — but neither is
-   the fine-grained one sufficient to explain it, since 2stage corrupts too.
+2. **A bulk D2D content check does not cover this.** `rocm-bandwidth-test`
+   passes on the failing box because it pushes. A control that cannot fail
+   reads exactly like a control that passed.
 
 3. **Throughput alone will not catch it.** The corrupted engine benchmarks
    _faster_: raising `max_size` lets the prefill collectives through instead of
    falling back to PYNCCL, so the speedup and the corruption arrive together.
-   Any
-   measurement of a collective on this hardware has to include an output sanity
-   check in the same engine start, and the checker has to be proven against a
-   known-bad sample first — a detector that greps for `!!!!` reports the generic
-   garbage here as clean.
-
----
+   Any measurement of a collective on this hardware has to include an output
+   sanity check in the same engine start, and the checker has to be proven
+   against a known-bad sample first. A detector that greps for `!!!!` calls the
+   generic garbage here clean, and one built on word fractions calls
+   `ductductduct...` clean too.
 
 ## Branch Structure
 
